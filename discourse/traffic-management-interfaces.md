@@ -73,14 +73,14 @@ topic name, e.g. `delivery_robot_1` would own the topic `/delivery_robot_1/traff
 
 ## Destination topics
 
-* `~/destination` (Mandatory) - `Destination.msg`: The current destination of the robot
-* `~/destination/error` (Mandatory) - `DestinationError.msg`: An error occurred while trying to generate a plan for the destination
-* `~/destination/session_refresh` (Mandatory) - `SessionRefresh.msg`: Ask for a new session to be started for the destination
-* `/destination/discovery` (Recommended) - `ParticipantList.msg`: Find the namespaces participating in this topic
-* `~/destination/goal` (Goal Component) - `DestinationGoal.msg`: A choice of destinations for the robot to reach
-* `~/destination/goal/error` (Goal Component) - `DestinationError.msg`: An error occurred while trying to select a destination for the goal
-* `~/destination/path` (Path Component) - `nav_msgs/Path.msg`: Specify a path that the robot intends to take to its destination
-* `~/odom` (Recommended) - `nav_msgs/Odometry`: Current location information for the robot
+* `~/destination` (Mandatory) - [`Destination.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/Destination.msg): The current destination of the robot
+* `~/destination/error` (Mandatory) - [`DestinationError.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/DestinationError.msg): An error occurred while trying to generate a plan for the destination
+* `~/destination/session_refresh` (Mandatory) - [`SessionRefresh.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/SessionRefresh.msg): Ask for a new session to be started for the destination
+* `/destination/discovery` (Recommended) - [`ParticipantList.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/ParticipantList.msg): Find the namespaces participating in this topic
+* `~/destination/goal` (Goal Component) - [`DestinationGoal.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/DestinationGoal.msg): A choice of destinations for the robot to reach
+* `~/destination/goal/error` (Goal Component) - [`DestinationError.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/DestinationError.msg): An error occurred while trying to select a destination for the goal
+* `~/destination/path` (Path Component) - [`nav_msgs/Path.msg`](https://github.com/ros2/common_interfaces/blob/rolling/nav_msgs/msg/Path.msg): Specify a path that the robot intends to take to its destination
+* `~/odom` (Recommended) - [`nav_msgs/Odometry.msg`](https://github.com/ros2/common_interfaces/blob/rolling/nav_msgs/msg/Odometry.msg): Current location information for the robot
 
 In general the purpose of the `~/destination` topic and its components is to
 communicate where the robots in the system need to go. The messages of these
@@ -138,16 +138,16 @@ error the system may respond in different ways:
 | Permanently Unreachable | Choose a different destination for the goal or escalate to operator |
 | Temporarily Unreachable | Detour to parking spot or choose a different destination for the goal |
 
-These error types are explicitly enumerated in `DestinationError.msg`, but other
+These error types are explicitly enumerated in [`DestinationError.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/DestinationError.msg), but other
 error types may also be introduced.
 
 ## Plan topics
 
-* `~/plan` (Mandatory) - `Plan.msg`: The current plan that the robot should follow
-* `~/plan/progress` (Mandatory) - `Progress.msg`: The most recent progress that has been made by the robot along its plan
-* `~/plan/error` (Mandatory) - `PlanError.msg`: The executor ran into a problem while trying to read or execute the plan
-* `~/plan/release` (Release Component) - `PlanRelease.msg`: How far along the plan is the robot allowed to freely move
-* `~/plan/safe_zone` (SafeZone Component) - `SafeZone.msg`: A costmap layer and incremental target to help guide the robot's nav system away from traffic conflicts
+* `~/plan` (Mandatory) - [`Plan.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/Plan.msg): The current plan that the robot should follow
+* `~/plan/progress` (Mandatory) - [`Progress.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/Progress.msg): The most recent progress that has been made by the robot along its plan
+* `~/plan/error` (Mandatory) - [`PlanError.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/PlanError.msg): The executor ran into a problem while trying to read or execute the plan
+* `~/plan/release` (Release Component) - [`PlanRelease.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/PlanRelease.msg): How far along the plan is the robot allowed to freely move
+* `~/plan/safe_zone` (SafeZone Component) - [`SafeZone.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/SafeZone.msg): A costmap layer and incremental target to help guide the robot's nav system away from traffic conflicts
 
 The `~/plan` topic and its components provide information on how a robot should
 go about reaching the destination that is has posted to `~/destination`. Besides
@@ -175,7 +175,7 @@ for two reasons:
 1. We need to know when traffic dependencies of other agents have been satisfied.
 2. We need to know when to execute the next stage of the robot's plan.
 
-`Progress.msg` has two fields for tracking progress:
+[`Progress.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/Progress.msg) has two fields for tracking progress:
 * `float32 progress`: A parameter that continuously tracks how far along the robot is in its plan. This is useful for traffic dependents to evaluate exactly when this robot has moved out of the way, without being sensitive to how the plan's waypoints are spaced out.
 * `uint64 reached_waypoint`: The index of the waypoint that was most recently reached. This is useful for the plan executor to know when it can begin the next stage of the plan.
 
@@ -239,8 +239,8 @@ its global path changes. As the traffic dependencies of the robot make progress,
 the safe space available to the AMR will expand towards its goal and the costmap
 will be updated to reflect this.
 
-There is an `incremental_target` field inside of `TrafficCostmap.msg` that
-represents the furthest point along the plan that the AMR can travel without
+There is an `incremental_target` field inside of [`SafeZone.msg`](https://github.com/open-rmf/next_gen_prototype/blob/main/rmf_prototype_msgs/msg/SafeZone.msg)
+that represents the furthest point along the plan that the AMR can travel without
 exiting its safe zone. Unlike the final plan destination, the target is always
 located inside the zero-cost area of the costmap so that the global planner of
 the AMR considers it to be reachable.
