@@ -17,9 +17,10 @@
 float32[2] position
 
 
-# If this waypoint is associated with any nodes in any graphs, their keys are
-# listed here.
-NodeKey[] keys
+# Specific constraints that need to be satisfied for the waypoint to be "reached".
+# If this is left out, then the robot must approach the position to the best of
+# its judgment.
+DestinationConstraints constraints
 
 
 # A value that indicates the progress level of a robot that has reached this
