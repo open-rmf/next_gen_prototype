@@ -94,3 +94,19 @@ Trajectory[] departure_trajectory
 # plan, since this action might be doing important cleanup, such as closing a
 # door.
 string departure_action
+
+
+# A particular action to be performed as soon as the arrival constraints are
+# satisfied. This will not wait for the departure_blockers to be satisfied
+# before executing.
+#
+# The format for this field should follow the same recommendations as departure_action.
+#
+# If an action is given here, departure will be blocked until the action has
+# completed. After the action is completed, the robot will be given no further
+# instructions until the departure_blockers are satisfied. This means if the
+# arrival_action moves the robot out of its destination constraints, it is the
+# responsibility of the action designer to make sure the robot ends in a location
+# that does not create a traffic conflict. To be safe it is best to only have
+# arrival actions which do not move the robot.
+string arrival_action
