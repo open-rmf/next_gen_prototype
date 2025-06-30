@@ -18,9 +18,9 @@ float32[2] position
 
 
 # Specific constraints that need to be satisfied for the waypoint to be "reached".
-# If this is left out, then the robot must approach the position to the best of
-# its judgment.
-DestinationConstraints constraints
+# If the constraints are empty, then the robot must approach the position to the
+# best of its judgment, perhaps based on built-in or user-defined thresholds.
+DestinationConstraints arrival_constraints
 
 
 # A value that indicates the progress level of a robot that has reached this
