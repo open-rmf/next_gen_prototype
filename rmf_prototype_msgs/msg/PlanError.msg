@@ -11,7 +11,7 @@ uint32 CODE_UNSPECIFIED=0
 uint32 CODE_REPLAN_REQUEST=1
 
 # A replan is being requested because the planned path is blocked. If possible,
-# the planner will gather the latest occupancy information available and generate 
+# the planner will gather the latest occupancy information available and generate
 # a new plan.
 uint32 CODE_PATH_BLOCKED=2
 
@@ -31,3 +31,7 @@ string message
 # Additional information about the error that may be parsed by a machine.
 # It is recommended to use a JSON structure for this.
 string parameters
+
+
+# What plan is this error asssociated with
+PlanId plan_id

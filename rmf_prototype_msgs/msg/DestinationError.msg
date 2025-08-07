@@ -44,3 +44,7 @@ string message
 # Additional information about the error that may be parsed by a machine.
 # It is recommended to use a JSON structure for this.
 string parameters
+
+
+# Which destination session is this error associated with
+unique_identifier_msgs/UUID session
