@@ -1,7 +1,7 @@
 # TargetNode.msg
 
 # A key within a graph that the robot intends to reach.
-NodeKey key
+GraphElementKey key
 
 # Zero or more orientations that the robot should face once it has reached the
 # target node.

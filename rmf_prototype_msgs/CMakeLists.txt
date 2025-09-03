@@ -26,7 +26,7 @@ set(msg_files
   "msg/DestinationError.msg"
   "msg/DestinationGoal.msg"
   "msg/Error.msg"
-  "msg/NodeKey.msg"
+  "msg/GraphElementKey.msg"
   "msg/Participant.msg"
   "msg/Plan.msg"
   "msg/PlanError.msg"

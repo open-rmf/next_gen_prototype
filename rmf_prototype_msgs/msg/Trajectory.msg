@@ -33,6 +33,6 @@ float32 final_progress_level
 # "North_Lift_A" should have a trajectory that includes both of those as maps.
 string[] maps
 
-# If this trajectory passes through any nodes in any graphs, their keys are
+# If this trajectory passes through any elements of any graphs, their keys are
 # listed here.
-NodeKey[] keys
+GraphElementKey[] keys

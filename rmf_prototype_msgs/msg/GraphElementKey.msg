@@ -1,4 +1,4 @@
-# NodeKey.msg
+# GraphElementKey.msg
 
 # Name of the graph that this target is referencing. The default standard is for
 # the graph information to be published to the /{graph_name}/graph topic.
@@ -30,3 +30,24 @@ string[<=1] name
 # location in the building, the graph may define each floor of the building as
 # a map and have one grid covering each floor.
 string[<=1] map
+
+# Specify what type of element in the graph this key is referring to. Some
+# consumers of this message might only be able to support specific types of
+# elements in some contexts. Sending an incompatible element type may lead to
+# an error.
+uint8 element_type
+
+# Might be any type of element. It must be interpreted based on context.
+uint8 ELEMENT_TYPE_UNSPECIFIED = 0
+
+# A discrete node within a graph
+uint8 ELEMENT_TYPE_NODE = 1
+
+# An edge that connects two nodes
+uint8 ELEMENT_TYPE_EDGE = 2
+
+# A discrete unit of free space
+uint8 ELEMENT_TYPE_CELL = 3
+
+# A region of space, possibly including a collection of nodes, edges, or cells.
+uint8 ELEMENT_TYPE_REGION = 4
