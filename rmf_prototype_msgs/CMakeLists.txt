@@ -28,6 +28,7 @@ set(msg_files
   "msg/Error.msg"
   "msg/GraphElementKey.msg"
   "msg/Participant.msg"
+  "msg/ParticipantList.msg"
   "msg/Plan.msg"
   "msg/PlanError.msg"
   "msg/PlanId.msg"
