@@ -1,9 +1,10 @@
 use rclrs::{Context, CreateBasicExecutor, SpinOptions};
 use rmf_prototype_msgs::msg::{
-    Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, Region,
-    TargetRegion,
+    Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, ParticipantList,
+    Region, TargetRegion,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 struct SessionUUID {
@@ -12,9 +13,21 @@ struct SessionUUID {
 
 impl SessionUUID {
     fn from_ros(ros_msg: &unique_identifier_msgs::msg::UUID) -> Self {
-        Self {
-            uuid: ros_msg.uuid,
-        }
+        Self { uuid: ros_msg.uuid }
+    }
+}
+
+impl std::fmt::Display for SessionUUID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            self.uuid[0], self.uuid[1], self.uuid[2], self.uuid[3],
+            self.uuid[4], self.uuid[5],
+            self.uuid[6], self.uuid[7],
+            self.uuid[8], self.uuid[9],
+            self.uuid[10], self.uuid[11], self.uuid[12], self.uuid[13], self.uuid[14], self.uuid[15]
+        )
     }
 }
 
@@ -80,7 +93,11 @@ struct DomainDestinationConstraints {
 impl DomainDestinationConstraints {
     fn from_ros(ros: &DestinationConstraints) -> Self {
         Self {
-            regions: ros.regions.iter().map(DomainTargetRegion::from_ros).collect(),
+            regions: ros
+                .regions
+                .iter()
+                .map(DomainTargetRegion::from_ros)
+                .collect(),
         }
     }
 
@@ -164,7 +181,6 @@ impl DomainDestinationError {
 }
 
 struct CurrentlyOccupiedDestinations {
-
     // A simple occupancy grid. If None, the region is considered free, if Some it is allocated to the session
     floor_space: Vec<Vec<Option<SessionUUID>>>,
 
@@ -210,7 +226,8 @@ impl CurrentlyOccupiedDestinations {
         for (id, c) in constraints.iter().enumerate() {
             // check all  regions are free
             let all_free = c.regions.iter().all(|target_region| {
-                self.check_if_region_free(&target_region.region).unwrap_or(false)
+                self.check_if_region_free(&target_region.region)
+                    .unwrap_or(false)
             });
 
             if all_free {
@@ -278,7 +295,10 @@ impl CurrentlyOccupiedDestinations {
         }
     }
 
-    fn get_region_grid_bounds(&self, region: &DomainRegion) -> Option<(usize, usize, usize, usize)> {
+    fn get_region_grid_bounds(
+        &self,
+        region: &DomainRegion,
+    ) -> Option<(usize, usize, usize, usize)> {
         if region.hint == DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE {
             if region.points.len() < 2 || region.points.len() % 2 != 0 {
                 return None;
@@ -329,7 +349,9 @@ impl CurrentlyOccupiedDestinations {
         let Some((start_x, end_x, start_y, end_y)) = bounds else {
             // If we can't get bounds (invalid points or negative), we treat it as an error
             // but for simplicity here we'll just check hint if it was invalid points.
-            if region.hint == DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE || region.hint == DomainRegion::HINT_POINT {
+            if region.hint == DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE
+                || region.hint == DomainRegion::HINT_POINT
+            {
                 if region.points.len() < 2 {
                     return Err(ShapeErr::InvalidPoints);
                 }
@@ -355,14 +377,25 @@ impl CurrentlyOccupiedDestinations {
     }
 }
 
+#[allow(dead_code)]
+struct RobotConnections {
+    goal_publisher: rclrs::Publisher<Destination>,
+    error_publisher: rclrs::Publisher<DestinationError>,
+    _goal_subscription: rclrs::WorkerSubscription<DestinationGoal, DestinationServer>,
+}
+
 struct DestinationServer {
-    currently_occupied: CurrentlyOccupiedDestinations
+    currently_occupied: CurrentlyOccupiedDestinations,
+    node: Arc<rclrs::Node>,
+    active_robots: HashMap<String, RobotConnections>,
 }
 
 impl DestinationServer {
-    fn new(grid_size: f32) -> Self {
+    fn new(node: Arc<rclrs::Node>, grid_size: f32) -> Self {
         Self {
             currently_occupied: CurrentlyOccupiedDestinations::new(grid_size),
+            node,
+            active_robots: HashMap::new(),
         }
     }
 
@@ -420,52 +453,126 @@ impl DestinationServer {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = Context::default_from_env().unwrap();
     let mut executor = context.create_basic_executor();
-    let node = executor.create_node("destination_server")?;
+    let node = Arc::new(executor.create_node("destination_server")?);
 
-    let robots = ["robot_1", "robot_2"];
+    let worker = Arc::new(node.create_worker(DestinationServer::new(Arc::clone(&node), 0.5)));
 
-    let worker = node.create_worker(DestinationServer::new(0.5));
+    let worker_weak = Arc::downgrade(&worker);
 
-    let mut subscriptions = Vec::new();
-    let mut goal_publishers = Vec::new();
-    let mut error_publishers = Vec::new();
+    let _discovery_subscription = worker.create_subscription::<ParticipantList, _>(
+        "/destination/discovery",
+        move |server: &mut DestinationServer, msg: ParticipantList| {
+            let Some(worker_strong) = worker_weak.upgrade() else {
+                return;
+            };
 
-    for robot in robots {
-        let goal_publisher = node.create_publisher::<Destination>(
-            &(robot.to_owned() + "/destination"),
-        )?;
-        let error_publisher = node.create_publisher::<DestinationError>(
-            &(robot.to_owned() + "/destination/error"),
-        )?;
-        
-        let robot_id = robot.to_string();
+            for participant in msg.participants {
+                let robot_id = participant.name.clone();
+                if !server.active_robots.contains_key(&robot_id) {
+                    rclrs::log!(
+                        server.node.logger(),
+                        "Discovered new participant: {}",
+                        robot_id
+                    );
 
-        let goal_pub_clone = goal_publisher.clone();
-        let error_pub_clone = error_publisher.clone();
+                    let goal_publisher = match server
+                        .node
+                        .create_publisher::<Destination>(&(robot_id.clone() + "/destination"))
+                    {
+                        Ok(pub_) => pub_,
+                        Err(err) => {
+                            rclrs::log_error!(
+                                server.node.logger(),
+                                "Failed to create destination publisher for {}: {:?}",
+                                robot_id,
+                                err
+                            );
+                            continue;
+                        }
+                    };
 
-        let subscription = worker.create_subscription::<DestinationGoal, _>(
-            &(robot.to_owned() + "/destination/goal"),
-            move |server: &mut DestinationServer, msg: DestinationGoal| {
-                println!("Received goal for {}: {:?}", robot_id, msg);
-                let domain_goal = DomainDestinationGoal::from_ros(&msg);
-                match server.request_destination(&robot_id, &domain_goal) {
-                    Ok(dest) => {
-                        println!("Successfully reserved destination for {}", robot_id);
-                        let _ = goal_pub_clone.publish(&dest.to_ros());
-                    }
-                    Err(err) => {
-                        println!("Failed to reserve destination for {}: {:?}", robot_id, err);
-                        let _ = error_pub_clone.publish(&err.to_ros());
-                    }
+                    let error_publisher = match server.node.create_publisher::<DestinationError>(
+                        &(robot_id.clone() + "/destination/error"),
+                    ) {
+                        Ok(pub_) => pub_,
+                        Err(err) => {
+                            rclrs::log_error!(
+                                server.node.logger(),
+                                "Failed to create error publisher for {}: {:?}",
+                                robot_id,
+                                err
+                            );
+                            continue;
+                        }
+                    };
+
+                    let goal_pub_clone = goal_publisher.clone();
+                    let error_pub_clone = error_publisher.clone();
+                    let robot_id_clone = robot_id.clone();
+
+                    let subscription = match worker_strong
+                        .create_subscription::<DestinationGoal, _>(
+                            &(robot_id.clone() + "/destination/goal"),
+                            move |server: &mut DestinationServer, goal_msg: DestinationGoal| {
+                                let domain_goal = DomainDestinationGoal::from_ros(&goal_msg);
+                                rclrs::log!(
+                                    server.node.logger(),
+                                    "Received goal for {} (session UUID {})",
+                                    robot_id_clone,
+                                    domain_goal.session
+                                );
+                                match server.request_destination(&robot_id_clone, &domain_goal) {
+                                    Ok(dest) => {
+                                        rclrs::log!(
+                                            server.node.logger(),
+                                            "Successfully reserved destination for {} (session UUID {})",
+                                            robot_id_clone,
+                                            dest.session
+                                        );
+                                        let _ = goal_pub_clone.publish(&dest.to_ros());
+                                    }
+                                    Err(err) => {
+                                        rclrs::log_error!(
+                                            server.node.logger(),
+                                            "Failed to reserve destination for {} (session UUID {}): {:?}",
+                                            robot_id_clone,
+                                            err.session,
+                                            err
+                                        );
+                                        let _ = error_pub_clone.publish(&err.to_ros());
+                                    }
+                                }
+                            },
+                        ) {
+                        Ok(sub) => sub,
+                        Err(err) => {
+                            rclrs::log_error!(
+                                server.node.logger(),
+                                "Failed to create subscription for {}: {:?}",
+                                robot_id,
+                                err
+                            );
+                            continue;
+                        }
+                    };
+
+                    server.active_robots.insert(
+                        robot_id,
+                        RobotConnections {
+                            goal_publisher,
+                            error_publisher,
+                            _goal_subscription: subscription,
+                        },
+                    );
                 }
-            },
-        )?;
-        subscriptions.push(subscription);
-        goal_publishers.push(goal_publisher);
-        error_publishers.push(error_publisher);
-    }
+            }
+        },
+    )?;
 
-    println!("Destination server started. Spinning...");
+    rclrs::log!(
+        node.logger(),
+        "Destination server started with dynamic participant discovery using Worker API. Spinning..."
+    );
     executor.spin(SpinOptions::default());
     Ok(())
 }
@@ -546,15 +653,21 @@ mod tests {
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), constraints[0]);
         assert_eq!(od.agent_to_session.get(agent), Some(&session1));
-        assert!(!od.check_if_region_free(&constraints[0].regions[0].region).unwrap());
+        assert!(!od
+            .check_if_region_free(&constraints[0].regions[0].region)
+            .unwrap());
 
         // Reserve second option (should clear first)
         let res = od.reserve_one_of(agent, &[constraints[1].clone()], &session2);
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), constraints[1]);
         assert_eq!(od.agent_to_session.get(agent), Some(&session2));
-        assert!(od.check_if_region_free(&constraints[0].regions[0].region).unwrap());
-        assert!(!od.check_if_region_free(&constraints[1].regions[0].region).unwrap());
+        assert!(od
+            .check_if_region_free(&constraints[0].regions[0].region)
+            .unwrap());
+        assert!(!od
+            .check_if_region_free(&constraints[1].regions[0].region)
+            .unwrap());
 
         // Try to reserve an occupied region
         let session3 = SessionUUID { uuid: [3; 16] };
