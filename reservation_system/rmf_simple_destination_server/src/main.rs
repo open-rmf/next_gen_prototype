@@ -1,9 +1,10 @@
 use rclrs::{Context, CreateBasicExecutor, SpinOptions};
 use rmf_prototype_msgs::msg::{
     Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, Region,
-    TargetRegion,
+    TargetRegion, ParticipantList,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 struct SessionUUID {
@@ -355,14 +356,25 @@ impl CurrentlyOccupiedDestinations {
     }
 }
 
+#[allow(dead_code)]
+struct RobotConnections {
+    goal_publisher: rclrs::Publisher<Destination>,
+    error_publisher: rclrs::Publisher<DestinationError>,
+    _goal_subscription: rclrs::WorkerSubscription<DestinationGoal, DestinationServer>,
+}
+
 struct DestinationServer {
-    currently_occupied: CurrentlyOccupiedDestinations
+    currently_occupied: CurrentlyOccupiedDestinations,
+    node: Arc<rclrs::Node>,
+    active_robots: HashMap<String, RobotConnections>,
 }
 
 impl DestinationServer {
-    fn new(grid_size: f32) -> Self {
+    fn new(node: Arc<rclrs::Node>, grid_size: f32) -> Self {
         Self {
             currently_occupied: CurrentlyOccupiedDestinations::new(grid_size),
+            node,
+            active_robots: HashMap::new(),
         }
     }
 
@@ -420,52 +432,83 @@ impl DestinationServer {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = Context::default_from_env().unwrap();
     let mut executor = context.create_basic_executor();
-    let node = executor.create_node("destination_server")?;
+    let node = Arc::new(executor.create_node("destination_server")?);
 
-    let robots = ["robot_1", "robot_2"];
+    let worker = Arc::new(node.create_worker(DestinationServer::new(Arc::clone(&node), 0.5)));
 
-    let worker = node.create_worker(DestinationServer::new(0.5));
+    let worker_weak = Arc::downgrade(&worker);
 
-    let mut subscriptions = Vec::new();
-    let mut goal_publishers = Vec::new();
-    let mut error_publishers = Vec::new();
+    let _discovery_subscription = worker.create_subscription::<ParticipantList, _>(
+        "/destination/discovery",
+        move |server: &mut DestinationServer, msg: ParticipantList| {
+            let Some(worker_strong) = worker_weak.upgrade() else {
+                return;
+            };
 
-    for robot in robots {
-        let goal_publisher = node.create_publisher::<Destination>(
-            &(robot.to_owned() + "/destination"),
-        )?;
-        let error_publisher = node.create_publisher::<DestinationError>(
-            &(robot.to_owned() + "/destination/error"),
-        )?;
-        
-        let robot_id = robot.to_string();
+            for participant in msg.participants {
+                let robot_id = participant.name.clone();
+                if !server.active_robots.contains_key(&robot_id) {
+                    println!("Discovered new participant: {}", robot_id);
 
-        let goal_pub_clone = goal_publisher.clone();
-        let error_pub_clone = error_publisher.clone();
+                    let goal_publisher = match server.node.create_publisher::<Destination>(
+                        &(robot_id.clone() + "/destination"),
+                    ) {
+                        Ok(pub_) => pub_,
+                        Err(err) => {
+                            eprintln!("Failed to create destination publisher for {}: {:?}", robot_id, err);
+                            continue;
+                        }
+                    };
 
-        let subscription = worker.create_subscription::<DestinationGoal, _>(
-            &(robot.to_owned() + "/destination/goal"),
-            move |server: &mut DestinationServer, msg: DestinationGoal| {
-                println!("Received goal for {}: {:?}", robot_id, msg);
-                let domain_goal = DomainDestinationGoal::from_ros(&msg);
-                match server.request_destination(&robot_id, &domain_goal) {
-                    Ok(dest) => {
-                        println!("Successfully reserved destination for {}", robot_id);
-                        let _ = goal_pub_clone.publish(&dest.to_ros());
-                    }
-                    Err(err) => {
-                        println!("Failed to reserve destination for {}: {:?}", robot_id, err);
-                        let _ = error_pub_clone.publish(&err.to_ros());
-                    }
+                    let error_publisher = match server.node.create_publisher::<DestinationError>(
+                        &(robot_id.clone() + "/destination/error"),
+                    ) {
+                        Ok(pub_) => pub_,
+                        Err(err) => {
+                            eprintln!("Failed to create error publisher for {}: {:?}", robot_id, err);
+                            continue;
+                        }
+                    };
+
+                    let goal_pub_clone = goal_publisher.clone();
+                    let error_pub_clone = error_publisher.clone();
+                    let robot_id_clone = robot_id.clone();
+
+                    let subscription = match worker_strong.create_subscription::<DestinationGoal, _>(
+                        &(robot_id.clone() + "/destination/goal"),
+                        move |server: &mut DestinationServer, goal_msg: DestinationGoal| {
+                            println!("Received goal for {}: {:?}", robot_id_clone, goal_msg);
+                            let domain_goal = DomainDestinationGoal::from_ros(&goal_msg);
+                            match server.request_destination(&robot_id_clone, &domain_goal) {
+                                Ok(dest) => {
+                                    println!("Successfully reserved destination for {}", robot_id_clone);
+                                    let _ = goal_pub_clone.publish(&dest.to_ros());
+                                }
+                                Err(err) => {
+                                    println!("Failed to reserve destination for {}: {:?}", robot_id_clone, err);
+                                    let _ = error_pub_clone.publish(&err.to_ros());
+                                }
+                            }
+                        },
+                    ) {
+                        Ok(sub) => sub,
+                        Err(err) => {
+                            eprintln!("Failed to create subscription for {}: {:?}", robot_id, err);
+                            continue;
+                        }
+                    };
+
+                    server.active_robots.insert(robot_id, RobotConnections {
+                        goal_publisher,
+                        error_publisher,
+                        _goal_subscription: subscription,
+                    });
                 }
-            },
-        )?;
-        subscriptions.push(subscription);
-        goal_publishers.push(goal_publisher);
-        error_publishers.push(error_publisher);
-    }
+            }
+        },
+    )?;
 
-    println!("Destination server started. Spinning...");
+    println!("Destination server started with dynamic participant discovery using Worker API. Spinning...");
     executor.spin(SpinOptions::default());
     Ok(())
 }
