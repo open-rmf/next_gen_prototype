@@ -7,7 +7,7 @@ import launch_testing
 import pytest
 
 import rclpy
-from rmf_prototype_msgs.msg import DestinationGoal, Destination, DestinationError, DestinationConstraints, TargetRegion, Region
+from rmf_prototype_msgs.msg import DestinationGoal, Destination, DestinationError, DestinationConstraints, TargetRegion, Region, ParticipantList, Participant
 
 @pytest.mark.launch_test
 def generate_test_description():
@@ -61,8 +61,25 @@ class TestOverlap(unittest.TestCase):
         
         pub1 = self.node.create_publisher(DestinationGoal, f'{r1_name}/destination/goal', 10)
         pub2 = self.node.create_publisher(DestinationGoal, f'{r2_name}/destination/goal', 10)
+
+        discovery_pub = self.node.create_publisher(
+            ParticipantList,
+            '/destination/discovery',
+            10
+        )
         
         time.sleep(2.0)
+
+        parts = ParticipantList()
+        p1 = Participant()
+        p1.name = r1_name
+        parts.participants.append(p1)
+        p2 = Participant()
+        p2.name = r2_name
+        parts.participants.append(p2)
+        discovery_pub.publish(parts)
+        
+        time.sleep(0.5)
         
         # Robot 1 goal
         goal1 = self.create_goal(10, 10.0, 10.0, 1.0)
@@ -70,6 +87,7 @@ class TestOverlap(unittest.TestCase):
         # Wait for robot 1 to succeed
         start_time = time.time()
         while time.time() - start_time < 5.0:
+            discovery_pub.publish(parts)
             pub1.publish(goal1)
             rclpy.spin_once(self.node, timeout_sec=0.1)
             if r1_received:
@@ -84,6 +102,7 @@ class TestOverlap(unittest.TestCase):
         # Wait for robot 2 to fail
         start_time = time.time()
         while time.time() - start_time < 5.0:
+            discovery_pub.publish(parts)
             pub2.publish(goal2)
             rclpy.spin_once(self.node, timeout_sec=0.1)
             if r2_errors:

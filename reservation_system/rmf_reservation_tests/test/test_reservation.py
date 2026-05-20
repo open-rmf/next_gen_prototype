@@ -7,7 +7,7 @@ import launch_testing
 import pytest
 
 import rclpy
-from rmf_prototype_msgs.msg import DestinationGoal, Destination, DestinationConstraints, TargetRegion, Region
+from rmf_prototype_msgs.msg import DestinationGoal, Destination, DestinationConstraints, TargetRegion, Region, ParticipantList, Participant
 
 @pytest.mark.launch_test
 def generate_test_description():
@@ -64,15 +64,30 @@ class TestReservation(unittest.TestCase):
             f'{robot_name}/destination/goal',
             10
         )
+
+        discovery_pub = self.node.create_publisher(
+            ParticipantList,
+            '/destination/discovery',
+            10
+        )
         
         # Wait for discovery and server to be ready
         time.sleep(2.0)
+
+        parts = ParticipantList()
+        p = Participant()
+        p.name = robot_name
+        parts.participants.append(p)
+        discovery_pub.publish(parts)
+        
+        time.sleep(0.5)
         
         goal = self.create_goal(1, 0.0, 0.0, 1.0)
         
         start_time = time.time()
         timeout = 5.0
         while time.time() - start_time < timeout:
+            discovery_pub.publish(parts)
             pub.publish(goal)
             rclpy.spin_once(self.node, timeout_sec=0.1)
             if received_dest:
