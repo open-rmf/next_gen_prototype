@@ -1,8 +1,9 @@
-use futures::{executor::LocalPool, stream::StreamExt, task::LocalSpawnExt};
-use r2r::QosProfile;
-use r2r::rmf_prototype_msgs::msg::*;
+use rclrs::{Context, CreateBasicExecutor, SpinOptions};
+use rmf_prototype_msgs::msg::{
+    Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, Region,
+    TargetRegion,
+};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 struct SessionUUID {
@@ -10,22 +11,156 @@ struct SessionUUID {
 }
 
 impl SessionUUID {
-    fn from_ros(ros_msg: &r2r::unique_identifier_msgs::msg::UUID) -> Self {
-        let mut uuid = [0u8; 16];
-        let len = ros_msg.uuid.len().min(16);
-        uuid[..len].copy_from_slice(&ros_msg.uuid[..len]);
-        Self { uuid }
-    }
-
-    fn is_zero(&self) -> bool {
-        self.uuid.iter().all(|&b| b == 0)
+    fn from_ros(ros_msg: &unique_identifier_msgs::msg::UUID) -> Self {
+        Self {
+            uuid: ros_msg.uuid,
+        }
     }
 }
 
 #[derive(Debug)]
 enum ShapeErr {
-    UnsupportedHint(u8),
+    UnsupportedHint,
     InvalidPoints,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DomainRegion {
+    pub points: Vec<f32>,
+    pub hint: u8,
+}
+
+impl DomainRegion {
+    const HINT_POINT: u8 = 1;
+    const HINT_AXIS_ALIGNED_RECTANGLE: u8 = 2;
+
+    fn from_ros(ros: &Region) -> Self {
+        Self {
+            points: ros.points.clone(),
+            hint: ros.hint,
+        }
+    }
+
+    fn to_ros(&self) -> Region {
+        Region {
+            points: self.points.clone(),
+            hint: self.hint,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DomainTargetRegion {
+    pub tolerance: f32,
+    pub region: DomainRegion,
+}
+
+impl DomainTargetRegion {
+    fn from_ros(ros: &TargetRegion) -> Self {
+        Self {
+            tolerance: ros.tolerance,
+            region: DomainRegion::from_ros(&ros.region),
+        }
+    }
+
+    fn to_ros(&self) -> TargetRegion {
+        TargetRegion {
+            tolerance: self.tolerance,
+            region: self.region.to_ros(),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DomainDestinationConstraints {
+    pub regions: Vec<DomainTargetRegion>,
+}
+
+impl DomainDestinationConstraints {
+    fn from_ros(ros: &DestinationConstraints) -> Self {
+        Self {
+            regions: ros.regions.iter().map(DomainTargetRegion::from_ros).collect(),
+        }
+    }
+
+    fn to_ros(&self) -> DestinationConstraints {
+        DestinationConstraints {
+            regions: self.regions.iter().map(|r| r.to_ros()).collect(),
+            ..Default::default()
+        }
+    }
+}
+
+struct DomainDestinationGoal {
+    pub one_of: Vec<DomainDestinationConstraints>,
+    pub cost_bias: Vec<f32>,
+    pub session: SessionUUID,
+}
+
+impl DomainDestinationGoal {
+    fn from_ros(ros: &DestinationGoal) -> Self {
+        Self {
+            one_of: ros
+                .one_of
+                .iter()
+                .map(DomainDestinationConstraints::from_ros)
+                .collect(),
+            cost_bias: ros.cost_bias.clone(),
+            session: SessionUUID::from_ros(&ros.session),
+        }
+    }
+}
+
+struct DomainDestination {
+    pub constraints: DomainDestinationConstraints,
+    pub session: SessionUUID,
+}
+
+impl DomainDestination {
+    fn to_ros(&self) -> Destination {
+        Destination {
+            constraints: self.constraints.to_ros(),
+            session: unique_identifier_msgs::msg::UUID {
+                uuid: self.session.uuid,
+            },
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DomainError {
+    pub code: u32,
+    pub message: String,
+    pub parameters: String,
+}
+
+impl DomainError {
+    fn to_ros(&self) -> Error {
+        Error {
+            code: self.code,
+            message: self.message.clone(),
+            parameters: self.parameters.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DomainDestinationError {
+    pub error: DomainError,
+    pub session: SessionUUID,
+}
+
+impl DomainDestinationError {
+    fn to_ros(&self) -> DestinationError {
+        DestinationError {
+            error: self.error.to_ros(),
+            session: unique_identifier_msgs::msg::UUID {
+                uuid: self.session.uuid,
+            },
+        }
+    }
 }
 
 struct CurrentlyOccupiedDestinations {
@@ -68,9 +203,9 @@ impl CurrentlyOccupiedDestinations {
     fn reserve_one_of(
         &mut self,
         agent: &str,
-        constraints: &[DestinationConstraints],
+        constraints: &[DomainDestinationConstraints],
         session: &SessionUUID,
-    ) -> Result<DestinationConstraints, ReservationError> {
+    ) -> Result<DomainDestinationConstraints, ReservationError> {
         let mut allocated_id = None;
         for (id, c) in constraints.iter().enumerate() {
             // check all  regions are free
@@ -118,7 +253,7 @@ impl CurrentlyOccupiedDestinations {
         self.session_to_location.remove(session);
     }
 
-    fn mark_region(&mut self, session: &SessionUUID, region: &Region) {
+    fn mark_region(&mut self, session: &SessionUUID, region: &DomainRegion) {
         let Some((start_x, end_x, start_y, end_y)) = self.get_region_grid_bounds(region) else {
             return;
         };
@@ -143,12 +278,12 @@ impl CurrentlyOccupiedDestinations {
         }
     }
 
-    fn get_region_grid_bounds(&self, region: &Region) -> Option<(usize, usize, usize, usize)> {
-        if region.hint == Region::HINT_AXIS_ALIGNED_RECTANGLE as u8 {
+    fn get_region_grid_bounds(&self, region: &DomainRegion) -> Option<(usize, usize, usize, usize)> {
+        if region.hint == DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE {
             if region.points.len() < 2 || region.points.len() % 2 != 0 {
                 return None;
             }
-        } else if region.hint == Region::HINT_POINT as u8 {
+        } else if region.hint == DomainRegion::HINT_POINT {
             if region.points.len() != 2 {
                 return None;
             }
@@ -189,17 +324,17 @@ impl CurrentlyOccupiedDestinations {
         Some((start_x, end_x, start_y, end_y))
     }
 
-    fn check_if_region_free(&self, region: &Region) -> Result<bool, ShapeErr> {
+    fn check_if_region_free(&self, region: &DomainRegion) -> Result<bool, ShapeErr> {
         let bounds = self.get_region_grid_bounds(region);
         let Some((start_x, end_x, start_y, end_y)) = bounds else {
             // If we can't get bounds (invalid points or negative), we treat it as an error
             // but for simplicity here we'll just check hint if it was invalid points.
-            if region.hint == Region::HINT_AXIS_ALIGNED_RECTANGLE as u8 || region.hint == Region::HINT_POINT as u8 {
+            if region.hint == DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE || region.hint == DomainRegion::HINT_POINT {
                 if region.points.len() < 2 {
                     return Err(ShapeErr::InvalidPoints);
                 }
             } else {
-                return Err(ShapeErr::UnsupportedHint(region.hint));
+                return Err(ShapeErr::UnsupportedHint);
             }
             // If points were okay but negative, we can return true (it's "free" in our tracked positive space)
             return Ok(true);
@@ -234,109 +369,105 @@ impl DestinationServer {
     fn request_destination(
         &mut self,
         agent_id: &str,
-        goals: &DestinationGoal,
-    ) -> Result<Destination, DestinationError> {
+        goals: &DomainDestinationGoal,
+    ) -> Result<DomainDestination, DomainDestinationError> {
         if !goals.cost_bias.is_empty() && goals.one_of.len() != goals.cost_bias.len() {
-            return Err(DestinationError {
-                error: Error {
+            return Err(DomainDestinationError {
+                error: DomainError {
                     code: 0, //TODO(arjoc): reserve a code,
                     message: "Number of goals and destinations do not match".into(),
                     parameters: "TODO".into(),
                 },
-                session: goals.session.clone(),
+                session: goals.session,
             });
         }
 
         let mut sorted_one_of = goals.one_of.clone();
         //TODO(arjoc): Sort goals by on_of length
-        sorted_one_of.sort_by_key(|c| c.regions.len() + c.nodes.len());
+        sorted_one_of.sort_by_key(|c| c.regions.len());
 
         if sorted_one_of.is_empty() {
-            return Err(DestinationError {
-                error: Error {
+            return Err(DomainDestinationError {
+                error: DomainError {
                     code: 0,
                     message: "No goals provided".into(),
                     parameters: "one_of is empty".into(),
                 },
-                session: goals.session.clone(),
+                session: goals.session,
             });
         }
 
-        let session = SessionUUID::from_ros(&goals.session);
-        match self.currently_occupied.reserve_one_of(agent_id, &sorted_one_of, &session) {
-            Ok(constraints) => Ok(Destination {
+        match self
+            .currently_occupied
+            .reserve_one_of(agent_id, &sorted_one_of, &goals.session)
+        {
+            Ok(constraints) => Ok(DomainDestination {
                 constraints,
-                timestamp: r2r::builtin_interfaces::msg::Time { sec: 0, nanosec: 0 },
-                session: goals.session.clone(),
-                detour_for_goal: r2r::unique_identifier_msgs::msg::UUID {
-                    uuid: [0; 16].to_vec(),
-                },
+                session: goals.session,
             }),
-            Err(_) => Err(DestinationError {
-                error: Error {
+            Err(_) => Err(DomainDestinationError {
+                error: DomainError {
                     code: 0,
                     message: "No available constraints".into(),
                     parameters: "".into(),
                 },
-                session: goals.session.clone(),
+                session: goals.session,
             }),
         }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = r2r::Context::create()?;
-    let mut node = r2r::Node::create(ctx, "destination_server", "")?;
-
-    let mut pool = LocalPool::new();
-    let spawner = pool.spawner();
+    let context = Context::default_from_env().unwrap();
+    let mut executor = context.create_basic_executor();
+    let node = executor.create_node("destination_server")?;
 
     let robots = ["robot_1", "robot_2"];
 
-    let destination_server = Arc::new(Mutex::new(DestinationServer::new(0.5)));
+    let worker = node.create_worker(DestinationServer::new(0.5));
+
+    let mut subscriptions = Vec::new();
+    let mut goal_publishers = Vec::new();
+    let mut error_publishers = Vec::new();
 
     for robot in robots {
         let goal_publisher = node.create_publisher::<Destination>(
             &(robot.to_owned() + "/destination"),
-            QosProfile::default(),
         )?;
         let error_publisher = node.create_publisher::<DestinationError>(
             &(robot.to_owned() + "/destination/error"),
-            QosProfile::default(),
         )?;
-        let mut sub = node.subscribe::<DestinationGoal>(
+        
+        let robot_id = robot.to_string();
+
+        let goal_pub_clone = goal_publisher.clone();
+        let error_pub_clone = error_publisher.clone();
+
+        let subscription = worker.create_subscription::<DestinationGoal, _>(
             &(robot.to_owned() + "/destination/goal"),
-            QosProfile::default(),
-        )?;
-        let destination_server = destination_server.clone();
-        let robot = robot.to_string();
-        spawner.spawn_local(async move {
-            loop {
-                match sub.next().await {
-                    Some(msg) => {
-                        println!("Received goal for {}: {:?}", robot, msg);
-                        let mut server = destination_server.lock().unwrap();
-                        match server.request_destination(&robot, &msg) {
-                            Ok(dest) => {
-                                println!("Successfully reserved destination for {}", robot);
-                                let _ = goal_publisher.publish(&dest);
-                            }
-                            Err(err) => {
-                                println!("Failed to reserve destination for {}: {:?}", robot, err);
-                                let _ = error_publisher.publish(&err);
-                            }
-                        }
+            move |server: &mut DestinationServer, msg: DestinationGoal| {
+                println!("Received goal for {}: {:?}", robot_id, msg);
+                let domain_goal = DomainDestinationGoal::from_ros(&msg);
+                match server.request_destination(&robot_id, &domain_goal) {
+                    Ok(dest) => {
+                        println!("Successfully reserved destination for {}", robot_id);
+                        let _ = goal_pub_clone.publish(&dest.to_ros());
                     }
-                    None => break,
+                    Err(err) => {
+                        println!("Failed to reserve destination for {}: {:?}", robot_id, err);
+                        let _ = error_pub_clone.publish(&err.to_ros());
+                    }
                 }
-            }
-        })?;
+            },
+        )?;
+        subscriptions.push(subscription);
+        goal_publishers.push(goal_publisher);
+        error_publishers.push(error_publisher);
     }
 
-    loop {
-        node.spin_once(std::time::Duration::from_millis(100));
-        pool.run_until_stalled();
-    }
+    println!("Destination server started. Spinning...");
+    executor.spin(SpinOptions::default());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -351,10 +482,9 @@ mod tests {
     fn test_mark_and_check_region() {
         let mut od = create_test_occupied();
         let session = SessionUUID { uuid: [1; 16] };
-        let region = Region {
-            hint: Region::HINT_AXIS_ALIGNED_RECTANGLE as u8,
+        let region = DomainRegion {
+            hint: DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE,
             points: vec![0.0, 0.0, 2.0, 2.0],
-            ..Default::default()
         };
 
         assert!(od.check_if_region_free(&region).unwrap());
@@ -370,10 +500,9 @@ mod tests {
     fn test_clear_old_uuid() {
         let mut od = create_test_occupied();
         let session = SessionUUID { uuid: [1; 16] };
-        let region = Region {
-            hint: Region::HINT_AXIS_ALIGNED_RECTANGLE as u8,
+        let region = DomainRegion {
+            hint: DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE,
             points: vec![0.0, 0.0, 1.0, 1.0],
-            ..Default::default()
         };
 
         od.mark_region(&session, &region);
@@ -392,27 +521,23 @@ mod tests {
         let session2 = SessionUUID { uuid: [2; 16] };
 
         let constraints = vec![
-            DestinationConstraints {
-                regions: vec![TargetRegion {
-                    region: Region {
-                        hint: Region::HINT_AXIS_ALIGNED_RECTANGLE as u8,
+            DomainDestinationConstraints {
+                regions: vec![DomainTargetRegion {
+                    tolerance: 0.0,
+                    region: DomainRegion {
+                        hint: DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE,
                         points: vec![0.0, 0.0, 1.0, 1.0],
-                        ..Default::default()
                     },
-                    ..Default::default()
                 }],
-                ..Default::default()
             },
-            DestinationConstraints {
-                regions: vec![TargetRegion {
-                    region: Region {
-                        hint: Region::HINT_AXIS_ALIGNED_RECTANGLE as u8,
+            DomainDestinationConstraints {
+                regions: vec![DomainTargetRegion {
+                    tolerance: 0.0,
+                    region: DomainRegion {
+                        hint: DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE,
                         points: vec![5.0, 5.0, 6.0, 6.0],
-                        ..Default::default()
                     },
-                    ..Default::default()
                 }],
-                ..Default::default()
             },
         ];
 

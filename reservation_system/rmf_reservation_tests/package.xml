@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rmf_reservation_tests</name>
+  <version>0.0.1</version>
+  <description>Launch tests for RMF reservation system.</description>
+  <maintainer email="arjoc@google.com">Arjoc</maintainer>
+  <license>Apache License 2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <test_depend>launch_testing</test_depend>
+  <test_depend>launch_testing_ros</test_depend>
+  <test_depend>rmf_simple_destination_server</test_depend>
+  <test_depend>rmf_prototype_msgs</test_depend>
+  <test_depend>rclpy</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
