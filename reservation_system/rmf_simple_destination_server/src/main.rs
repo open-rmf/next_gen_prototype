@@ -1,7 +1,7 @@
 use rclrs::{Context, CreateBasicExecutor, SpinOptions};
 use rmf_prototype_msgs::msg::{
-    Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, ParticipantList,
-    Region, TargetRegion,
+    Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, Region,
+    TargetRegion,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -377,25 +377,22 @@ impl CurrentlyOccupiedDestinations {
     }
 }
 
-#[allow(dead_code)]
 struct RobotConnections {
     goal_publisher: rclrs::Publisher<Destination>,
     error_publisher: rclrs::Publisher<DestinationError>,
-    _goal_subscription: rclrs::WorkerSubscription<DestinationGoal, DestinationServer>,
+    _goal_subscription: rclrs::WorkerSubscription<DestinationGoal, DestinationsServer>,
 }
 
-struct DestinationServer {
+struct DestinationsServer {
     currently_occupied: CurrentlyOccupiedDestinations,
     node: Arc<rclrs::Node>,
-    active_robots: HashMap<String, RobotConnections>,
 }
 
-impl DestinationServer {
+impl DestinationsServer {
     fn new(node: Arc<rclrs::Node>, grid_size: f32) -> Self {
         Self {
             currently_occupied: CurrentlyOccupiedDestinations::new(grid_size),
             node,
-            active_robots: HashMap::new(),
         }
     }
 
@@ -416,7 +413,6 @@ impl DestinationServer {
         }
 
         let mut sorted_one_of = goals.one_of.clone();
-        //TODO(arjoc): Sort goals by on_of length
         sorted_one_of.sort_by_key(|c| c.regions.len());
 
         if sorted_one_of.is_empty() {
@@ -450,128 +446,154 @@ impl DestinationServer {
     }
 }
 
+struct DiscoveryServer {
+    node: Arc<rclrs::Node>,
+    active_robots: HashMap<String, RobotConnections>,
+    destinations_worker: Arc<rclrs::Worker<DestinationsServer>>,
+}
+
+impl DiscoveryServer {
+    fn new(
+        node: Arc<rclrs::Node>,
+        destinations_worker: Arc<rclrs::Worker<DestinationsServer>>,
+    ) -> Self {
+        Self {
+            node,
+            active_robots: HashMap::new(),
+            destinations_worker,
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = Context::default_from_env().unwrap();
     let mut executor = context.create_basic_executor();
     let node = Arc::new(executor.create_node("destination_server")?);
 
-    let worker = Arc::new(node.create_worker(DestinationServer::new(Arc::clone(&node), 0.5)));
+    // 1. Create the Destinations worker (Data Plane)
+    let destinations_worker =
+        Arc::new(node.create_worker(DestinationsServer::new(Arc::clone(&node), 0.5)));
 
-    let worker_weak = Arc::downgrade(&worker);
+    // 2. Create the Discovery worker (Control Plane), passing a reference to the Destinations worker
+    let discovery_worker = Arc::new(node.create_worker(DiscoveryServer::new(
+        Arc::clone(&node),
+        Arc::clone(&destinations_worker),
+    )));
 
-    let _discovery_subscription = worker.create_subscription::<ParticipantList, _>(
+    // 3. Subscribe to discovery using the shared helper
+    let _discovery_subscription = rmf_participant_discovery::create_discovery_subscription(
+        &discovery_worker,
         "/destination/discovery",
-        move |server: &mut DestinationServer, msg: ParticipantList| {
-            let Some(worker_strong) = worker_weak.upgrade() else {
-                return;
-            };
+        |server: &mut DiscoveryServer, robot_id: &str| {
+            if !server.active_robots.contains_key(robot_id) {
+                rclrs::log!(
+                    server.node.logger(),
+                    "Discovered new participant: {}",
+                    robot_id
+                );
 
-            for participant in msg.participants {
-                let robot_id = participant.name.clone();
-                if !server.active_robots.contains_key(&robot_id) {
-                    rclrs::log!(
-                        server.node.logger(),
-                        "Discovered new participant: {}",
-                        robot_id
-                    );
+                let goal_publisher = match server
+                    .node
+                    .create_publisher::<Destination>(&(robot_id.to_string() + "/destination"))
+                {
+                    Ok(pub_) => pub_,
+                    Err(err) => {
+                        rclrs::log_error!(
+                            server.node.logger(),
+                            "Failed to create destination publisher for {}: {:?}",
+                            robot_id,
+                            err
+                        );
+                        return;
+                    }
+                };
 
-                    let goal_publisher = match server
-                        .node
-                        .create_publisher::<Destination>(&(robot_id.clone() + "/destination"))
-                    {
-                        Ok(pub_) => pub_,
-                        Err(err) => {
-                            rclrs::log_error!(
-                                server.node.logger(),
-                                "Failed to create destination publisher for {}: {:?}",
-                                robot_id,
-                                err
+                let error_publisher = match server.node.create_publisher::<DestinationError>(
+                    &(robot_id.to_string() + "/destination/error"),
+                ) {
+                    Ok(pub_) => pub_,
+                    Err(err) => {
+                        rclrs::log_error!(
+                            server.node.logger(),
+                            "Failed to create error publisher for {}: {:?}",
+                            robot_id,
+                            err
+                        );
+                        return;
+                    }
+                };
+
+                let goal_pub_clone = goal_publisher.clone();
+                let error_pub_clone = error_publisher.clone();
+                let robot_id_clone = robot_id.to_string();
+
+                // Create the goal subscription on the destinations_worker thread context!
+                let subscription = match server.destinations_worker
+                    .create_subscription::<DestinationGoal, _>(
+                        &(robot_id.to_string() + "/destination/goal"),
+                        move |dest_server: &mut DestinationsServer, goal_msg: DestinationGoal| {
+                            let domain_goal = DomainDestinationGoal::from_ros(&goal_msg);
+                            rclrs::log!(
+                                dest_server.node.logger(),
+                                "Received goal for {} (session UUID {})",
+                                robot_id_clone,
+                                domain_goal.session
                             );
-                            continue;
-                        }
-                    };
-
-                    let error_publisher = match server.node.create_publisher::<DestinationError>(
-                        &(robot_id.clone() + "/destination/error"),
-                    ) {
-                        Ok(pub_) => pub_,
-                        Err(err) => {
-                            rclrs::log_error!(
-                                server.node.logger(),
-                                "Failed to create error publisher for {}: {:?}",
-                                robot_id,
-                                err
-                            );
-                            continue;
-                        }
-                    };
-
-                    let goal_pub_clone = goal_publisher.clone();
-                    let error_pub_clone = error_publisher.clone();
-                    let robot_id_clone = robot_id.clone();
-
-                    let subscription = match worker_strong
-                        .create_subscription::<DestinationGoal, _>(
-                            &(robot_id.clone() + "/destination/goal"),
-                            move |server: &mut DestinationServer, goal_msg: DestinationGoal| {
-                                let domain_goal = DomainDestinationGoal::from_ros(&goal_msg);
-                                rclrs::log!(
-                                    server.node.logger(),
-                                    "Received goal for {} (session UUID {})",
-                                    robot_id_clone,
-                                    domain_goal.session
-                                );
-                                match server.request_destination(&robot_id_clone, &domain_goal) {
-                                    Ok(dest) => {
-                                        rclrs::log!(
-                                            server.node.logger(),
-                                            "Successfully reserved destination for {} (session UUID {})",
-                                            robot_id_clone,
-                                            dest.session
-                                        );
-                                        let _ = goal_pub_clone.publish(&dest.to_ros());
-                                    }
-                                    Err(err) => {
-                                        rclrs::log_error!(
-                                            server.node.logger(),
-                                            "Failed to reserve destination for {} (session UUID {}): {:?}",
-                                            robot_id_clone,
-                                            err.session,
-                                            err
-                                        );
-                                        let _ = error_pub_clone.publish(&err.to_ros());
-                                    }
+                            match dest_server.request_destination(&robot_id_clone, &domain_goal) {
+                                Ok(dest) => {
+                                    rclrs::log!(
+                                        dest_server.node.logger(),
+                                        "Successfully reserved destination for {} (session UUID {})",
+                                        robot_id_clone,
+                                        dest.session
+                                    );
+                                    let _ = goal_pub_clone.publish(&dest.to_ros());
                                 }
-                            },
-                        ) {
-                        Ok(sub) => sub,
-                        Err(err) => {
-                            rclrs::log_error!(
-                                server.node.logger(),
-                                "Failed to create subscription for {}: {:?}",
-                                robot_id,
-                                err
-                            );
-                            continue;
-                        }
-                    };
-
-                    server.active_robots.insert(
-                        robot_id,
-                        RobotConnections {
-                            goal_publisher,
-                            error_publisher,
-                            _goal_subscription: subscription,
+                                Err(err) => {
+                                    rclrs::log_error!(
+                                        dest_server.node.logger(),
+                                        "Failed to reserve destination for {} (session UUID {}): {:?}",
+                                        robot_id_clone,
+                                        err.session,
+                                        err
+                                    );
+                                    let _ = error_pub_clone.publish(&err.to_ros());
+                                }
+                            }
                         },
-                    );
-                }
+                    ) {
+                    Ok(sub) => sub,
+                    Err(err) => {
+                        rclrs::log_error!(
+                            server.node.logger(),
+                            "Failed to create goal subscription on DestinationsWorker for {}: {:?}",
+                            robot_id,
+                            err
+                        );
+                        return;
+                    }
+                };
+
+                server.active_robots.insert(
+                    robot_id.to_string(),
+                    RobotConnections {
+                        goal_publisher,
+                        error_publisher,
+                        _goal_subscription: subscription,
+                    },
+                );
+            }
+        },
+        |server: &mut DiscoveryServer, robot_id: &str| {
+            if server.active_robots.remove(robot_id).is_some() {
+                rclrs::log!(server.node.logger(), "Participant left: {}", robot_id);
             }
         },
     )?;
 
     rclrs::log!(
         node.logger(),
-        "Destination server started with dynamic participant discovery using Worker API. Spinning..."
+        "Destination server started with multi-worker separation (DiscoveryWorker + DestinationsWorker). Spinning..."
     );
     executor.spin(SpinOptions::default());
     Ok(())
