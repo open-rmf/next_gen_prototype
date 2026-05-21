@@ -1,0 +1,8 @@
+[package]
+name = "rmf_participant_discovery"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rclrs = "*"
+rmf_prototype_msgs = "*"
