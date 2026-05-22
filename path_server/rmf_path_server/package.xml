@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rmf_path_server</name>
+  <version>0.0.1</version>
+  <description>A simple path server for RMF next generation prototype.</description>
+  <maintainer email="arjoc@intrinsic.ai">Arjo Chakravarty</maintainer>
+  <license>Apache License 2.0</license>
+
+  <buildtool_depend>ament_cargo</buildtool_depend>
+
+  <build_depend>rclrs</build_depend>
+  <build_depend>rmf_prototype_msgs</build_depend>
+  <build_depend>rmf_participant_discovery</build_depend>
+  <build_depend>unique_identifier_msgs</build_depend>
+  <build_depend>example_interfaces</build_depend>
+  <build_depend>test_msgs</build_depend>
+  <build_depend>nav_msgs</build_depend>
+
+  <exec_depend>rclrs</exec_depend>
+  <exec_depend>rmf_prototype_msgs</exec_depend>
+  <exec_depend>rmf_participant_discovery</exec_depend>
+  <exec_depend>unique_identifier_msgs</exec_depend>
+  <exec_depend>example_interfaces</exec_depend>
+  <exec_depend>test_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_cargo</build_type>
+  </export>
+</package>
