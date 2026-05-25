@@ -20,6 +20,8 @@ from rmf_prototype_msgs.msg import (
     ParticipantList,
     Region,
     TargetRegion,
+    Plan,
+    Progress,
 )
 
 # Global node reference for the HTTP request handler to access
@@ -145,6 +147,8 @@ class RobotSpawnerNode(Node):
         self.sse_clients_lock = threading.Lock()
         self.robot_goals = {}
         self.odom_subs = {}
+        self.plan_subs = {}
+        self.progress_subs = {}
         self.discovery_timer = None
 
         # Publishers for ROS 2 control plane
@@ -235,8 +239,10 @@ class RobotSpawnerNode(Node):
             self.active_processes[name] = proc
             self.get_logger().info(f"Spawned process for '{name}' successfully (PID {proc.pid})")
 
-            # Subscribe to this robot's odometry dynamically
+            # Subscribe to this robot's topics dynamically
             self.subscribe_to_odom(name)
+            self.subscribe_to_plan(name)
+            self.subscribe_to_progress(name)
 
         except Exception as e:
             self.get_logger().error(f"Failed to spawn robot process: {e}")
@@ -263,6 +269,62 @@ class RobotSpawnerNode(Node):
             Odometry,
             f'{name}/odom',
             odom_callback,
+            10
+        )
+
+    def subscribe_to_plan(self, name):
+        if name in self.plan_subs:
+            return
+
+        self.get_logger().info(f"Subscribing to dynamic plan topic for '{name}'")
+
+        def plan_callback(msg, r_name=name):
+            wps = []
+            for wp in msg.waypoints:
+                blockers = []
+                for blocker in wp.departure_blockers:
+                    blockers.append({
+                        "name": blocker.name,
+                        "required_progress": float(blocker.required_progress)
+                    })
+                wps.append({
+                    "x": float(wp.position[0]),
+                    "y": float(wp.position[1]),
+                    "progress": float(wp.progress),
+                    "departure_blockers": blockers
+                })
+            data = json.dumps({
+                "type": "plan",
+                "name": r_name,
+                "waypoints": wps
+            })
+            self.broadcast(data)
+
+        self.plan_subs[name] = self.create_subscription(
+            Plan,
+            f'{name}/plan',
+            plan_callback,
+            10
+        )
+
+    def subscribe_to_progress(self, name):
+        if name in self.progress_subs:
+            return
+
+        self.get_logger().info(f"Subscribing to dynamic progress topic for '{name}'")
+
+        def progress_callback(msg, r_name=name):
+            data = json.dumps({
+                "type": "progress",
+                "name": r_name,
+                "progress": float(msg.progress)
+            })
+            self.broadcast(data)
+
+        self.progress_subs[name] = self.create_subscription(
+            Progress,
+            f'{name}/plan/progress',
+            progress_callback,
             10
         )
 
@@ -356,6 +418,14 @@ class RobotSpawnerNode(Node):
         for sub in self.odom_subs.values():
             self.destroy_subscription(sub)
         self.odom_subs.clear()
+
+        for sub in self.plan_subs.values():
+            self.destroy_subscription(sub)
+        self.plan_subs.clear()
+
+        for sub in self.progress_subs.values():
+            self.destroy_subscription(sub)
+        self.progress_subs.clear()
 
         for pub in self.dest_publishers.values():
             self.destroy_publisher(pub)

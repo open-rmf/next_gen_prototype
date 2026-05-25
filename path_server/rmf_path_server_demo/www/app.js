@@ -73,6 +73,17 @@ function initSSE() {
           }
           updateRobotListUI();
         }
+      } else if (msg.type === 'plan') {
+        const r = robots.find(robot => robot.name === msg.name);
+        if (r) {
+          r.waypoints = msg.waypoints;
+          console.log(`Received plan for ${msg.name} with ${msg.waypoints.length} waypoints.`);
+        }
+      } else if (msg.type === 'progress') {
+        const r = robots.find(robot => robot.name === msg.name);
+        if (r) {
+          r.progress = msg.progress;
+        }
       }
     } catch (e) {
       // Ignore keepalive or parse errors
@@ -216,7 +227,9 @@ canvas.addEventListener('click', (e) => {
       current_y: gridPos.y,
       goal_x: null,
       goal_y: null,
-      status: 'Pending'
+      status: 'Pending',
+      waypoints: [],
+      progress: 0.0
     };
 
     robots.push(newRobot);
@@ -332,6 +345,45 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   initSSE();
 });
 
+// Helper to draw dependency arrow with optional dash animation
+function drawDependencyArrow(ctx, fromX, fromY, toX, toY, isBlocking) {
+  const headlen = 8; // length of head in pixels
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const angle = Math.atan2(dy, dx);
+  
+  ctx.save();
+  ctx.shadowBlur = 0; // Disable shadow glow for dependency lines to keep canvas clean
+  
+  if (isBlocking) {
+    // Neon Orange pulsing animated flow
+    ctx.strokeStyle = '#ff5500';
+    ctx.lineWidth = 2.0;
+    ctx.setLineDash([6, 4]);
+    ctx.lineDashOffset = -Date.now() / 50 % 100;
+  } else {
+    // Faded translucent green static dash
+    ctx.strokeStyle = 'rgba(0, 255, 135, 0.25)';
+    ctx.lineWidth = 1.0;
+    ctx.setLineDash([4, 4]);
+  }
+  
+  ctx.beginPath();
+  ctx.moveTo(fromX, fromY);
+  ctx.lineTo(toX, toY);
+  ctx.stroke();
+  
+  // Arrow head
+  ctx.fillStyle = isBlocking ? '#ff5500' : 'rgba(0, 255, 135, 0.4)';
+  ctx.beginPath();
+  ctx.moveTo(toX, toY);
+  ctx.lineTo(toX - headlen * Math.cos(angle - Math.PI / 12), toY - headlen * Math.sin(angle - Math.PI / 12));
+  ctx.lineTo(toX - headlen * Math.cos(angle + Math.PI / 12), toY - headlen * Math.sin(angle + Math.PI / 12));
+  ctx.fill();
+  
+  ctx.restore();
+}
+
 // Rendering grid background and actors
 function drawGrid() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -388,12 +440,67 @@ function drawGrid() {
     ctx.fillText(y.toString(), centerX - 8, pix.y);
   }
 
-  // 4. Draw goal routes (dotted lines)
+  // 4. Draw plans, actual routes, and dependencies
   robots.forEach(r => {
-    if (r.goal_x !== null) {
+    if (r.waypoints && r.waypoints.length > 0) {
+      // 4a. Draw actual scheduled path computed by mapf
+      ctx.save();
+      ctx.strokeStyle = r.color;
+      ctx.lineWidth = 2.0;
+      ctx.shadowColor = r.color;
+      ctx.shadowBlur = 4;
+      
+      ctx.beginPath();
+      const startPix = toPixel(r.waypoints[0].x, r.waypoints[0].y);
+      ctx.moveTo(startPix.x, startPix.y);
+      for (let i = 1; i < r.waypoints.length; i++) {
+        const wpPix = toPixel(r.waypoints[i].x, r.waypoints[i].y);
+        ctx.lineTo(wpPix.x, wpPix.y);
+      }
+      ctx.stroke();
+      ctx.restore();
+
+      // 4b. Draw waypoint marker dots
+      r.waypoints.forEach((wp, idx) => {
+        const wpPix = toPixel(wp.x, wp.y);
+        ctx.save();
+        ctx.fillStyle = r.color;
+        ctx.beginPath();
+        ctx.arc(wpPix.x, wpPix.y, 4, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.restore();
+
+        // 4c. Draw departure dependencies for this waypoint
+        if (wp.departure_blockers) {
+          wp.departure_blockers.forEach(dep => {
+            const dependedRobot = robots.find(bot => bot.name === dep.name);
+            if (dependedRobot) {
+              // Check if the dependency is active or resolved
+              const isBlocking = dependedRobot.progress === undefined || dependedRobot.progress < dep.required_progress;
+
+              // Find physical coordinate of the dependency trigger waypoint on the depended robot's path
+              let depX = dependedRobot.current_x;
+              let depY = dependedRobot.current_y;
+              if (dependedRobot.waypoints) {
+                const matchWp = dependedRobot.waypoints.find(w => Math.abs(w.progress - dep.required_progress) < 1e-2);
+                if (matchWp) {
+                  depX = matchWp.x;
+                  depY = matchWp.y;
+                }
+              }
+
+              const depPix = toPixel(depX, depY);
+              drawDependencyArrow(ctx, wpPix.x, wpPix.y, depPix.x, depPix.y, isBlocking);
+            }
+          });
+        }
+      });
+    } else if (r.goal_x !== null) {
+      // Fallback to straight dotted goal route in setup mode before plan is generated
       const curPix = toPixel(r.current_x, r.current_y);
       const goalPix = toPixel(r.goal_x, r.goal_y);
 
+      ctx.save();
       ctx.strokeStyle = r.color;
       ctx.lineWidth = 1.5;
       ctx.setLineDash([5, 5]);
@@ -401,7 +508,7 @@ function drawGrid() {
       ctx.moveTo(curPix.x, curPix.y);
       ctx.lineTo(goalPix.x, goalPix.y);
       ctx.stroke();
-      ctx.setLineDash([]); // Reset
+      ctx.restore();
     }
   });
 
