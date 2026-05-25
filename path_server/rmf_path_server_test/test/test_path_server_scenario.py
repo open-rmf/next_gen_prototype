@@ -172,9 +172,10 @@ class TestPathServerScenario(unittest.TestCase):
 
         # Run simulation and verify both robots reach their destinations
         start_time = time.time()
-        timeout = 12.0
+        timeout = 15.0
         r1_reached = False
         r2_reached = False
+        r1_redirected = False
 
         while time.time() - start_time < timeout:
             # Keep publishing discovery so they aren't considered disconnected
@@ -185,9 +186,22 @@ class TestPathServerScenario(unittest.TestCase):
             if r1_odoms:
                 x = r1_odoms[-1].pose.pose.position.x
                 y = r1_odoms[-1].pose.pose.position.y
-                # Goal is 5.0, 0.0
-                if abs(x - 5.0) < 0.25 and abs(y - 0.0) < 0.25:
-                    r1_reached = True
+
+                if x > 2.0 and not r1_redirected:
+                    print(
+                        f'robot_1 is midway at ({x:.2f}, {y:.2f}), '
+                        'redirecting to (5.0, 5.0)...'
+                    )
+                    dest_1_new = self.create_destination(3, 5.0, 5.0, 1.0)
+                    r1_dest_pub.publish(dest_1_new)
+                    r1_redirected = True
+
+                if r1_redirected:
+                    if abs(x - 5.0) < 0.25 and abs(y - 5.0) < 0.25:
+                        r1_reached = True
+                else:
+                    if abs(x - 5.0) < 0.25 and abs(y - 0.0) < 0.25:
+                        r1_reached = True
 
             if r2_odoms:
                 x = r2_odoms[-1].pose.pose.position.x
@@ -201,7 +215,7 @@ class TestPathServerScenario(unittest.TestCase):
 
             time.sleep(0.2)
 
-        self.assertTrue(r1_reached, 'robot_1 did not reach destination (5.0, 0.0)')
+        self.assertTrue(r1_reached, 'robot_1 did not reach destination (5.0, 5.0)')
         self.assertTrue(r2_reached, 'robot_2 did not reach destination (3.0, 0.0)')
 
         # Verify robot_1 moved and did not collide with robot_2

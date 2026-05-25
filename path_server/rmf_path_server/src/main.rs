@@ -9,16 +9,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut executor = context.create_basic_executor();
     let node = Arc::new(executor.create_node("path_server")?);
 
-    // 1. Create the Destinations worker (Data Plane)
+    // Create the Destinations worker (Data Plane)
     let destinations_worker = Arc::new(node.create_worker(PlanServer::new(Arc::clone(&node), PibtPlanner::default())));
 
-    // 2. Create the Discovery worker (Control Plane), passing a reference to the Destinations worker
+    // Create a periodic timer on the Destinations worker to trigger replans asynchronously.
+    // This avoids blocking subscriber callbacks and coalesces multiple updates within the tick duration.
+    let _replan_timer = destinations_worker.create_timer_repeating(
+        std::time::Duration::from_millis(100),
+        move |server: &mut PlanServer<PibtPlanner>| {
+            server.replan();
+        },
+    )?;
+
+    // Create the Discovery worker (Control Plane), passing a reference to the Destinations worker
     let discovery_worker = Arc::new(node.create_worker(DiscoveryServer::new(
         Arc::clone(&node),
         Arc::clone(&destinations_worker),
     )));
 
-    // 3. Subscribe to discovery on the Discovery worker using the shared generic helper
+    // Subscribe to discovery on the Discovery worker using the shared generic helper
     let _discovery_subscription = rmf_participant_discovery::create_discovery_subscription(
         &discovery_worker,
         "/destination/discovery",
