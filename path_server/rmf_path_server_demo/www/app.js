@@ -7,6 +7,8 @@ let selectedRobotName = null;
 let interactionMode = 'normal'; // 'normal', 'add-robot', 'set-goal'
 let systemMode = 'setup'; // 'setup', 'live'
 let eventSource = null;
+let mouseX = 0;
+let mouseY = 0;
 
 // Canvas config
 const canvas = document.getElementById('grid-canvas');
@@ -170,20 +172,20 @@ function updateRobotListUI() {
 }
 
 function selectRobot(name) {
-  if (systemMode === 'live') return;
   selectedRobotName = name;
   interactionMode = 'set-goal';
-  showInstruction(`Click on the grid to place the Goal for ${name}.`);
+  const verb = systemMode === 'live' ? 'NEW Goal' : 'Goal';
+  showInstruction(`Click on the grid to place the ${verb} for ${name}.`);
   updateRobotListUI();
 }
 
 // Interactive canvas click/hover bindings
 canvas.addEventListener('mousemove', (e) => {
   const rect = canvas.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
+  mouseX = e.clientX - rect.left;
+  mouseY = e.clientY - rect.top;
   
-  const gridPos = toGrid(mx, my);
+  const gridPos = toGrid(mouseX, mouseY);
   document.getElementById('coords-display').textContent = `X: ${gridPos.x} | Y: ${gridPos.y}`;
 });
 
@@ -228,20 +230,23 @@ canvas.addEventListener('click', (e) => {
   else if (interactionMode === 'set-goal') {
     const robot = robots.find(r => r.name === selectedRobotName);
     if (robot) {
-      // Goal is strictly checked to prevent overlaying on starting poses or other goals
+      // Goal is strictly checked to prevent overlaying on active poses or other goals
       const cellOccupied = robots.some(r => 
         (r.name !== robot.name) && 
-        ((r.start_x === gridPos.x && r.start_y === gridPos.y) || (r.goal_x === gridPos.x && r.goal_y === gridPos.y))
+        (
+          (systemMode === 'setup' && r.start_x === gridPos.x && r.start_y === gridPos.y) || 
+          (r.goal_x === gridPos.x && r.goal_y === gridPos.y)
+        )
       );
       
       if (cellOccupied) {
-        alert('This grid coordinate is already occupied by another robot or goal!');
+        alert('This grid coordinate is already occupied by another active goal!');
         return;
       }
 
       robot.goal_x = gridPos.x;
       robot.goal_y = gridPos.y;
-      robot.status = 'Pending';
+      robot.status = systemMode === 'live' ? 'Planning' : 'Pending';
       
       sendGoalRequest(robot);
 
@@ -259,7 +264,7 @@ canvas.addEventListener('click', (e) => {
       return dist < 15; // within 15 pixels radius
     });
 
-    if (clickedRobot && systemMode === 'setup') {
+    if (clickedRobot) {
       selectRobot(clickedRobot.name);
     }
   }
@@ -400,6 +405,22 @@ function drawGrid() {
     }
   });
 
+  // 4.5. Draw active dynamic target guide line if in set-goal mode
+  if (interactionMode === 'set-goal' && selectedRobotName) {
+    const r = robots.find(robot => robot.name === selectedRobotName);
+    if (r) {
+      const curPix = toPixel(r.current_x, r.current_y);
+      ctx.strokeStyle = r.color;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(curPix.x, curPix.y);
+      ctx.lineTo(mouseX, mouseY);
+      ctx.stroke();
+      ctx.setLineDash([]); // Reset
+    }
+  }
+
   // 5. Draw goals
   robots.forEach(r => {
     if (r.goal_x !== null) {
@@ -438,6 +459,16 @@ function drawGrid() {
     // Set glowing neon effect
     ctx.shadowColor = r.color;
     ctx.shadowBlur = 10;
+
+    // Draw pulsing active selection ring
+    if (r.name === selectedRobotName) {
+      ctx.strokeStyle = r.color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      const ringRadius = 13 + 2 * Math.sin(Date.now() / 150);
+      ctx.arc(pix.x, pix.y, ringRadius, 0, 2 * Math.PI);
+      ctx.stroke();
+    }
 
     // Draw rounded square
     ctx.fillStyle = r.color;

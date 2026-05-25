@@ -208,6 +208,12 @@ class RobotSpawnerNode(Node):
                 self.get_logger().info(f"Robot '{name}' is already running.")
                 return
 
+        # Ensure any orphaned mock robot simulation process for this name is killed first
+        try:
+            subprocess.run(['pkill', '-f', f'robot_name:={name}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
         self.get_logger().info(f"Spawning robot '{name}' at ({x:.2f}, {y:.2f})")
 
         cmd = [
@@ -263,6 +269,35 @@ class RobotSpawnerNode(Node):
     def set_goal(self, name, x, y):
         self.get_logger().info(f"Setting goal for '{name}' to ({x:.2f}, {y:.2f})")
         self.robot_goals[name] = (x, y)
+        if self.discovery_timer:
+            self.publish_destination(name, x, y)
+
+    def publish_destination(self, name, gx, gy):
+        import uuid
+        if name not in self.dest_publishers:
+            self.dest_publishers[name] = self.create_publisher(
+                Destination,
+                f'{name}/destination',
+                10
+            )
+
+        dest_msg = Destination()
+        dest_msg.session.uuid = list(uuid.uuid4().bytes)
+        
+        constraint = DestinationConstraints()
+        target_region = TargetRegion()
+        target_region.region.hint = Region.HINT_AXIS_ALIGNED_RECTANGLE
+        target_region.region.points = [
+            float(gx),
+            float(gy),
+            float(gx + 1.0),
+            float(gy + 1.0)
+        ]
+        constraint.regions.append(target_region)
+        dest_msg.constraints = constraint
+
+        self.dest_publishers[name].publish(dest_msg)
+        self.get_logger().info(f"Published goal destination for '{name}' to ({gx}, {gy}) with UUID {dest_msg.session.uuid}")
 
     def send_scenario(self):
         self.get_logger().info("Broadcasting scenario goals and discovery...")
@@ -288,30 +323,7 @@ class RobotSpawnerNode(Node):
 
         # 2. Publish goals for all robots to their destination topics
         for name, (gx, gy) in self.robot_goals.items():
-            if name not in self.dest_publishers:
-                self.dest_publishers[name] = self.create_publisher(
-                    Destination,
-                    f'{name}/destination',
-                    10
-                )
-
-            dest_msg = Destination()
-            dest_msg.session.uuid = [len(self.dest_publishers)] * 16
-            
-            constraint = DestinationConstraints()
-            target_region = TargetRegion()
-            target_region.region.hint = Region.HINT_AXIS_ALIGNED_RECTANGLE
-            target_region.region.points = [
-                float(gx),
-                float(gy),
-                float(gx + 1.0),
-                float(gy + 1.0)
-            ]
-            constraint.regions.append(target_region)
-            dest_msg.constraints = constraint
-
-            self.dest_publishers[name].publish(dest_msg)
-            self.get_logger().info(f"Published goal destination for '{name}' to ({gx}, {gy})")
+            self.publish_destination(name, gx, gy)
 
     def reset_scenario(self):
         self.get_logger().info("Resetting scenario, shutting down all simulator processes...")
@@ -330,6 +342,12 @@ class RobotSpawnerNode(Node):
                     proc.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+
+        # Also run a clean pkill to kill any orphaned or untracked mock robot sims
+        try:
+            subprocess.run(['pkill', '-f', 'rmf_mock_robot_sim'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
 
         self.active_processes.clear()
         self.robot_goals.clear()

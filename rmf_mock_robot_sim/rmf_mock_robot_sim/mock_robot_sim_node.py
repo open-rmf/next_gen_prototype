@@ -59,6 +59,7 @@ class MockRobotSimNode(Node):
         self.current_waypoint_idx = 0
         self.current_plan_id = None
         self.last_update_time = self.get_clock().now()
+        self.wait_time_remaining = 0.0
 
         # 3. Configure QoS for Discovery
         discovery_qos = QoSProfile(
@@ -148,6 +149,7 @@ class MockRobotSimNode(Node):
         self.current_path = msg.waypoints
         self.current_plan_id = msg.plan_id
         self.current_waypoint_idx = 0
+        self.wait_time_remaining = 0.0
 
         # If the path is not empty and we are far from the start,
         # we could either teleport or travel there.
@@ -166,26 +168,33 @@ class MockRobotSimNode(Node):
 
         # 1. Update position based on current path
         if self.current_path and self.current_waypoint_idx < len(self.current_path):
-            target_wp = self.current_path[self.current_waypoint_idx]
-            tx, ty = float(target_wp.position[0]), float(target_wp.position[1])
-            dx = tx - self.x
-            dy = ty - self.y
-            dist = math.hypot(dx, dy)
-
-            if dist > 1e-3:
-                self.yaw = math.atan2(dy, dx)
-                step = self.speed * dt
-                if step >= dist:
-                    # Reached the target waypoint
-                    self.x = tx
-                    self.y = ty
-                    self.current_waypoint_idx += 1
-                else:
-                    self.x += (dx / dist) * step
-                    self.y += (dy / dist) * step
+            if self.wait_time_remaining > 0.0:
+                self.wait_time_remaining -= dt
+                if self.wait_time_remaining < 0.0:
+                    self.wait_time_remaining = 0.0
             else:
-                # Already at or extremely close to target waypoint, advance to next
-                self.current_waypoint_idx += 1
+                target_wp = self.current_path[self.current_waypoint_idx]
+                tx, ty = float(target_wp.position[0]), float(target_wp.position[1])
+                dx = tx - self.x
+                dy = ty - self.y
+                dist = math.hypot(dx, dy)
+
+                if dist > 1e-3:
+                    self.yaw = math.atan2(dy, dx)
+                    step = self.speed * dt
+                    if step >= dist:
+                        # Reached the target waypoint
+                        self.x = tx
+                        self.y = ty
+                        self.current_waypoint_idx += 1
+                        self.wait_time_remaining = 1.0
+                    else:
+                        self.x += (dx / dist) * step
+                        self.y += (dy / dist) * step
+                else:
+                    # Already at or extremely close to target waypoint, advance to next
+                    self.current_waypoint_idx += 1
+                    self.wait_time_remaining = 1.0
 
             # 2. Publish plan progress
             self.publish_progress()
@@ -249,7 +258,11 @@ class MockRobotSimNode(Node):
         odom.pose.pose.orientation = self.yaw_to_quaternion(self.yaw)
 
         # Set twist (simple velocity estimate)
-        if self.current_path and self.current_waypoint_idx < len(self.current_path):
+        if (
+            self.current_path
+            and self.current_waypoint_idx < len(self.current_path)
+            and self.wait_time_remaining <= 0.0
+        ):
             target_wp = self.current_path[self.current_waypoint_idx]
             tx, ty = target_wp.position[0], target_wp.position[1]
             dx = tx - self.x
