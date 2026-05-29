@@ -149,11 +149,13 @@ class TestPathServerScenario(unittest.TestCase):
         p1 = Participant()
         p1.name = 'robot_1'
         p1.components = []
+        p1.radius = 0.49
         discovery_msg.participants.append(p1)
 
         p2 = Participant()
         p2.name = 'robot_2'
         p2.components = []
+        p2.radius = 0.49
         discovery_msg.participants.append(p2)
 
         # Wait for discovery and subscriptions to settle

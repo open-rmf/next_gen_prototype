@@ -4,11 +4,14 @@ use nav_msgs::msg::Odometry;
 use rmf_prototype_msgs::msg::Destination;
 use std::collections::HashMap;
 
+use std::sync::Arc;
+
 pub trait MapfPlanner: Send + Sync + 'static {
     fn plan(
         &self,
         starts: &HashMap<String, Odometry>,
         goals: &HashMap<String, Destination>,
+        footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>>;
 }
@@ -21,6 +24,7 @@ impl MapfPlanner for MockPlanner {
         &self,
         _starts: &HashMap<String, Odometry>,
         _goals: &HashMap<String, Destination>,
+        _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
         let mut plan = Vec::new();
@@ -53,6 +57,7 @@ impl MapfPlanner for PibtPlanner {
         &self,
         starts: &HashMap<String, Odometry>,
         goals: &HashMap<String, Destination>,
+        _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
         if robot_ids.is_empty() {
@@ -68,20 +73,36 @@ impl MapfPlanner for PibtPlanner {
             if let Some(odom) = starts.get(id) {
                 let x = odom.pose.pose.position.x as f32;
                 let y = odom.pose.pose.position.y as f32;
-                if x < min_x { min_x = x; }
-                if y < min_y { min_y = y; }
-                if x > max_x { max_x = x; }
-                if y > max_y { max_y = y; }
+                if x < min_x {
+                    min_x = x;
+                }
+                if y < min_y {
+                    min_y = y;
+                }
+                if x > max_x {
+                    max_x = x;
+                }
+                if y > max_y {
+                    max_y = y;
+                }
             }
             if let Some(dest) = goals.get(id) {
                 if let Some(region) = dest.constraints.regions.first() {
                     if region.region.points.len() >= 2 {
                         let x = region.region.points[0];
                         let y = region.region.points[1];
-                        if x < min_x { min_x = x; }
-                        if y < min_y { min_y = y; }
-                        if x > max_x { max_x = x; }
-                        if y > max_y { max_y = y; }
+                        if x < min_x {
+                            min_x = x;
+                        }
+                        if y < min_y {
+                            min_y = y;
+                        }
+                        if x > max_x {
+                            max_x = x;
+                        }
+                        if y > max_y {
+                            max_y = y;
+                        }
                     }
                 }
             }
@@ -111,10 +132,16 @@ impl MapfPlanner for PibtPlanner {
 
         for id in robot_ids {
             let odom = starts.get(id).ok_or_else(|| {
-                Box::<dyn std::error::Error>::from(format!("Missing start odometry for agent {}", id))
+                Box::<dyn std::error::Error>::from(format!(
+                    "Missing start odometry for agent {}",
+                    id
+                ))
             })?;
             let dest = goals.get(id).ok_or_else(|| {
-                Box::<dyn std::error::Error>::from(format!("Missing goal destination for agent {}", id))
+                Box::<dyn std::error::Error>::from(format!(
+                    "Missing goal destination for agent {}",
+                    id
+                ))
             })?;
 
             let sx = (odom.pose.pose.position.x as f32 - offset_x).round() as usize;
@@ -154,10 +181,11 @@ impl MapfPlanner for PibtPlanner {
 
         let mut solver = PiBTWithExternalTracks::init(grid);
         let external_tracks = Vec::new();
-        let solved_paths = match solver.solve(&grid_starts, &grid_ends, &external_tracks, self.max_time) {
-            Ok(paths) => paths,
-            Err(_) => return Err(Box::<dyn std::error::Error>::from("PIBT failed to solve")),
-        };
+        let solved_paths =
+            match solver.solve(&grid_starts, &grid_ends, &external_tracks, self.max_time) {
+                Ok(paths) => paths,
+                Err(_) => return Err(Box::<dyn std::error::Error>::from("PIBT failed to solve")),
+            };
 
         let mut trajectories = vec![Vec::new(); robot_ids.len()];
         for time_step in solved_paths {

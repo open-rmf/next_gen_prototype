@@ -1,6 +1,6 @@
-use mapf_post::na::Isometry2;
 use mapf_post::SemanticPlan;
 use mapf_post::SemanticWaypoint;
+use mapf_post::na::Isometry2;
 use nav_msgs::msg::Odometry;
 use rclrs::Node;
 use rmf_prototype_msgs::msg::Destination;
@@ -41,10 +41,15 @@ pub struct PlanServer<P: MapfPlanner> {
     pub current_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub planning_session_id: u64,
     pub current_planning_session: Option<u64>,
+    pub footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
 }
 
 impl<P: MapfPlanner> PlanServer<P> {
-    pub fn new(node: Arc<Node>, planner: P) -> Self {
+    pub fn new(
+        node: Arc<Node>,
+        planner: P,
+        footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
+    ) -> Self {
         let (plan_sender, plan_receiver) = std::sync::mpsc::channel();
         Self {
             active_plans: HashMap::new(),
@@ -60,6 +65,7 @@ impl<P: MapfPlanner> PlanServer<P> {
             current_cancellation: None,
             planning_session_id: 0,
             current_planning_session: None,
+            footprints,
         }
     }
 
@@ -132,7 +138,11 @@ impl<P: MapfPlanner> PlanServer<P> {
                             let dest = goals.get(robot_id).unwrap();
                             let prev_plan_id = self.active_plan_ids.get(robot_id);
                             let new_version = match prev_plan_id {
-                                Some(p_id) if p_id.destination_session.uuid == dest.session.uuid => p_id.plan_version + 1,
+                                Some(p_id)
+                                    if p_id.destination_session.uuid == dest.session.uuid =>
+                                {
+                                    p_id.plan_version + 1
+                                }
                                 _ => 0,
                             };
 
@@ -273,6 +283,7 @@ impl<P: MapfPlanner> PlanServer<P> {
         self.current_cancellation = Some(Arc::clone(&cancellation));
 
         let planner_clone = Arc::clone(&self.planner);
+        let footprints_clone = Arc::clone(&self.footprints);
         let sender_clone = match self.plan_sender.lock() {
             Ok(sender) => sender.clone(),
             Err(_) => {
@@ -286,7 +297,24 @@ impl<P: MapfPlanner> PlanServer<P> {
                 return;
             }
 
-            let basic_plan = match planner_clone.plan(&starts, &goals, &robot_ids) {
+            let footprints_map: HashMap<String, Arc<dyn mapf_post::shape::Shape>> = robot_ids
+                .iter()
+                .map(|id| {
+                    let radius = if let Ok(map) = footprints_clone.lock() {
+                        *map.get(id).unwrap_or(&0.49)
+                    } else {
+                        0.49
+                    };
+                    (
+                        id.clone(),
+                        Arc::new(mapf_post::shape::Ball::new(radius))
+                            as Arc<dyn mapf_post::shape::Shape>,
+                    )
+                })
+                .collect();
+
+            let basic_plan = match planner_clone.plan(&starts, &goals, &footprints_map, &robot_ids)
+            {
                 Ok(plan) => plan,
                 Err(err) => {
                     let _ = sender_clone.send(PlanResult::Failure {
@@ -303,12 +331,14 @@ impl<P: MapfPlanner> PlanServer<P> {
 
             let trajectories: Vec<mapf_post::Trajectory> = basic_plan
                 .iter()
-                .map(|poses| mapf_post::Trajectory { poses: poses.clone() })
+                .map(|poses| mapf_post::Trajectory {
+                    poses: poses.clone(),
+                })
                 .collect();
 
-            let num_agents = trajectories.len();
-            let footprints: Vec<Arc<dyn mapf_post::shape::Shape>> = (0..num_agents)
-                .map(|_| Arc::new(mapf_post::shape::Ball::new(0.49)) as Arc<dyn mapf_post::shape::Shape>)
+            let footprints: Vec<Arc<dyn mapf_post::shape::Shape>> = robot_ids
+                .iter()
+                .map(|id| footprints_map.get(id).unwrap().clone())
                 .collect();
 
             let mapf_result = mapf_post::MapfResult {

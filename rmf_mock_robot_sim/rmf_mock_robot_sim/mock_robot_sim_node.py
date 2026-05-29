@@ -136,8 +136,8 @@ class MockRobotSimNode(Node):
         msg = ParticipantList()
         p = Participant()
         p.name = self.robot_name
-        # The robot participates in destination and plan components
         p.components = []
+        p.radius = 0.49
         msg.participants.append(p)
 
         self.dest_discovery_pub.publish(msg)

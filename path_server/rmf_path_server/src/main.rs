@@ -1,16 +1,23 @@
-use rclrs::{Context, CreateBasicExecutor, SpinOptions};
-use rmf_prototype_msgs::msg::Destination;
 use nav_msgs::msg::Odometry;
+use rclrs::{Context, CreateBasicExecutor, SpinOptions};
+use rmf_path_server::{DiscoveryServer, PibtPlanner, PlanServer, RobotPathConnections};
+use rmf_prototype_msgs::msg::Destination;
 use std::sync::Arc;
-use rmf_path_server::{PlanServer, DiscoveryServer, PibtPlanner, RobotPathConnections};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = Context::default_from_env().unwrap();
     let mut executor = context.create_basic_executor();
     let node = Arc::new(executor.create_node("path_server")?);
 
+    let footprints = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let footprints_clone = Arc::clone(&footprints);
+
     // Create the Destinations worker (Data Plane)
-    let destinations_worker = Arc::new(node.create_worker(PlanServer::new(Arc::clone(&node), PibtPlanner::default())));
+    let destinations_worker = Arc::new(node.create_worker(PlanServer::new(
+        Arc::clone(&node),
+        PibtPlanner::default(),
+        footprints,
+    )));
 
     // Create a periodic timer on the Destinations worker to trigger replans asynchronously.
     // This avoids blocking subscriber callbacks and coalesces multiple updates within the tick duration.
@@ -26,6 +33,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&node),
         Arc::clone(&destinations_worker),
     )));
+
+    let footprints_clone2 = Arc::clone(&footprints_clone);
+    let _list_subscription = discovery_worker
+        .create_subscription::<rmf_prototype_msgs::msg::ParticipantList, _>(
+            "/destination/discovery",
+            move |_server: &mut DiscoveryServer<PibtPlanner>,
+                  msg: rmf_prototype_msgs::msg::ParticipantList| {
+                if let Ok(mut map) = footprints_clone2.lock() {
+                    for p in msg.participants {
+                        let radius = if p.radius > 0.0 { p.radius } else { 0.49 };
+                        map.insert(p.name, radius);
+                    }
+                }
+            },
+        )?;
 
     // Subscribe to discovery on the Discovery worker using the shared generic helper
     let _discovery_subscription = rmf_participant_discovery::create_discovery_subscription(
