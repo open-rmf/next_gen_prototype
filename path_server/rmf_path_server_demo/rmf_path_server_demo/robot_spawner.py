@@ -84,9 +84,13 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
 
             if spawner_node and name:
                 spawner_node.spawn_robot(name, x, y)
-                self.send_ok_response({"status": "spawned", "name": name})
+                self.send_ok_response({"status": "spawned", "name": name, "radius": 0.49})
             else:
                 self.send_error_response("Missing name or spawner node inactive")
+            return
+
+        elif self.path.startswith('/config'):
+            self.send_ok_response({"default_radius": 0.49})
             return
 
         elif self.path.startswith('/destination'):
@@ -370,6 +374,7 @@ class RobotSpawnerNode(Node):
             p = Participant()
             p.name = name
             p.components = []
+            p.radius = 0.49
             discovery_msg.participants.append(p)
 
         self.discovery_pub.publish(discovery_msg)

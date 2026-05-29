@@ -11,4 +11,3 @@ To start the dashboard, run the following command:
 ```bash
 ros2 launch rmf_path_server_demo demo.launch.py
 ```
-Nor the path followers do not follow any of the traffic dependencies prescribed by the plan.

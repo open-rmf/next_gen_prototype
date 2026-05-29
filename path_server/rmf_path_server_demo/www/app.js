@@ -122,7 +122,12 @@ function sendSpawnRequest(robot) {
   const url = `/spawn?name=${robot.name}&x=${robot.start_x}&y=${robot.start_y}`;
   fetch(url)
     .then(res => res.json())
-    .then(data => console.log('Spawn response:', data))
+    .then(data => {
+      console.log('Spawn response:', data);
+      if (data.radius !== undefined) {
+        robot.radius = parseFloat(data.radius);
+      }
+    })
     .catch(err => console.error('Spawn request failed:', err));
 }
 
@@ -229,7 +234,8 @@ canvas.addEventListener('click', (e) => {
       goal_y: null,
       status: 'Pending',
       waypoints: [],
-      progress: 0.0
+      progress: 0.0,
+      radius: 0.49
     };
 
     robots.push(newRobot);
@@ -577,11 +583,24 @@ function drawGrid() {
       ctx.stroke();
     }
 
+    // Draw planning footprint circle (radius 0.49m)
+    ctx.save();
+    ctx.shadowBlur = 0; // Reset shadow for the footprint
+    ctx.fillStyle = r.color + '33'; // Semi-transparent fill
+    ctx.strokeStyle = r.color + 'bb'; // Bright outline
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    const footprintRadius = (r.radius || 0.49) * scale;
+    ctx.arc(pix.x, pix.y, footprintRadius, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+
     // Draw rounded square
     ctx.fillStyle = r.color;
     const size = 16;
     ctx.beginPath();
-    ctx.roundRect(pix.x - size/2, pix.y - size/2, size, size, 4);
+    ctx.roundRect(pix.x - size / 2, pix.y - size / 2, size, size, 4);
     ctx.fill();
 
     // Draw thin white inner dot
