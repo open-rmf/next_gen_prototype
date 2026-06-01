@@ -1,6 +1,9 @@
+use mapf_post::MapfResult;
 use mapf_post::SemanticPlan;
 use mapf_post::SemanticWaypoint;
-use mapf_post::na::Isometry2;
+use mapf_post::WaypointFollower;
+use mapf_post::na::{Isometry2, Vector2};
+use mapf_post::spatial_allocation::{CurrentPosition, Grid2D};
 use nav_msgs::msg::Odometry;
 use rclrs::Node;
 use rmf_prototype_msgs::msg::Destination;
@@ -8,7 +11,7 @@ use rmf_prototype_msgs::msg::Plan;
 use rmf_prototype_msgs::msg::PlanId;
 use rmf_prototype_msgs::msg::TrafficDependency;
 use rmf_prototype_msgs::msg::Waypoint;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 pub mod planner;
@@ -20,6 +23,7 @@ pub struct PlanSuccess {
     pub traffic_dependencies: mapf_post::SemanticPlan,
     pub goals: HashMap<String, Destination>,
     pub robot_ids: Vec<String>,
+    pub active_plan: mapf_post::MapfResult,
 }
 
 pub enum PlanResult {
@@ -33,6 +37,7 @@ pub struct PlanServer<P: MapfPlanner> {
     pub node: Arc<Node>,
     pub replan_queue: Vec<(String, Destination)>,
     pub active_plan_ids: HashMap<String, PlanId>,
+    pub active_plan: Option<MapfResult>,
     pub planner: Arc<P>,
     pub plan_publishers: HashMap<String, rclrs::Publisher<Plan>>,
     pub plan_receiver: std::sync::Mutex<std::sync::mpsc::Receiver<PlanResult>>,
@@ -42,6 +47,7 @@ pub struct PlanServer<P: MapfPlanner> {
     pub planning_session_id: u64,
     pub current_planning_session: Option<u64>,
     pub footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
+    pub waypoint_followers: HashMap<String, WaypointFollower>,
 }
 
 impl<P: MapfPlanner> PlanServer<P> {
@@ -58,6 +64,7 @@ impl<P: MapfPlanner> PlanServer<P> {
             replan_queue: Vec::new(),
             active_plan_ids: HashMap::new(),
             planner: Arc::new(planner),
+            active_plan: None,
             plan_publishers: HashMap::new(),
             plan_sender: std::sync::Mutex::new(plan_sender),
             plan_receiver: std::sync::Mutex::new(plan_receiver),
@@ -66,6 +73,7 @@ impl<P: MapfPlanner> PlanServer<P> {
             planning_session_id: 0,
             current_planning_session: None,
             footprints,
+            waypoint_followers: HashMap::new(),
         }
     }
 
@@ -108,7 +116,39 @@ impl<P: MapfPlanner> PlanServer<P> {
             msg.pose.pose.position.y,
             msg.pose.pose.position.z
         );
-        self.latest_pose_estimate.insert(robot_id.to_string(), msg);
+        self.latest_pose_estimate
+            .insert(robot_id.to_string(), msg.clone());
+        if let Some(waypoint_follower_session) = self.waypoint_followers.get_mut(robot_id) {
+            //TODO(arjoc): Make "uncertainty" configurable
+            let position = Isometry2::new(
+                Vector2::new(
+                    msg.pose.pose.position.x as f32,
+                    msg.pose.pose.position.y as f32,
+                ),
+                0.0,
+            );
+            waypoint_follower_session.update_position_estimate(&position, 0.5);
+        }
+
+        let mut current_positions: BTreeMap<String, CurrentPosition> = BTreeMap::new();
+        // Get semantic robot positions
+        for (robot_id, waypoint_follower_session) in &mut self.waypoint_followers {
+            current_positions.insert(
+                robot_id.clone(),
+                CurrentPosition {
+                    semantic_position: waypoint_follower_session.get_semantic_waypoint(),
+                    real_position: (
+                        msg.pose.pose.position.x as f32,
+                        msg.pose.pose.position.y as f32,
+                    ),
+                },
+            );
+        }
+
+        let mut pos_vec: Vec<_> = current_positions
+            .iter()
+            .map(|(_robot, position)| position)
+            .collect();
     }
 
     pub fn replan(&mut self) {
@@ -130,8 +170,10 @@ impl<P: MapfPlanner> PlanServer<P> {
                             traffic_dependencies,
                             goals,
                             robot_ids,
+                            active_plan,
                             ..
                         } = success;
+                        self.active_plan = Some(active_plan);
 
                         // First update the active_plan_ids for each robot with their new PlanId
                         for robot_id in &robot_ids {
@@ -359,6 +401,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                 traffic_dependencies,
                 goals,
                 robot_ids,
+                active_plan: mapf_result,
             }));
         });
     }
