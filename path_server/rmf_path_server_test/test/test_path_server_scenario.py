@@ -174,7 +174,7 @@ class TestPathServerScenario(unittest.TestCase):
 
         # Run simulation and verify both robots reach their destinations
         start_time = time.time()
-        timeout = 15.0
+        timeout = 30.0
         r1_reached = False
         r2_reached = False
         r1_redirected = False

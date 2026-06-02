@@ -198,6 +198,13 @@ impl<P: MapfPlanner> PlanServer<P> {
                         waypoint_id: p.end_id as u64,
                         plan_id: self.active_plan_ids.get(robot_id).unwrap().clone(),
                     };
+                    rclrs::log!(
+                        self.node.logger(),
+                        "Publishing PlanRelease for {}: waypoint_id = {}, plan_version = {}",
+                        robot_id,
+                        p.end_id,
+                        pr.plan_id.plan_version
+                    );
                     if let Some(plan_release_pub) = self.plan_release_publishers.get_mut(robot_id) {
                         plan_release_pub.publish(pr);
                     } else {
@@ -320,6 +327,20 @@ impl<P: MapfPlanner> PlanServer<P> {
                                 1.0,
                             );
                             plans.insert(robot_id.clone(), plan);
+                        }
+
+                        self.waypoint_followers.clear();
+                        for (agent_idx, robot_id) in robot_ids.iter().enumerate() {
+                            let traj = &basic_plan[agent_idx];
+                            self.waypoint_followers.insert(
+                                robot_id.clone(),
+                                WaypointFollower::from_trajectory(
+                                    agent_idx,
+                                    mapf_post::Trajectory {
+                                        poses: traj.clone(),
+                                    },
+                                ),
+                            );
                         }
 
                         for (robot_id, plan) in &plans {

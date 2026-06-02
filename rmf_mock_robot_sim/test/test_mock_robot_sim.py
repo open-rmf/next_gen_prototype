@@ -8,7 +8,7 @@ from nav_msgs.msg import Odometry
 import pytest
 import rclpy
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
-from rmf_prototype_msgs.msg import ParticipantList, Plan, PlanId, Progress, Waypoint
+from rmf_prototype_msgs.msg import ParticipantList, Plan, PlanId, PlanRelease, Progress, Waypoint
 
 
 @pytest.mark.launch_test
@@ -122,6 +122,12 @@ class TestMockRobotSim(unittest.TestCase):
             10
         )
 
+        release_pub = self.node.create_publisher(
+            PlanRelease,
+            f'{robot_name}/plan/release',
+            10
+        )
+
         # 3. Construct and publish Plan
         plan_msg = Plan()
 
@@ -143,10 +149,16 @@ class TestMockRobotSim(unittest.TestCase):
 
         plan_msg.waypoints = [wp1, wp2]
 
+        # Create and publish PlanRelease message releasing up to waypoint index 1
+        release_msg = PlanRelease()
+        release_msg.waypoint_id = 1
+        release_msg.plan_id = plan_id
+
         # Let's publish the plan repeatedly for a short time to ensure delivery
         start_time = time.time()
         while time.time() - start_time < 0.5:
             plan_pub.publish(plan_msg)
+            release_pub.publish(release_msg)
             rclpy.spin_once(self.node, timeout_sec=0.05)
 
         # 4. Run simulation and verify movement and progress updates
