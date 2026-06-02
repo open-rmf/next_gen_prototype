@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Implement this trait to use your own custom MAPF
-/// planner. The planner in this scenario will take in 
+/// planner. The planner in this scenario will take in
 /// starts and goals and assign a trajectory to the agents.
 pub trait MapfPlanner: Send + Sync + 'static {
     fn plan(
