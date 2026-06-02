@@ -4,7 +4,7 @@ from geometry_msgs.msg import Point, Quaternion
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
-from rmf_prototype_msgs.msg import Participant, ParticipantList, Plan, Progress
+from rmf_prototype_msgs.msg import Participant, ParticipantList, Plan, PlanRelease, Progress
 
 
 class MockRobotSimNode(Node):
@@ -60,8 +60,7 @@ class MockRobotSimNode(Node):
         self.current_plan_id = None
         self.last_update_time = self.get_clock().now()
         self.wait_time_remaining = 0.0
-        self.blocker_progress_subs = {}
-        self.blocker_progress_values = {}
+        self.released_waypoint_idx = 0
 
         # 3. Configure QoS for Discovery
         discovery_qos = QoSProfile(
@@ -112,6 +111,14 @@ class MockRobotSimNode(Node):
             10
         )
 
+        # Subscribe to plan release topic
+        self.release_sub = self.create_subscription(
+            PlanRelease,
+            f'{self.robot_name}/plan/release',
+            self.handle_release,
+            10
+        )
+
         # 6. Timers
         # Simulation update timer
         dt = 1.0 / self.update_rate
@@ -152,49 +159,27 @@ class MockRobotSimNode(Node):
         self.current_plan_id = msg.plan_id
         self.current_waypoint_idx = 0
         self.wait_time_remaining = 0.0
-
-        # Clear old blocker progress subscriptions
-        for sub in self.blocker_progress_subs.values():
-            self.destroy_subscription(sub)
-        self.blocker_progress_subs.clear()
-        self.blocker_progress_values.clear()
-
-        # Dynamic subscriptions to blockers
-        blocker_names = set()
-        for wp in msg.waypoints:
-            for blocker in wp.departure_blockers:
-                if blocker.name != self.robot_name:
-                    blocker_names.add(blocker.name)
-
-        for name in blocker_names:
-            self.subscribe_to_blocker_progress(name)
+        self.released_waypoint_idx = 0
 
         # If the path is not empty and we are far from the start,
         # we could either teleport or travel there.
         # The standard practice is to just start moving from current
         # position to waypoints[0].
 
-    def subscribe_to_blocker_progress(self, name):
-        def callback(progress_msg):
-            self.blocker_progress_values[name] = progress_msg.progress
-
-        self.blocker_progress_subs[name] = self.create_subscription(
-            Progress,
-            f'{name}/plan/progress',
-            callback,
-            10
-        )
+    def handle_release(self, msg: PlanRelease):
+        if (
+            self.current_plan_id
+            and msg.plan_id.plan_version == self.current_plan_id.plan_version
+            and list(msg.plan_id.destination_session.uuid)
+            == list(self.current_plan_id.destination_session.uuid)
+        ):
+            self.released_waypoint_idx = msg.waypoint_id
 
     def is_blocked(self):
         if not self.current_path or self.current_waypoint_idx >= len(self.current_path):
             return False
-        reached_idx = self.current_waypoint_idx - 1
-        if 0 <= reached_idx < len(self.current_path):
-            reached_wp = self.current_path[reached_idx]
-            for blocker in reached_wp.departure_blockers:
-                latest_prog = self.blocker_progress_values.get(blocker.name, 0.0)
-                if latest_prog < blocker.required_progress:
-                    return True
+        if self.current_waypoint_idx > self.released_waypoint_idx:
+            return True
         return False
 
     def sim_step(self):
