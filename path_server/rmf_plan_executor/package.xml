@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>rmf_path_server</name>
+  <name>rmf_plan_executor</name>
   <version>0.0.1</version>
-  <description>A simple path server for RMF next generation prototype.</description>
+  <description>A plan executor for RMF next generation prototype.</description>
   <maintainer email="arjoc@intrinsic.ai">Arjo Chakravarty</maintainer>
   <license>Apache License 2.0</license>
 
@@ -11,27 +11,25 @@
 
   <build_depend>rclrs</build_depend>
   <build_depend>rmf_prototype_msgs</build_depend>
-  <build_depend>rmf_participant_discovery</build_depend>
-  <build_depend>rmf_plan_executor</build_depend>
-  <build_depend>unique_identifier_msgs</build_depend>
-  <build_depend>example_interfaces</build_depend>
-  <build_depend>test_msgs</build_depend>
   <build_depend>nav_msgs</build_depend>
   <build_depend>nav2_msgs</build_depend>
   <build_depend>geometry_msgs</build_depend>
   <build_depend>std_msgs</build_depend>
+  <build_depend>unique_identifier_msgs</build_depend>
+  <build_depend>example_interfaces</build_depend>
+  <build_depend>test_msgs</build_depend>
+  <build_depend>rcl_interfaces</build_depend>
 
   <exec_depend>rclrs</exec_depend>
   <exec_depend>rmf_prototype_msgs</exec_depend>
-  <exec_depend>rmf_participant_discovery</exec_depend>
-  <exec_depend>rmf_plan_executor</exec_depend>
-  <exec_depend>unique_identifier_msgs</exec_depend>
-  <exec_depend>example_interfaces</exec_depend>
-  <exec_depend>test_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>nav2_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>unique_identifier_msgs</exec_depend>
+  <exec_depend>example_interfaces</exec_depend>
+  <exec_depend>test_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
 
   <export>
     <build_type>ament_cargo</build_type>

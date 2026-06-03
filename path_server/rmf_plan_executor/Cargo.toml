@@ -1,0 +1,15 @@
+[package]
+name = "rmf_plan_executor"
+version = "0.1.0"
+edition = "2024"
+# Trigger rebuild after package.xml changes
+
+[dependencies]
+rclrs = "*"
+rmf_prototype_msgs = "*"
+nav_msgs = "*"
+nav2_msgs = "*"
+geometry_msgs = "*"
+std_msgs = "*"
+builtin_interfaces = { version = "2.0.3" }
+mapf_post = { git = "https://github.com/arjo129/mapf_post", branch="arjo/feat/more_efficient_checks"}
