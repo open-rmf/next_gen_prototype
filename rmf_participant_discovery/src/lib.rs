@@ -100,10 +100,12 @@ mod tests {
                 Participant {
                     name: "robot_1".to_string(),
                     components: vec![],
+                    radius: 0.0,
                 },
                 Participant {
                     name: "robot_2".to_string(),
                     components: vec![],
+                    radius: 0.0,
                 },
             ],
         };
@@ -124,10 +126,12 @@ mod tests {
                 Participant {
                     name: "robot_2".to_string(),
                     components: vec![],
+                    radius: 0.0,
                 },
                 Participant {
                     name: "robot_3".to_string(),
                     components: vec![],
+                    radius: 0.0,
                 },
             ],
         };
