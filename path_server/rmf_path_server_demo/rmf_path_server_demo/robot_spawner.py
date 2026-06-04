@@ -16,6 +16,7 @@ from rclpy.node import Node
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
+    DestinationGoal,
     Participant,
     ParticipantList,
     Region,
@@ -23,6 +24,7 @@ from rmf_prototype_msgs.msg import (
     Plan,
     Progress,
 )
+
 
 # Global node reference for the HTTP request handler to access
 spawner_node = None
@@ -90,19 +92,22 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
             return
 
         elif self.path.startswith('/config'):
-            self.send_ok_response({"default_radius": 0.49})
+            use_dest = spawner_node.use_destination_server if spawner_node else False
+            self.send_ok_response({"default_radius": 0.49, "use_destination_server": use_dest})
             return
 
         elif self.path.startswith('/destination'):
             from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
             name = query.get('name', [''])[0]
-            x = float(query.get('x', [0.0])[0])
-            y = float(query.get('y', [0.0])[0])
+            x_str = query.get('x', [''])[0]
+            y_str = query.get('y', [''])[0]
 
             if spawner_node and name:
-                spawner_node.set_goal(name, x, y)
-                self.send_ok_response({"status": "goal_set", "name": name})
+                xs = [float(val) for val in x_str.split(',')] if x_str else []
+                ys = [float(val) for val in y_str.split(',')] if y_str else []
+                spawner_node.set_goals(name, xs, ys)
+                self.send_ok_response({"status": "goals_set", "name": name})
             else:
                 self.send_error_response("Missing name or spawner node inactive")
             return
@@ -146,6 +151,10 @@ class RobotSpawnerNode(Node):
         super().__init__('robot_spawner')
         self.get_logger().info("Initializing Robot Spawner & HTTP Bridge Node...")
 
+        # Parameters
+        self.declare_parameter('use_destination_server', False)
+        self.use_destination_server = self.get_parameter('use_destination_server').value
+
         self.active_processes = {}
         self.sse_clients = []
         self.sse_clients_lock = threading.Lock()
@@ -153,6 +162,7 @@ class RobotSpawnerNode(Node):
         self.odom_subs = {}
         self.plan_subs = {}
         self.progress_subs = {}
+        self.destination_subs = {}
         self.discovery_timer = None
 
         # Publishers for ROS 2 control plane
@@ -162,6 +172,7 @@ class RobotSpawnerNode(Node):
             10
         )
         self.dest_publishers = {}
+        self.dest_goal_publishers = {}
 
         # Get the package share directory and resolve static files path
         try:
@@ -247,6 +258,7 @@ class RobotSpawnerNode(Node):
             self.subscribe_to_odom(name)
             self.subscribe_to_plan(name)
             self.subscribe_to_progress(name)
+            self.subscribe_to_destination(name)
 
         except Exception as e:
             self.get_logger().error(f"Failed to spawn robot process: {e}")
@@ -332,38 +344,107 @@ class RobotSpawnerNode(Node):
             10
         )
 
+    def subscribe_to_destination(self, name):
+        if name in self.destination_subs:
+            return
+
+        self.get_logger().info(f"Subscribing to dynamic destination topic for '{name}'")
+
+        def destination_callback(msg, r_name=name):
+            try:
+                if msg.constraints.regions:
+                    region = msg.constraints.regions[0].region
+                    if region.hint == Region.HINT_AXIS_ALIGNED_RECTANGLE and len(region.points) >= 2:
+                        gx = region.points[0]
+                        gy = region.points[1]
+                        data = json.dumps({
+                            "type": "active_destination",
+                            "name": r_name,
+                            "x": gx,
+                            "y": gy
+                        })
+                        self.broadcast(data)
+            except Exception as e:
+                self.get_logger().error(f"Error parsing destination message: {e}")
+
+        self.destination_subs[name] = self.create_subscription(
+            Destination,
+            f'{name}/destination',
+            destination_callback,
+            10
+        )
+
     def set_goal(self, name, x, y):
-        self.get_logger().info(f"Setting goal for '{name}' to ({x:.2f}, {y:.2f})")
-        self.robot_goals[name] = (x, y)
+        self.set_goals(name, [x], [y])
+
+    def set_goals(self, name, xs, ys):
+        goals = list(zip(xs, ys))
+        self.get_logger().info(f"Setting goals for '{name}' to {goals}")
+        self.robot_goals[name] = goals
         if self.discovery_timer:
-            self.publish_destination(name, x, y)
+            self.publish_destination(name)
 
-    def publish_destination(self, name, gx, gy):
+    def publish_destination(self, name):
         import uuid
-        if name not in self.dest_publishers:
-            self.dest_publishers[name] = self.create_publisher(
-                Destination,
-                f'{name}/destination',
-                10
-            )
+        goals = self.robot_goals.get(name, [])
+        if not goals:
+            return
 
-        dest_msg = Destination()
-        dest_msg.session.uuid = list(uuid.uuid4().bytes)
-        
-        constraint = DestinationConstraints()
-        target_region = TargetRegion()
-        target_region.region.hint = Region.HINT_AXIS_ALIGNED_RECTANGLE
-        target_region.region.points = [
-            float(gx),
-            float(gy),
-            float(gx + 1.0),
-            float(gy + 1.0)
-        ]
-        constraint.regions.append(target_region)
-        dest_msg.constraints = constraint
+        if self.use_destination_server:
+            if name not in self.dest_goal_publishers:
+                self.dest_goal_publishers[name] = self.create_publisher(
+                    DestinationGoal,
+                    f'{name}/destination/goal',
+                    10
+                )
 
-        self.dest_publishers[name].publish(dest_msg)
-        self.get_logger().info(f"Published goal destination for '{name}' to ({gx}, {gy}) with UUID {dest_msg.session.uuid}")
+            goal_msg = DestinationGoal()
+            goal_msg.session.uuid = list(uuid.uuid4().bytes)
+
+            for gx, gy in goals:
+                constraint = DestinationConstraints()
+                target_region = TargetRegion()
+                target_region.region.hint = Region.HINT_AXIS_ALIGNED_RECTANGLE
+                target_region.region.points = [
+                    float(gx),
+                    float(gy),
+                    float(gx + 1.0),
+                    float(gy + 1.0)
+                ]
+                constraint.regions.append(target_region)
+                goal_msg.one_of.append(constraint)
+
+            goal_msg.cost_bias = [0.0] * len(goals)
+
+            self.dest_goal_publishers[name].publish(goal_msg)
+            self.get_logger().info(f"Published DestinationGoal for '{name}' with {len(goals)} options, session {goal_msg.session.uuid}")
+
+        else:
+            if name not in self.dest_publishers:
+                self.dest_publishers[name] = self.create_publisher(
+                    Destination,
+                    f'{name}/destination',
+                    10
+                )
+
+            gx, gy = goals[0]
+            dest_msg = Destination()
+            dest_msg.session.uuid = list(uuid.uuid4().bytes)
+
+            constraint = DestinationConstraints()
+            target_region = TargetRegion()
+            target_region.region.hint = Region.HINT_AXIS_ALIGNED_RECTANGLE
+            target_region.region.points = [
+                float(gx),
+                float(gy),
+                float(gx + 1.0),
+                float(gy + 1.0)
+            ]
+            constraint.regions.append(target_region)
+            dest_msg.constraints = constraint
+
+            self.dest_publishers[name].publish(dest_msg)
+            self.get_logger().info(f"Published Destination for '{name}' to ({gx}, {gy}) with UUID {dest_msg.session.uuid}")
 
     def send_scenario(self):
         self.get_logger().info("Broadcasting scenario goals and discovery...")
@@ -389,8 +470,8 @@ class RobotSpawnerNode(Node):
         self.discovery_timer = self.create_timer(1.0, timer_callback)
 
         # 2. Publish goals for all robots to their destination topics
-        for name, (gx, gy) in self.robot_goals.items():
-            self.publish_destination(name, gx, gy)
+        for name in self.robot_goals.keys():
+            self.publish_destination(name)
 
     def reset_scenario(self):
         self.get_logger().info("Resetting scenario, shutting down all simulator processes...")
@@ -432,9 +513,17 @@ class RobotSpawnerNode(Node):
             self.destroy_subscription(sub)
         self.progress_subs.clear()
 
+        for sub in self.destination_subs.values():
+            self.destroy_subscription(sub)
+        self.destination_subs.clear()
+
         for pub in self.dest_publishers.values():
             self.destroy_publisher(pub)
         self.dest_publishers.clear()
+
+        for pub in self.dest_goal_publishers.values():
+            self.destroy_publisher(pub)
+        self.dest_goal_publishers.clear()
 
         self.get_logger().info("Reset complete.")
 

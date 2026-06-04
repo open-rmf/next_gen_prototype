@@ -2,6 +2,10 @@
 
 // State variables
 let isConnected = false;
+let config = {
+  default_radius: 0.49,
+  use_destination_server: false
+};
 let robots = [];
 let selectedRobotName = null;
 let interactionMode = 'normal'; // 'normal', 'add-robot', 'set-goal'
@@ -84,6 +88,15 @@ function initSSE() {
         if (r) {
           r.progress = msg.progress;
         }
+      } else if (msg.type === 'active_destination') {
+        const r = robots.find(robot => robot.name === msg.name);
+        if (r) {
+          r.active_goal_x = msg.x;
+          r.active_goal_y = msg.y;
+          r.goal_x = msg.x;
+          r.goal_y = msg.y;
+          updateRobotListUI();
+        }
       }
     } catch (e) {
       // Ignore keepalive or parse errors
@@ -133,7 +146,14 @@ function sendSpawnRequest(robot) {
 
 // Sends Goal Destination to the backend REST /destination
 function sendGoalRequest(robot) {
-  const url = `/destination?name=${robot.name}&x=${robot.goal_x}&y=${robot.goal_y}`;
+  let url;
+  if (config.use_destination_server) {
+    const xs = (robot.goals || []).map(g => g.x).join(',');
+    const ys = (robot.goals || []).map(g => g.y).join(',');
+    url = `/destination?name=${robot.name}&x=${xs}&y=${ys}`;
+  } else {
+    url = `/destination?name=${robot.name}&x=${robot.goal_x}&y=${robot.goal_y}`;
+  }
   fetch(url)
     .then(res => res.json())
     .then(data => console.log('Goal set response:', data))
@@ -155,13 +175,24 @@ function updateRobotListUI() {
   emptyMsg.style.display = 'none';
   
   // Check if all robots have goals to enable Send Scenario
-  const allHaveGoals = robots.every(r => r.goal_x !== null && r.goal_y !== null);
+  const allHaveGoals = config.use_destination_server
+    ? robots.every(r => r.goals && r.goals.length > 0)
+    : robots.every(r => r.goal_x !== null && r.goal_y !== null);
   document.getElementById('btn-send').disabled = !allHaveGoals || systemMode === 'live' || !isConnected;
 
   let html = '';
   robots.forEach(r => {
     const isSelected = selectedRobotName === r.name ? 'selected' : '';
-    const goalStr = r.goal_x !== null ? `(${r.goal_x}, ${r.goal_y})` : 'Not Set';
+    let goalStr = 'Not Set';
+    if (config.use_destination_server) {
+      if (r.active_goal_x !== undefined && r.active_goal_y !== undefined) {
+        goalStr = `Chosen: (${r.active_goal_x}, ${r.active_goal_y})`;
+      } else if (r.goals && r.goals.length > 0) {
+        goalStr = `Goals: ` + r.goals.map(g => `(${g.x}, ${g.y})`).join(', ');
+      }
+    } else {
+      goalStr = r.goal_x !== null ? `(${r.goal_x}, ${r.goal_y})` : 'Not Set';
+    }
     
     let statusClass = '';
     if (r.status === 'Moving') statusClass = 'moving';
@@ -188,10 +219,21 @@ function updateRobotListUI() {
 }
 
 function selectRobot(name) {
+  if (selectedRobotName === name) {
+    selectedRobotName = null;
+    interactionMode = 'normal';
+    showInstruction(null);
+    updateRobotListUI();
+    return;
+  }
   selectedRobotName = name;
   interactionMode = 'set-goal';
   const verb = systemMode === 'live' ? 'NEW Goal' : 'Goal';
-  showInstruction(`Click on the grid to place the ${verb} for ${name}.`);
+  if (config.use_destination_server) {
+    showInstruction(`Click on the grid to add alternative goals for ${name}. Click the robot name in the list again to finish.`);
+  } else {
+    showInstruction(`Click on the grid to place the ${verb} for ${name}.`);
+  }
   updateRobotListUI();
 }
 
@@ -232,6 +274,7 @@ canvas.addEventListener('click', (e) => {
       current_y: gridPos.y,
       goal_x: null,
       goal_y: null,
+      goals: [],
       status: 'Pending',
       waypoints: [],
       progress: 0.0,
@@ -249,30 +292,47 @@ canvas.addEventListener('click', (e) => {
   else if (interactionMode === 'set-goal') {
     const robot = robots.find(r => r.name === selectedRobotName);
     if (robot) {
-      // Goal is strictly checked to prevent overlaying on active poses or other goals
-      const cellOccupied = robots.some(r => 
-        (r.name !== robot.name) && 
-        (
-          (systemMode === 'setup' && r.start_x === gridPos.x && r.start_y === gridPos.y) || 
-          (r.goal_x === gridPos.x && r.goal_y === gridPos.y)
-        )
-      );
-      
-      if (cellOccupied) {
-        alert('This grid coordinate is already occupied by another active goal!');
-        return;
+      if (!config.use_destination_server) {
+        // Goal is strictly checked to prevent overlaying on active poses or other goals
+        const cellOccupied = robots.some(r => 
+          (r.name !== robot.name) && 
+          (
+            (systemMode === 'setup' && r.start_x === gridPos.x && r.start_y === gridPos.y) || 
+            (r.goal_x === gridPos.x && r.goal_y === gridPos.y)
+          )
+        );
+        
+        if (cellOccupied) {
+          alert('This grid coordinate is already occupied by another active goal!');
+          return;
+        }
       }
 
-      robot.goal_x = gridPos.x;
-      robot.goal_y = gridPos.y;
-      robot.status = systemMode === 'live' ? 'Planning' : 'Pending';
-      
-      sendGoalRequest(robot);
+      if (config.use_destination_server) {
+        if (!robot.goals) {
+          robot.goals = [];
+        }
+        if (robot.goals.some(g => g.x === gridPos.x && g.y === gridPos.y)) {
+          alert('This goal is already added for this robot!');
+          return;
+        }
+        robot.goals.push({x: gridPos.x, y: gridPos.y});
+        robot.status = systemMode === 'live' ? 'Planning' : 'Pending';
+        
+        sendGoalRequest(robot);
+        updateRobotListUI();
+      } else {
+        robot.goal_x = gridPos.x;
+        robot.goal_y = gridPos.y;
+        robot.status = systemMode === 'live' ? 'Planning' : 'Pending';
+        
+        sendGoalRequest(robot);
 
-      selectedRobotName = null;
-      interactionMode = 'normal';
-      showInstruction(null);
-      updateRobotListUI();
+        selectedRobotName = null;
+        interactionMode = 'normal';
+        showInstruction(null);
+        updateRobotListUI();
+      }
     }
   } 
   else {
@@ -349,6 +409,7 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   
   // Re-init SSE stream connection
   initSSE();
+  fetchConfig();
 });
 
 // Helper to draw dependency arrow with optional dash animation
@@ -501,6 +562,25 @@ function drawGrid() {
           });
         }
       });
+    } else if (config.use_destination_server) {
+      // Fallback straight dotted lines to candidate or active goals
+      const curPix = toPixel(r.current_x, r.current_y);
+      const goals = (r.active_goal_x !== undefined && r.active_goal_y !== undefined)
+        ? [{x: r.active_goal_x, y: r.active_goal_y}]
+        : (r.goals || []);
+
+      goals.forEach(g => {
+        const goalPix = toPixel(g.x, g.y);
+        ctx.save();
+        ctx.strokeStyle = r.color;
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        ctx.moveTo(curPix.x, curPix.y);
+        ctx.lineTo(goalPix.x, goalPix.y);
+        ctx.stroke();
+        ctx.restore();
+      });
     } else if (r.goal_x !== null) {
       // Fallback to straight dotted goal route in setup mode before plan is generated
       const curPix = toPixel(r.current_x, r.current_y);
@@ -536,32 +616,73 @@ function drawGrid() {
 
   // 5. Draw goals
   robots.forEach(r => {
-    if (r.goal_x !== null) {
-      const pix = toPixel(r.goal_x, r.goal_y);
-      
-      ctx.strokeStyle = r.color;
-      ctx.lineWidth = 2.5;
-      
-      // Draw goal cross marker
-      ctx.beginPath();
-      ctx.moveTo(pix.x - 8, pix.y - 8);
-      ctx.lineTo(pix.x + 8, pix.y + 8);
-      ctx.moveTo(pix.x + 8, pix.y - 8);
-      ctx.lineTo(pix.x - 8, pix.y + 8);
-      ctx.stroke();
+    if (config.use_destination_server) {
+      const goals = r.goals || [];
+      goals.forEach((g, idx) => {
+        const isChosen = r.active_goal_x !== undefined && r.active_goal_y !== undefined &&
+                         r.active_goal_x === g.x && r.active_goal_y === g.y;
+        const hasChosenAny = r.active_goal_x !== undefined && r.active_goal_y !== undefined;
+        
+        const pix = toPixel(g.x, g.y);
+        
+        const opacity = (!hasChosenAny || isChosen) ? 'ff' : '44';
+        const glowOpacity = (!hasChosenAny || isChosen) ? '33' : '0f';
+        const colorWithOpacity = r.color + opacity;
+        
+        ctx.save();
+        ctx.strokeStyle = colorWithOpacity;
+        ctx.lineWidth = isChosen ? 4.0 : 2.5;
+        
+        // Draw goal cross marker
+        ctx.beginPath();
+        ctx.moveTo(pix.x - 8, pix.y - 8);
+        ctx.lineTo(pix.x + 8, pix.y + 8);
+        ctx.moveTo(pix.x + 8, pix.y - 8);
+        ctx.lineTo(pix.x - 8, pix.y + 8);
+        ctx.stroke();
 
-      // Draw glowing halo
-      ctx.strokeStyle = r.color + '33';
-      ctx.lineWidth = 5;
-      ctx.beginPath();
-      ctx.arc(pix.x, pix.y, 12, 0, 2 * Math.PI);
-      ctx.stroke();
+        // Draw glowing halo
+        ctx.strokeStyle = r.color + glowOpacity;
+        ctx.lineWidth = isChosen ? 8 : 5;
+        ctx.beginPath();
+        ctx.arc(pix.x, pix.y, 12, 0, 2 * Math.PI);
+        ctx.stroke();
 
-      // Text label
-      ctx.fillStyle = r.color;
-      ctx.font = '600 10px Outfit';
-      ctx.textAlign = 'left';
-      ctx.fillText(`G_${r.idNum}`, pix.x + 12, pix.y);
+        // Text label
+        ctx.fillStyle = colorWithOpacity;
+        ctx.font = '600 10px Outfit';
+        ctx.textAlign = 'left';
+        ctx.fillText(`G_${r.idNum}.${idx + 1}`, pix.x + 12, pix.y);
+        ctx.restore();
+      });
+    } else {
+      if (r.goal_x !== null) {
+        const pix = toPixel(r.goal_x, r.goal_y);
+        
+        ctx.strokeStyle = r.color;
+        ctx.lineWidth = 2.5;
+        
+        // Draw goal cross marker
+        ctx.beginPath();
+        ctx.moveTo(pix.x - 8, pix.y - 8);
+        ctx.lineTo(pix.x + 8, pix.y + 8);
+        ctx.moveTo(pix.x + 8, pix.y - 8);
+        ctx.lineTo(pix.x - 8, pix.y + 8);
+        ctx.stroke();
+
+        // Draw glowing halo
+        ctx.strokeStyle = r.color + '33';
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.arc(pix.x, pix.y, 12, 0, 2 * Math.PI);
+        ctx.stroke();
+
+        // Text label
+        ctx.fillStyle = r.color;
+        ctx.font = '600 10px Outfit';
+        ctx.textAlign = 'left';
+        ctx.fillText(`G_${r.idNum}`, pix.x + 12, pix.y);
+      }
     }
   });
 
@@ -625,6 +746,18 @@ function animationLoop() {
   requestAnimationFrame(animationLoop);
 }
 
+function fetchConfig() {
+  fetch('/config')
+    .then(res => res.json())
+    .then(data => {
+      config = { ...config, ...data };
+      console.log('Loaded config:', config);
+      updateRobotListUI();
+    })
+    .catch(err => console.error('Failed to load config:', err));
+}
+
 // Boot application
+fetchConfig();
 initSSE();
 animationLoop();
