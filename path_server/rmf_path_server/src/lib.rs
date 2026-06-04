@@ -1,11 +1,9 @@
 use mapf_post::MapfResult;
 use mapf_post::SemanticPlan;
 use mapf_post::SemanticWaypoint;
-use mapf_post::WaypointFollower;
 use mapf_post::na::Isometry2;
 use nav_msgs::msg::Odometry;
 use rclrs::Node;
-use rmf_plan_executor::PlanExecutor;
 use rmf_prototype_msgs::msg::Destination;
 use rmf_prototype_msgs::msg::Plan;
 use rmf_prototype_msgs::msg::PlanId;
@@ -45,7 +43,7 @@ pub struct PlanServer<P: MapfPlanner> {
     pub planning_session_id: u64,
     pub current_planning_session: Option<u64>,
     pub footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
-    pub executor: PlanExecutor,
+    pub active_plan_ids: HashMap<String, PlanId>,
 }
 
 impl<P: MapfPlanner> PlanServer<P> {
@@ -55,7 +53,6 @@ impl<P: MapfPlanner> PlanServer<P> {
         footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
     ) -> Self {
         let (plan_sender, plan_receiver) = std::sync::mpsc::channel();
-        let executor = PlanExecutor::new(Arc::clone(&node));
         Self {
             active_plans: HashMap::new(),
             latest_pose_estimate: HashMap::new(),
@@ -70,7 +67,7 @@ impl<P: MapfPlanner> PlanServer<P> {
             planning_session_id: 0,
             current_planning_session: None,
             footprints,
-            executor,
+            active_plan_ids: HashMap::new(),
         }
     }
 
@@ -117,8 +114,6 @@ impl<P: MapfPlanner> PlanServer<P> {
         );
         self.latest_pose_estimate
             .insert(robot_id.to_string(), msg.clone());
-
-        self.executor.handle_odometry(robot_id, &msg);
     }
 
     pub fn replan(&mut self) {
@@ -140,16 +135,13 @@ impl<P: MapfPlanner> PlanServer<P> {
                             traffic_dependencies,
                             goals,
                             robot_ids,
-                            active_plan,
                             ..
                         } = success;
-                        self.executor.active_plan = Some(active_plan);
-                        self.executor.active_semantic_plan = Some(traffic_dependencies.clone());
 
                         // First update the active_plan_ids for each robot with their new PlanId
                         for robot_id in &robot_ids {
                             let dest = goals.get(robot_id).unwrap();
-                            let prev_plan_id = self.executor.active_plan_ids.get(robot_id);
+                            let prev_plan_id = self.active_plan_ids.get(robot_id);
                             let new_version = match prev_plan_id {
                                 Some(p_id)
                                     if p_id.destination_session.uuid == dest.session.uuid =>
@@ -164,16 +156,14 @@ impl<P: MapfPlanner> PlanServer<P> {
                                 plan_version: new_version,
                             };
 
-                            self.executor
-                                .active_plan_ids
-                                .insert(robot_id.clone(), plan_id);
+                            self.active_plan_ids.insert(robot_id.clone(), plan_id);
                         }
+
 
                         // Use traffic_dependencies to populate Plan message for each agent
                         let mut plans = HashMap::new();
                         for (agent_idx, robot_id) in robot_ids.iter().enumerate() {
-                            let plan_id =
-                                self.executor.active_plan_ids.get(robot_id).unwrap().clone();
+                            let plan_id = self.active_plan_ids.get(robot_id).unwrap().clone();
                             let traj = &basic_plan[agent_idx];
                             let plan = Self::to_plan_msg(
                                 agent_idx,
@@ -181,33 +171,27 @@ impl<P: MapfPlanner> PlanServer<P> {
                                 plan_id,
                                 &traffic_dependencies,
                                 &robot_ids,
-                                &self.executor.active_plan_ids,
+                                &self.active_plan_ids,
                                 1.0,
                             );
                             plans.insert(robot_id.clone(), plan);
                         }
 
-                        self.executor.waypoint_followers.clear();
-                        for (agent_idx, robot_id) in robot_ids.iter().enumerate() {
-                            let traj = &basic_plan[agent_idx];
-                            self.executor.waypoint_followers.insert(
-                                robot_id.clone(),
-                                WaypointFollower::from_trajectory(
-                                    agent_idx,
-                                    mapf_post::Trajectory {
-                                        poses: traj.clone(),
-                                    },
-                                ),
-                            );
-                        }
-
                         for (robot_id, plan) in &plans {
+                            let mut wp_strs = Vec::new();
+                            for (j, wp) in plan.waypoints.iter().enumerate() {
+                                let blockers: Vec<String> = wp.departure_blockers.iter().map(|b| {
+                                    format!("{} progress >= {}", b.name, b.required_progress)
+                                }).collect();
+                                wp_strs.push(format!("  wp {}: pos {:?}, progress {}, blockers: {:?}", j, wp.position, wp.progress, blockers));
+                            }
                             rclrs::log!(
                                 self.node.logger(),
-                                "Generated plan with version {} and {} waypoints for robot {}",
+                                "Generated plan with version {} and {} waypoints for robot {}:\n{}",
                                 plan.plan_id.plan_version,
                                 plan.waypoints.len(),
-                                robot_id
+                                robot_id,
+                                wp_strs.join("\n")
                             );
 
                             // Publish the plans
@@ -405,7 +389,19 @@ impl<P: MapfPlanner> PlanServer<P> {
     ) -> Plan {
         let mut waypoints = Vec::new();
         for (i, pose) in traj.iter().enumerate() {
-            let mut departure_blockers = Vec::new();
+            waypoints.push(Waypoint {
+                position: [pose.translation.x, pose.translation.y],
+                arrival_constraints: Default::default(),
+                progress: i as f32 * timestep,
+                maps: Vec::new(),
+                departure_blockers: Vec::new(),
+                departure_trajectory: Vec::new(),
+                departure_action: String::new(),
+                arrival_action: String::new(),
+            });
+        }
+
+        for i in 0..traj.len() {
             if let Some(dep_ids) = traffic_dependencies.comes_before(&SemanticWaypoint {
                 agent: agent_idx,
                 trajectory_index: i,
@@ -417,26 +413,17 @@ impl<P: MapfPlanner> PlanServer<P> {
                     }
                     if let Some(dep_robot_id) = robot_ids.get(dep_wp.agent) {
                         if let Some(dep_plan_id) = active_plan_ids.get(dep_robot_id) {
-                            departure_blockers.push(TrafficDependency {
+                            let req_progress = (dep_wp.trajectory_index + 1) as f32 * timestep;
+                            let blocker = TrafficDependency {
                                 name: dep_robot_id.clone(),
                                 plan_id: dep_plan_id.clone(),
-                                required_progress: dep_wp.trajectory_index as f32 * timestep,
-                            });
+                                required_progress: req_progress,
+                            };
+                            waypoints[i].departure_blockers.push(blocker);
                         }
                     }
                 }
             }
-
-            waypoints.push(Waypoint {
-                position: [pose.translation.x, pose.translation.y],
-                arrival_constraints: Default::default(),
-                progress: i as f32 * timestep,
-                maps: Vec::new(),
-                departure_blockers,
-                departure_trajectory: Vec::new(),
-                departure_action: String::new(),
-                arrival_action: String::new(),
-            });
         }
 
         Plan {

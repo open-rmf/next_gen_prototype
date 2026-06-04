@@ -8,7 +8,6 @@ futures = "0.3.32"
 rclrs = "*"
 rmf_prototype_msgs = "*"
 rmf_participant_discovery = { path = "../../rmf_participant_discovery" }
-rmf_plan_executor = { path = "../rmf_plan_executor" }
 unique_identifier_msgs = "*"
 nav_msgs = "*"
 nav2_msgs = "*"

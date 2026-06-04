@@ -12,7 +12,6 @@
   <build_depend>rclrs</build_depend>
   <build_depend>rmf_prototype_msgs</build_depend>
   <build_depend>rmf_participant_discovery</build_depend>
-  <build_depend>rmf_plan_executor</build_depend>
   <build_depend>unique_identifier_msgs</build_depend>
   <build_depend>example_interfaces</build_depend>
   <build_depend>test_msgs</build_depend>
@@ -24,7 +23,6 @@
   <exec_depend>rclrs</exec_depend>
   <exec_depend>rmf_prototype_msgs</exec_depend>
   <exec_depend>rmf_participant_discovery</exec_depend>
-  <exec_depend>rmf_plan_executor</exec_depend>
   <exec_depend>unique_identifier_msgs</exec_depend>
   <exec_depend>example_interfaces</exec_depend>
   <exec_depend>test_msgs</exec_depend>

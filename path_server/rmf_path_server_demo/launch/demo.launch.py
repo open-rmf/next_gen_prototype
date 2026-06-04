@@ -19,7 +19,16 @@ def generate_launch_description():
         output='screen'
     )
 
+    # 3. Start the plan executor
+    plan_executor = Node(
+        package='rmf_plan_executor',
+        executable='rmf_plan_executor',
+        name='rmf_plan_executor',
+        output='screen'
+    )
+
     return LaunchDescription([
         path_server,
-        robot_spawner
+        robot_spawner,
+        plan_executor
     ])
