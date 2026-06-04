@@ -1,3 +1,4 @@
+import math
 import time
 import unittest
 
@@ -13,6 +14,7 @@ from rmf_prototype_msgs.msg import (
     DestinationConstraints,
     Participant,
     ParticipantList,
+    Plan,
     Region,
     TargetRegion,
 )
@@ -32,13 +34,14 @@ def generate_test_description():
         output='screen'
     )
 
+    # Robot 1 is fast: speed 4.0, starting at x=0.0
     robot_1_sim = launch_ros.actions.Node(
         package='rmf_mock_robot_sim',
         executable='rmf_mock_robot_sim',
         output='screen',
         parameters=[{
             'robot_name': 'robot_1',
-            'speed': 2.0,
+            'speed': 4.0,
             'update_rate': 20.0,
             'initial_x': 0.0,
             'initial_y': 0.0,
@@ -47,13 +50,14 @@ def generate_test_description():
         }]
     )
 
+    # Robot 2 is slow: speed 1.0, starting at x=3.0 (in front of Robot 1)
     robot_2_sim = launch_ros.actions.Node(
         package='rmf_mock_robot_sim',
         executable='rmf_mock_robot_sim',
         output='screen',
         parameters=[{
             'robot_name': 'robot_2',
-            'speed': 2.0,
+            'speed': 1.0,
             'update_rate': 20.0,
             'initial_x': 3.0,
             'initial_y': 0.0,
@@ -76,7 +80,7 @@ def generate_test_description():
     }
 
 
-class TestPathServerScenario(unittest.TestCase):
+class TestPathServerFollow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         rclpy.init()
@@ -86,7 +90,7 @@ class TestPathServerScenario(unittest.TestCase):
         rclpy.shutdown()
 
     def setUp(self):
-        self.node = rclpy.create_node('test_path_server_scenario_node')
+        self.node = rclpy.create_node('test_path_server_follow_node')
 
     def tearDown(self):
         self.node.destroy_node()
@@ -107,37 +111,49 @@ class TestPathServerScenario(unittest.TestCase):
         msg.constraints = constraint
         return msg
 
-    def test_scenario(self):
-        # Track robot odometry
-        r1_odoms = []
-        r2_odoms = []
+    def test_follow_scenario(self):
+        # Track robot positions
+        r1_positions = []
+        r2_positions = []
 
-        self.node.create_subscription(
-            Odometry,
-            'robot_1/odom',
-            lambda msg: r1_odoms.append(msg),
-            10
-        )
+        def r1_odom_cb(msg):
+            r1_positions.append((msg.pose.pose.position.x, msg.pose.pose.position.y))
 
-        self.node.create_subscription(
-            Odometry,
-            'robot_2/odom',
-            lambda msg: r2_odoms.append(msg),
-            10
-        )
+        def r2_odom_cb(msg):
+            r2_positions.append((msg.pose.pose.position.x, msg.pose.pose.position.y))
+
+        def r1_plan_cb(msg):
+            print(f'--- robot_1 plan (version {msg.plan_id.plan_version}) ---')
+            for i, wp in enumerate(msg.waypoints):
+                blockers = [
+                    f'{b.name} progress >= {b.required_progress}'
+                    for b in wp.departure_blockers
+                ]
+                print(
+                    f'  wp {i}: pos {wp.position}, '
+                    f'progress {wp.progress}, blockers: {blockers}'
+                )
+
+        def r2_plan_cb(msg):
+            print(f'--- robot_2 plan (version {msg.plan_id.plan_version}) ---')
+            for i, wp in enumerate(msg.waypoints):
+                blockers = [
+                    f'{b.name} progress >= {b.required_progress}'
+                    for b in wp.departure_blockers
+                ]
+                print(
+                    f'  wp {i}: pos {wp.position}, '
+                    f'progress {wp.progress}, blockers: {blockers}'
+                )
+
+        self.node.create_subscription(Odometry, 'robot_1/odom', r1_odom_cb, 10)
+        self.node.create_subscription(Odometry, 'robot_2/odom', r2_odom_cb, 10)
+        self.node.create_subscription(Plan, 'robot_1/plan', r1_plan_cb, 10)
+        self.node.create_subscription(Plan, 'robot_2/plan', r2_plan_cb, 10)
 
         # Publishers for destinations
-        r1_dest_pub = self.node.create_publisher(
-            Destination,
-            'robot_1/destination',
-            10
-        )
-
-        r2_dest_pub = self.node.create_publisher(
-            Destination,
-            'robot_2/destination',
-            10
-        )
+        r1_dest_pub = self.node.create_publisher(Destination, 'robot_1/destination', 10)
+        r2_dest_pub = self.node.create_publisher(Destination, 'robot_2/destination', 10)
 
         # Discovery publisher
         discovery_qos = QoSProfile(
@@ -169,8 +185,9 @@ class TestPathServerScenario(unittest.TestCase):
         # Wait for discovery and subscriptions to settle
         time.sleep(3.0)
 
-        dest_1 = self.create_destination(1, 5.0, 0.0, 1.0)
-        dest_2 = self.create_destination(2, 3.0, 0.0, 1.0)
+        # Destinations: robot 1 goes to (9.0, 0.0), robot 2 goes to (10.0, 0.0)
+        dest_1 = self.create_destination(1, 9.0, 0.0, 1.0)
+        dest_2 = self.create_destination(2, 10.0, 0.0, 1.0)
 
         # Publish discovery and destinations initially to ensure delivery
         for _ in range(5):
@@ -180,44 +197,32 @@ class TestPathServerScenario(unittest.TestCase):
             rclpy.spin_once(self.node, timeout_sec=0.1)
             time.sleep(0.1)
 
-        # Run simulation and verify both robots reach their destinations
+        # Run simulation and check distances dynamically
         start_time = time.time()
-        timeout = 30.0
+        timeout = 40.0
         r1_reached = False
         r2_reached = False
-        r1_redirected = False
+        min_distance = float('inf')
+        distances = []
 
         while time.time() - start_time < timeout:
-            # Keep publishing discovery so they aren't considered disconnected
             discovery_pub.publish(discovery_msg)
-
             rclpy.spin_once(self.node, timeout_sec=0.1)
 
-            if r1_odoms:
-                x = r1_odoms[-1].pose.pose.position.x
-                y = r1_odoms[-1].pose.pose.position.y
+            if r1_positions and r2_positions:
+                pos1 = r1_positions[-1]
+                pos2 = r2_positions[-1]
+                dx = pos1[0] - pos2[0]
+                dy = pos1[1] - pos2[1]
+                dist = math.hypot(dx, dy)
+                distances.append(dist)
+                if dist < min_distance:
+                    min_distance = dist
 
-                if x >= 1.9 and not r1_redirected:
-                    print(
-                        f'robot_1 is midway at ({x:.2f}, {y:.2f}), '
-                        'redirecting to (5.0, 5.0)...'
-                    )
-                    dest_1_new = self.create_destination(3, 5.0, 5.0, 1.0)
-                    r1_dest_pub.publish(dest_1_new)
-                    r1_redirected = True
-
-                if r1_redirected:
-                    if abs(x - 5.0) < 0.25 and abs(y - 5.0) < 0.25:
-                        r1_reached = True
-                else:
-                    if abs(x - 5.0) < 0.25 and abs(y - 0.0) < 0.25:
-                        r1_reached = True
-
-            if r2_odoms:
-                x = r2_odoms[-1].pose.pose.position.x
-                y = r2_odoms[-1].pose.pose.position.y
-                # Goal is 3.0, 0.0
-                if abs(x - 3.0) < 0.25 and abs(y - 0.0) < 0.25:
+                # Goal checks (within 0.25m from the target points)
+                if abs(pos1[0] - 9.0) < 0.25 and abs(pos1[1] - 0.0) < 0.25:
+                    r1_reached = True
+                if abs(pos2[0] - 10.0) < 0.25 and abs(pos2[1] - 0.0) < 0.25:
                     r2_reached = True
 
             if r1_reached and r2_reached:
@@ -225,10 +230,27 @@ class TestPathServerScenario(unittest.TestCase):
 
             time.sleep(0.2)
 
-        self.assertTrue(r1_reached, 'robot_1 did not reach destination (5.0, 5.0)')
-        self.assertTrue(r2_reached, 'robot_2 did not reach destination (3.0, 0.0)')
+        # Asserts
+        self.assertTrue(
+            r1_reached,
+            f'robot_1 did not reach destination (9.0, 0.0). '
+            f'Last pos: {r1_positions[-1] if r1_positions else "None"}'
+        )
+        self.assertTrue(
+            r2_reached,
+            f'robot_2 did not reach destination (10.0, 0.0). '
+            f'Last pos: {r2_positions[-1] if r2_positions else "None"}'
+        )
 
-        # Verify robot_1 moved and did not collide with robot_2
-        self.assertGreater(len(r1_odoms), 0)
-        self.assertGreater(len(r2_odoms), 0)
-        print('Both robots safely reached their targets!')
+        print(f'Recorded distances between robots: {distances}')
+        print(f'Minimum distance recorded: {min_distance}')
+
+        # Footprint check: radius of each is 0.49.
+        # Sum of radii = 0.98.
+        # If they get closer than 0.95 (with minor tolerances), we consider it a collision.
+        # Let's verify that the minimum distance is at least 0.95.
+        self.assertGreaterEqual(
+            min_distance,
+            0.95,
+            f'Collision detected! Minimum distance was {min_distance}, expected >= 0.95'
+        )

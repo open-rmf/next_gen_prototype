@@ -1,178 +1,307 @@
 use geometry_msgs::msg::Pose;
 use mapf_post::MapfResult;
-use mapf_post::SemanticPlan;
 use mapf_post::WaypointFollower;
 use mapf_post::na::{Isometry2, Vector2};
 use mapf_post::spatial_allocation::{CurrentPosition, Grid2D};
 use nav_msgs::msg::Odometry;
 use nav2_msgs::msg::Costmap;
 use rclrs::Node;
-use rmf_prototype_msgs::msg::DestinationConstraints;
-use rmf_prototype_msgs::msg::PlanId;
-use rmf_prototype_msgs::msg::PlanRelease;
-use rmf_prototype_msgs::msg::SafeZone;
-use rmf_prototype_msgs::msg::SafeZoneId;
+use rmf_prototype_msgs::msg::{DestinationConstraints, Plan, PlanRelease, SafeZone, SafeZoneId};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+pub struct RobotState {
+    pub radius: f32,
+    pub latest_odom: Option<Odometry>,
+    pub plan: Option<Plan>,
+    pub waypoint_follower: Option<WaypointFollower>,
+}
+
 pub struct PlanExecutor {
     pub node: Arc<Node>,
-    pub waypoint_followers: HashMap<String, WaypointFollower>,
+    pub active_robots: BTreeMap<String, RobotState>,
     pub plan_release_publishers: HashMap<String, rclrs::Publisher<PlanRelease>>,
     pub safezone_publishers: HashMap<String, rclrs::Publisher<SafeZone>>,
-    pub active_plan: Option<MapfResult>,
-    pub active_semantic_plan: Option<SemanticPlan>,
-    pub active_plan_ids: HashMap<String, PlanId>,
     pub grid: Arc<Grid2D>,
     pub grid_width: u32,
     pub grid_height: u32,
     pub grid_resolution: f32,
     pub grid_origin: Pose,
-    pub latest_positions: HashMap<String, (f32, f32)>,
 }
 
 impl PlanExecutor {
     pub fn new(node: Arc<Node>) -> Self {
         Self {
             node,
-            waypoint_followers: HashMap::new(),
+            active_robots: BTreeMap::new(),
             plan_release_publishers: HashMap::new(),
             safezone_publishers: HashMap::new(),
-            active_plan: None,
-            active_semantic_plan: None,
-            active_plan_ids: HashMap::new(),
             grid: Arc::new(Grid2D::new(vec![vec![0; 20]; 20], 1.0)),
             grid_width: 20,
             grid_height: 20,
             grid_resolution: 1.0,
             grid_origin: Pose::default(),
-            latest_positions: HashMap::new(),
         }
     }
 
-    pub fn handle_odometry(&mut self, robot_id: &str, msg: &Odometry) {
+    pub fn handle_robot_added(&mut self, robot_id: &str, radius: f32) {
+        if !self.active_robots.contains_key(robot_id) {
+            rclrs::log!(
+                self.node.logger(),
+                "PlanExecutor adding participant: {} with radius {}",
+                robot_id,
+                radius
+            );
+            self.active_robots.insert(
+                robot_id.to_string(),
+                RobotState {
+                    radius,
+                    latest_odom: None,
+                    plan: None,
+                    waypoint_follower: None,
+                },
+            );
+            self.reindex_followers();
+        }
+    }
+
+    pub fn handle_robot_removed(&mut self, robot_id: &str) {
+        if self.active_robots.remove(robot_id).is_some() {
+            rclrs::log!(
+                self.node.logger(),
+                "PlanExecutor removing participant: {}",
+                robot_id
+            );
+            self.plan_release_publishers.remove(robot_id);
+            self.safezone_publishers.remove(robot_id);
+            self.reindex_followers();
+        }
+    }
+
+    fn get_agent_index(&self, robot_id: &str) -> Option<usize> {
+        self.active_robots.keys().position(|k| k == robot_id)
+    }
+
+    fn reindex_followers(&mut self) {
+        let sorted_names: Vec<String> = self.active_robots.keys().cloned().collect();
+        for (agent_idx, name) in sorted_names.iter().enumerate() {
+            let robot_state = self.active_robots.get_mut(name).unwrap();
+            if let Some(plan) = &robot_state.plan {
+                let traj_poses: Vec<Isometry2<f32>> = plan
+                    .waypoints
+                    .iter()
+                    .map(|wp| Isometry2::new(Vector2::new(wp.position[0], wp.position[1]), 0.0))
+                    .collect();
+
+                let mut follower = WaypointFollower::from_trajectory(
+                    agent_idx,
+                    mapf_post::Trajectory { poses: traj_poses },
+                );
+
+                if let Some(odom) = &robot_state.latest_odom {
+                    let current_x = odom.pose.pose.position.x as f32;
+                    let current_y = odom.pose.pose.position.y as f32;
+                    let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
+                    follower.update_position_estimate(&position, 0.5);
+                }
+
+                robot_state.waypoint_follower = Some(follower);
+            }
+        }
+    }
+
+    pub fn handle_plan(&mut self, robot_id: &str, msg: Plan) {
+        rclrs::log!(
+            self.node.logger(),
+            "Received plan version {} with {} waypoints for robot {}",
+            msg.plan_id.plan_version,
+            msg.waypoints.len(),
+            robot_id
+        );
+
+        let Some(state) = self.active_robots.get_mut(robot_id) else {
+            return;
+        };
+
+        state.plan = Some(msg);
+
+        // Reindex because we updated the plan
+        self.reindex_followers();
+    }
+
+    pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) {
         let current_x = msg.pose.pose.position.x as f32;
         let current_y = msg.pose.pose.position.y as f32;
 
-        self.latest_positions
-            .insert(robot_id.to_string(), (current_x, current_y));
+        let Some(state) = self.active_robots.get_mut(robot_id) else {
+            return;
+        };
 
-        if let Some(waypoint_follower_session) = self.waypoint_followers.get_mut(robot_id) {
-            //TODO(arjoc): Make "uncertainty" configurable
+        state.latest_odom = Some(msg.clone());
+
+        if let Some(fw) = &mut state.waypoint_follower {
             let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
-            waypoint_follower_session.update_position_estimate(&position, 0.5);
+            fw.update_position_estimate(&position, 0.5);
         }
 
-        let mut current_positions: BTreeMap<String, CurrentPosition> = BTreeMap::new();
-
-        // Get semantic robot positions
-        for (r_id, waypoint_follower_session) in &mut self.waypoint_followers {
-            let real_pos = self
-                .latest_positions
-                .get(r_id)
-                .copied()
-                .unwrap_or((current_x, current_y));
-            current_positions.insert(
-                r_id.clone(),
-                CurrentPosition {
-                    semantic_position: waypoint_follower_session.get_semantic_waypoint(),
-                    real_position: real_pos,
-                },
-            );
+        if !self.ready_to_execute() {
+            return;
         }
 
-        let robot_name_to_id: HashMap<String, usize> = HashMap::from_iter(
-            current_positions
-                .iter()
-                .enumerate()
-                .map(|(id, (robot_name, _))| (robot_name.clone(), id)),
-        );
-        let semantic_pos_vec: Vec<_> = current_positions
-            .iter()
-            .map(|(_robot, position)| &position.semantic_position)
-            .cloned()
-            .collect();
-
-        let full_pos_vec: Vec<_> = current_positions
-            .iter()
-            .map(|(_robot, position)| position)
-            .cloned()
-            .collect(); // Calculate claim dict
-        if let Some(active_sem_plan) = self.active_semantic_plan.clone() {
-            let safe_claims = active_sem_plan.get_claim_dict(&semantic_pos_vec);
-
-            if let Some(agent_id) = robot_name_to_id.get(robot_id) {
-                if let Some(p) = safe_claims.get(&agent_id) {
-                    let pr = PlanRelease {
-                        waypoint_id: p.end_id as u64,
-                        plan_id: self.active_plan_ids.get(robot_id).unwrap().clone(),
-                    };
-                    rclrs::log!(
-                        self.node.logger(),
-                        "Publishing PlanRelease for {}: waypoint_id = {}, plan_version = {}",
-                        robot_id,
-                        p.end_id,
-                        pr.plan_id.plan_version
-                    );
-                    if let Some(plan_release_pub) = self.plan_release_publishers.get_mut(robot_id) {
-                        let _ = plan_release_pub.publish(pr);
-                    } else {
-                        let publisher = self
-                            .node
-                            .create_publisher(&format!("{}/plan/release", robot_id))
-                            .unwrap();
-                        let _ = publisher.publish(pr);
-                        self.plan_release_publishers
-                            .insert(robot_id.to_owned().clone(), publisher);
-                    }
-
-                    let Some(trajectory) = self.active_plan.clone() else {
-                        println!("This should not be possible.");
-                        return;
-                    };
-                    let allocation_field =
-                        self.grid.allocate_trajectory(&trajectory, &full_pos_vec);
-                    let positions = allocation_field
-                        .get_alloc_for_agent(*agent_id)
-                        .unwrap_or_default();
-                    let costmap = Self::to_costmap_msg(
-                        &positions,
-                        self.grid_width,
-                        self.grid_height,
-                        self.grid_resolution,
-                        self.grid_origin.clone(),
-                        msg.header.stamp.clone(),
-                    );
-
-                    let safe_zone = SafeZone {
-                        incremental_target: DestinationConstraints {
-                            regions: vec![],
-                            nodes: vec![],
-                        },
-                        costmap,
-                        target_waypoint: vec![p.start_id as u64].try_into().unwrap(),
-                        last_waypoint: p.end_id as u64,
-                        target_progress: 0.0, // TODO(arjoc): Is this necessary
-                        id: SafeZoneId {
-                            plan_id: self.active_plan_ids.get(robot_id).unwrap().clone(),
-                            safe_zone_version: 0, // TODO(arjoc)L
-                        },
-                    };
-
-                    if let Some(costmap_pub) = self.safezone_publishers.get_mut(robot_id) {
-                        let _ = costmap_pub.publish(safe_zone);
-                    } else {
-                        let publisher = self
-                            .node
-                            .create_publisher(&format!("{}/safe_zone", robot_id))
-                            .unwrap();
-                        let _ = publisher.publish(safe_zone);
-                        self.safezone_publishers
-                            .insert(robot_id.to_owned().clone(), publisher);
-                    }
-                }
+        // Cache all semantic waypoints first because get_semantic_waypoint requires &mut self.
+        // Doing this first avoids borrowing active_robots as mutable during later immutable reads.
+        let mut semantic_waypoints = HashMap::new();
+        for (name, r_state) in &mut self.active_robots {
+            if let Some(fw) = &mut r_state.waypoint_follower {
+                semantic_waypoints.insert(name.clone(), fw.get_semantic_waypoint());
             }
         }
+
+        // 1. Calculate PlanRelease
+        let agent_idx = self.get_agent_index(robot_id).unwrap();
+        let robot_state = &self.active_robots[robot_id];
+        let plan = robot_state.plan.as_ref().unwrap();
+        let curr_wp_idx = semantic_waypoints
+            .get(robot_id)
+            .map(|w| w.trajectory_index)
+            .unwrap_or(0);
+
+        let mut released_wp_idx = curr_wp_idx;
+        while released_wp_idx < plan.waypoints.len() {
+            let wp = &plan.waypoints[released_wp_idx];
+            let mut blocked = false;
+            for blocker in &wp.departure_blockers {
+                if let Some(blocker_sem) = semantic_waypoints.get(&blocker.name) {
+                    // Timestep is 1.0, so progress is equivalent to the trajectory index.
+                    let blocker_progress = blocker_sem.trajectory_index as f32;
+                    if blocker_progress < blocker.required_progress {
+                        blocked = true;
+                        break;
+                    }
+                } else {
+                    blocked = true;
+                    break;
+                }
+            }
+            if blocked {
+                break;
+            }
+            released_wp_idx += 1;
+        }
+
+        if released_wp_idx >= plan.waypoints.len() {
+            released_wp_idx = plan.waypoints.len() - 1;
+        }
+
+        let pr = PlanRelease {
+            waypoint_id: released_wp_idx as u64,
+            plan_id: plan.plan_id.clone(),
+        };
+
+        // Publish PlanRelease
+        if let Some(plan_release_pub) = self.plan_release_publishers.get_mut(robot_id) {
+            let _ = plan_release_pub.publish(pr);
+        } else {
+            let publisher = self
+                .node
+                .create_publisher(&format!("{}/plan/release", robot_id))
+                .unwrap();
+            let _ = publisher.publish(pr);
+            self.plan_release_publishers
+                .insert(robot_id.to_string(), publisher);
+        }
+
+        // 2. Generate and publish SafeZone
+        let mut trajectories = Vec::new();
+        let mut footprints = Vec::new();
+        let mut current_positions = Vec::new();
+
+        for (r_name, r_state) in &self.active_robots {
+            let r_plan = r_state.plan.as_ref().unwrap();
+            let r_odom = r_state.latest_odom.as_ref().unwrap();
+
+            let traj_poses: Vec<Isometry2<f32>> = r_plan
+                .waypoints
+                .iter()
+                .map(|wp| Isometry2::new(Vector2::new(wp.position[0], wp.position[1]), 0.0))
+                .collect();
+            trajectories.push(mapf_post::Trajectory { poses: traj_poses });
+            footprints.push(Arc::new(mapf_post::shape::Ball::new(r_state.radius))
+                as Arc<dyn mapf_post::shape::Shape>);
+
+            let semantic_position = semantic_waypoints.get(r_name).cloned().unwrap();
+            current_positions.push(CurrentPosition {
+                semantic_position,
+                real_position: (
+                    r_odom.pose.pose.position.x as f32,
+                    r_odom.pose.pose.position.y as f32,
+                ),
+            });
+        }
+
+        let mapf_result = MapfResult {
+            trajectories,
+            footprints,
+            discretization_timestep: 1.0,
+        };
+
+        let allocation_field = self
+            .grid
+            .allocate_trajectory(&mapf_result, &current_positions);
+        let positions = allocation_field
+            .get_alloc_for_agent(agent_idx)
+            .unwrap_or_default();
+
+        let costmap = Self::to_costmap_msg(
+            &positions,
+            self.grid_width,
+            self.grid_height,
+            self.grid_resolution,
+            self.grid_origin.clone(),
+            msg.header.stamp.clone(),
+        );
+
+        let safe_zone = SafeZone {
+            incremental_target: DestinationConstraints {
+                regions: vec![],
+                nodes: vec![],
+            },
+            costmap,
+            target_waypoint: vec![curr_wp_idx as u64].try_into().unwrap(),
+            last_waypoint: released_wp_idx as u64,
+            target_progress: 0.0,
+            id: SafeZoneId {
+                plan_id: plan.plan_id.clone(),
+                safe_zone_version: 0,
+            },
+        };
+
+        if let Some(safe_zone_pub) = self.safezone_publishers.get_mut(robot_id) {
+            let _ = safe_zone_pub.publish(safe_zone);
+        } else {
+            let publisher = self
+                .node
+                .create_publisher(&format!("{}/safe_zone", robot_id))
+                .unwrap();
+            let _ = publisher.publish(safe_zone);
+            self.safezone_publishers
+                .insert(robot_id.to_string(), publisher);
+        }
+    }
+
+    fn ready_to_execute(&self) -> bool {
+        if self.active_robots.is_empty() {
+            return false;
+        }
+        for state in self.active_robots.values() {
+            if state.plan.is_none()
+                || state.latest_odom.is_none()
+                || state.waypoint_follower.is_none()
+            {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn to_costmap_msg(
