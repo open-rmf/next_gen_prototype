@@ -115,12 +115,19 @@ class TestPathServerFollow(unittest.TestCase):
         # Track robot positions
         r1_positions = []
         r2_positions = []
+        trajectory = []
 
         def r1_odom_cb(msg):
-            r1_positions.append((msg.pose.pose.position.x, msg.pose.pose.position.y))
+            x = msg.pose.pose.position.x
+            y = msg.pose.pose.position.y
+            r1_positions.append((x, y))
+            trajectory.append((time.time(), 'robot_1', x, y))
 
         def r2_odom_cb(msg):
-            r2_positions.append((msg.pose.pose.position.x, msg.pose.pose.position.y))
+            x = msg.pose.pose.position.x
+            y = msg.pose.pose.position.y
+            r2_positions.append((x, y))
+            trajectory.append((time.time(), 'robot_2', x, y))
 
         def r1_plan_cb(msg):
             print(f'--- robot_1 plan (version {msg.plan_id.plan_version}) ---')
@@ -254,3 +261,12 @@ class TestPathServerFollow(unittest.TestCase):
             0.95,
             f'Collision detected! Minimum distance was {min_distance}, expected >= 0.95'
         )
+
+        # Save trajectories to a single file
+        import os
+        os.makedirs('trajectories', exist_ok=True)
+        trajectory.sort(key=lambda item: item[0])
+        with open('trajectories/follow_test_trajectory.csv', 'w') as f:
+            f.write('t,robot_id,x,y\n')
+            for t, robot_id, x, y in trajectory:
+                f.write(f'{t - start_time},{robot_id},{x},{y}\n')

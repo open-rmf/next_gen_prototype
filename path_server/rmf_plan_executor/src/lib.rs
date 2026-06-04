@@ -140,8 +140,19 @@ impl PlanExecutor {
         state.latest_odom = Some(msg.clone());
 
         if let Some(fw) = &mut state.waypoint_follower {
+            let before = fw.get_semantic_waypoint().trajectory_index;
             let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
             fw.update_position_estimate(&position, 0.5);
+            let after = fw.get_semantic_waypoint().trajectory_index;
+            rclrs::log!(
+                self.node.logger(),
+                "[Executor Debug] Robot {} pos=({}, {}) index before={}, after={}",
+                robot_id,
+                current_x,
+                current_y,
+                before,
+                after
+            );
         }
 
         if !self.ready_to_execute() {
@@ -166,19 +177,61 @@ impl PlanExecutor {
             .map(|w| w.trajectory_index)
             .unwrap_or(0);
 
+        rclrs::log!(
+            self.node.logger(),
+            "[Executor Debug] Robot {} curr_wp_idx={} (semantic waypoint trajectory index)",
+            robot_id,
+            curr_wp_idx
+        );
+
         let mut released_wp_idx = curr_wp_idx;
         while released_wp_idx < plan.waypoints.len() {
             let wp = &plan.waypoints[released_wp_idx];
             let mut blocked = false;
             for blocker in &wp.departure_blockers {
                 if let Some(blocker_sem) = semantic_waypoints.get(&blocker.name) {
-                    // Timestep is 1.0, so progress is equivalent to the trajectory index.
-                    let blocker_progress = blocker_sem.trajectory_index as f32;
+                    let mut blocker_progress = blocker_sem.trajectory_index as f32;
+                    if let Some(blocker_state) = self.active_robots.get(&blocker.name) {
+                        if let Some(blocker_plan) = &blocker_state.plan {
+                            let curr_idx = blocker_sem.trajectory_index;
+                            if curr_idx < blocker_plan.waypoints.len() {
+                                let curr_pos = &blocker_plan.waypoints[curr_idx].position;
+                                let mut all_same = true;
+                                for w in &blocker_plan.waypoints[curr_idx..] {
+                                    let dx = w.position[0] - curr_pos[0];
+                                    let dy = w.position[1] - curr_pos[1];
+                                    if dx.abs() > 1e-3 || dy.abs() > 1e-3 {
+                                        all_same = false;
+                                        break;
+                                    }
+                                }
+                                if all_same {
+                                    blocker_progress = blocker_plan.waypoints.len() as f32;
+                                }
+                            }
+                        }
+                    }
+                    rclrs::log!(
+                        self.node.logger(),
+                        "[Executor Debug] Blocker check for robot {} wp {}: blocker={} blocker_progress={} required={}",
+                        robot_id,
+                        released_wp_idx,
+                        blocker.name,
+                        blocker_progress,
+                        blocker.required_progress
+                    );
                     if blocker_progress < blocker.required_progress {
                         blocked = true;
                         break;
                     }
                 } else {
+                    rclrs::log!(
+                        self.node.logger(),
+                        "[Executor Debug] Blocker check for robot {} wp {}: blocker={} is missing semantic waypoint",
+                        robot_id,
+                        released_wp_idx,
+                        blocker.name
+                    );
                     blocked = true;
                     break;
                 }
@@ -338,3 +391,59 @@ impl PlanExecutor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mapf_post::{Trajectory, WaypointFollower};
+    use mapf_post::na::{Isometry2, Vector2};
+
+    #[test]
+    fn test_robot_2_follower() {
+        let poses = vec![
+            Isometry2::new(Vector2::new(3.0, 0.0), 0.0),
+            Isometry2::new(Vector2::new(4.0, 0.0), 0.0),
+            Isometry2::new(Vector2::new(5.0, 0.0), 0.0),
+            Isometry2::new(Vector2::new(6.0, 0.0), 0.0),
+            Isometry2::new(Vector2::new(7.0, 0.0), 0.0),
+            Isometry2::new(Vector2::new(8.0, 0.0), 0.0),
+            Isometry2::new(Vector2::new(9.0, 0.0), 0.0),
+            Isometry2::new(Vector2::new(10.0, 0.0), 0.0),
+            Isometry2::new(Vector2::new(10.0, 0.0), 0.0),
+            Isometry2::new(Vector2::new(10.0, 0.0), 0.0),
+        ];
+        let mut follower = WaypointFollower::from_trajectory(0, Trajectory { poses });
+        
+        // Simulating the robot moving through the path:
+        follower.update_position_estimate(&Isometry2::new(Vector2::new(3.0, 0.0), 0.0), 0.5);
+        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 0);
+
+        follower.update_position_estimate(&Isometry2::new(Vector2::new(4.0, 0.0), 0.0), 0.5);
+        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 1);
+
+        follower.update_position_estimate(&Isometry2::new(Vector2::new(5.0, 0.0), 0.0), 0.5);
+        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 2);
+
+        follower.update_position_estimate(&Isometry2::new(Vector2::new(6.0, 0.0), 0.0), 0.5);
+        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 3);
+
+        follower.update_position_estimate(&Isometry2::new(Vector2::new(7.0, 0.0), 0.0), 0.5);
+        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 4);
+
+        follower.update_position_estimate(&Isometry2::new(Vector2::new(8.0, 0.0), 0.0), 0.5);
+        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 5);
+
+        follower.update_position_estimate(&Isometry2::new(Vector2::new(9.0, 0.0), 0.0), 0.5);
+        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 6);
+
+        follower.update_position_estimate(&Isometry2::new(Vector2::new(10.0, 0.0), 0.0), 0.5);
+        println!("After reaching 10.0: index is {}", follower.get_semantic_waypoint().trajectory_index);
+        
+        follower.update_position_estimate(&Isometry2::new(Vector2::new(10.0, 0.0), 0.0), 0.5);
+        println!("After waiting at 10.0 (1st time): index is {}", follower.get_semantic_waypoint().trajectory_index);
+        
+        follower.update_position_estimate(&Isometry2::new(Vector2::new(10.0, 0.0), 0.0), 0.5);
+        println!("After waiting at 10.0 (2nd time): index is {}", follower.get_semantic_waypoint().trajectory_index);
+    }
+}
+

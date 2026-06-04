@@ -111,18 +111,29 @@ class TestPathServerScenario(unittest.TestCase):
         # Track robot odometry
         r1_odoms = []
         r2_odoms = []
+        trajectory = []
+
+        def r1_cb(msg):
+            r1_odoms.append(msg)
+            pos = msg.pose.pose.position
+            trajectory.append((time.time(), 'robot_1', pos.x, pos.y))
+
+        def r2_cb(msg):
+            r2_odoms.append(msg)
+            pos = msg.pose.pose.position
+            trajectory.append((time.time(), 'robot_2', pos.x, pos.y))
 
         self.node.create_subscription(
             Odometry,
             'robot_1/odom',
-            lambda msg: r1_odoms.append(msg),
+            r1_cb,
             10
         )
 
         self.node.create_subscription(
             Odometry,
             'robot_2/odom',
-            lambda msg: r2_odoms.append(msg),
+            r2_cb,
             10
         )
 
@@ -232,3 +243,12 @@ class TestPathServerScenario(unittest.TestCase):
         self.assertGreater(len(r1_odoms), 0)
         self.assertGreater(len(r2_odoms), 0)
         print('Both robots safely reached their targets!')
+
+        # Save trajectories to a single file
+        import os
+        os.makedirs('trajectories', exist_ok=True)
+        trajectory.sort(key=lambda item: item[0])
+        with open('trajectories/scenario_test_trajectory.csv', 'w') as f:
+            f.write('t,robot_id,x,y\n')
+            for t, robot_id, x, y in trajectory:
+                f.write(f'{t - start_time},{robot_id},{x},{y}\n')
