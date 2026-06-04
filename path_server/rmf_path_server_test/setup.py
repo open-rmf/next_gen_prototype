@@ -21,6 +21,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'rmf_visualize_trajectory = rmf_path_server_test.visualize:main',
         ],
     },
 )
