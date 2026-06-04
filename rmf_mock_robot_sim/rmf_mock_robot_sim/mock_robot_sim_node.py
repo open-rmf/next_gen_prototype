@@ -61,6 +61,7 @@ class MockRobotSimNode(Node):
         self.last_update_time = self.get_clock().now()
         self.wait_time_remaining = 0.0
         self.released_waypoint_idx = 0
+        self.was_blocked = False
 
         # 3. Configure QoS for Discovery
         discovery_qos = QoSProfile(
@@ -160,6 +161,7 @@ class MockRobotSimNode(Node):
         self.current_waypoint_idx = 0
         self.wait_time_remaining = 0.0
         self.released_waypoint_idx = 0
+        self.was_blocked = False
 
         # If the path is not empty and we are far from the start,
         # we could either teleport or travel there.
@@ -167,13 +169,24 @@ class MockRobotSimNode(Node):
         # position to waypoints[0].
 
     def handle_release(self, msg: PlanRelease):
-        if (
-            self.current_plan_id
-            and msg.plan_id.plan_version == self.current_plan_id.plan_version
-            and list(msg.plan_id.destination_session.uuid)
-            == list(self.current_plan_id.destination_session.uuid)
-        ):
+        self.get_logger().info(
+            f"Received PlanRelease: waypoint_id={msg.waypoint_id}, "
+            f"plan_version={msg.plan_id.plan_version}"
+        )
+        if not self.current_plan_id:
+            self.get_logger().info("Cannot update release: current_plan_id is None")
+            return
+        
+        uuid_matches = list(msg.plan_id.destination_session.uuid) == list(self.current_plan_id.destination_session.uuid)
+        version_matches = msg.plan_id.plan_version == self.current_plan_id.plan_version
+        self.get_logger().info(
+            f"PlanRelease check: uuid_matches={uuid_matches}, version_matches={version_matches}"
+        )
+        if uuid_matches and version_matches:
             self.released_waypoint_idx = msg.waypoint_id
+            self.get_logger().info(
+                f"Successfully updated released_waypoint_idx to {self.released_waypoint_idx}"
+            )
 
     def is_blocked(self):
         if not self.current_path or self.current_waypoint_idx >= len(self.current_path):
@@ -195,35 +208,50 @@ class MockRobotSimNode(Node):
         # 1. Update position based on current path
         if self.current_path and self.current_waypoint_idx < len(self.current_path):
             if self.is_blocked():
+                if not self.was_blocked:
+                    self.get_logger().info(
+                        f"Blocked! current_waypoint_idx={self.current_waypoint_idx}, "
+                        f"released_waypoint_idx={self.released_waypoint_idx}"
+                    )
+                    self.was_blocked = True
                 # Blocked by traffic dependencies! Do not move.
                 pass
-            elif self.wait_time_remaining > 0.0:
-                self.wait_time_remaining -= dt
-                if self.wait_time_remaining < 0.0:
-                    self.wait_time_remaining = 0.0
             else:
-                target_wp = self.current_path[self.current_waypoint_idx]
-                tx, ty = float(target_wp.position[0]), float(target_wp.position[1])
-                dx = tx - self.x
-                dy = ty - self.y
-                dist = math.hypot(dx, dy)
+                if self.was_blocked:
+                    self.get_logger().info(
+                        f"Unblocked! current_waypoint_idx={self.current_waypoint_idx}, "
+                        f"released_waypoint_idx={self.released_waypoint_idx}"
+                    )
+                    self.was_blocked = False
+                if self.wait_time_remaining > 0.0:
+                    self.wait_time_remaining -= dt
+                    if self.wait_time_remaining < 0.0:
+                        self.wait_time_remaining = 0.0
+                else:
+                    target_wp = self.current_path[self.current_waypoint_idx]
+                    tx, ty = float(target_wp.position[0]), float(target_wp.position[1])
+                    dx = tx - self.x
+                    dy = ty - self.y
+                    dist = math.hypot(dx, dy)
 
-                if dist > 1e-3:
-                    self.yaw = math.atan2(dy, dx)
-                    step = self.speed * dt
-                    if step >= dist:
-                        # Reached the target waypoint
+                    if dist > 1e-3:
+                        self.yaw = math.atan2(dy, dx)
+                        step = self.speed * dt
+                        if step >= dist:
+                            # Reached the target waypoint
+                            self.x = tx
+                            self.y = ty
+                            self.current_waypoint_idx += 1
+                            self.wait_time_remaining = 1.0
+                        else:
+                            self.x += (dx / dist) * step
+                            self.y += (dy / dist) * step
+                    else:
+                        # Already at or extremely close to target waypoint, advance to next
                         self.x = tx
                         self.y = ty
                         self.current_waypoint_idx += 1
                         self.wait_time_remaining = 1.0
-                    else:
-                        self.x += (dx / dist) * step
-                        self.y += (dy / dist) * step
-                else:
-                    # Already at or extremely close to target waypoint, advance to next
-                    self.current_waypoint_idx += 1
-                    self.wait_time_remaining = 1.0
 
             # 2. Publish plan progress
             self.publish_progress()

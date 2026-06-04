@@ -1,3 +1,4 @@
-path_server/rmf_path_server_test/trajectories/scenario_test_trajectory.csv
+path_server/rmf_path_server_test/trajectories/
 path_server/rmf_plan_executor/src/lib.rs
 next_gen_prototype/
+rmf_mock_robot_sim/rmf_mock_robot_sim/mock_robot_sim_node.py
