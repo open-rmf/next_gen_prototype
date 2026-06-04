@@ -1,3 +1,6 @@
+mod config;
+
+use config::ReservationConfig;
 use rclrs::{Context, CreateBasicExecutor, SpinOptions};
 use rmf_prototype_msgs::msg::{
     Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, Region,
@@ -385,13 +388,15 @@ struct RobotConnections {
 
 struct DestinationsServer {
     currently_occupied: CurrentlyOccupiedDestinations,
+    config: Arc<ReservationConfig>,
     node: Arc<rclrs::Node>,
 }
 
 impl DestinationsServer {
-    fn new(node: Arc<rclrs::Node>, grid_size: f32) -> Self {
+    fn new(node: Arc<rclrs::Node>, config: Arc<ReservationConfig>) -> Self {
         Self {
-            currently_occupied: CurrentlyOccupiedDestinations::new(grid_size),
+            currently_occupied: CurrentlyOccupiedDestinations::new(config.grid_size),
+            config,
             node,
         }
     }
@@ -424,6 +429,29 @@ impl DestinationsServer {
                 },
                 session: goals.session,
             });
+        }
+
+        // Every requested region must lie within one of the predefined safe sets.
+        if self.config.enforces_safe_sets() {
+            for constraints in &sorted_one_of {
+                for target_region in &constraints.regions {
+                    let region = &target_region.region;
+                    if !self
+                        .config
+                        .is_region_within_safe_sets(region.hint, &region.points)
+                    {
+                        return Err(DomainDestinationError {
+                            error: DomainError {
+                                code: DestinationError::CODE_UNREACHABLE,
+                                message: "Requested region is outside the predefined safe sets"
+                                    .into(),
+                                parameters: format!("{{\"points\": {:?}}}", region.points),
+                            },
+                            session: goals.session,
+                        });
+                    }
+                }
+            }
         }
 
         match self
@@ -465,14 +493,63 @@ impl DiscoveryServer {
     }
 }
 
+/// Load the reservation configuration from the given file path.
+///
+/// If no path is provided, fall back to the default configuration.
+/// Throws an error if a path is provided but cannot be loaded.
+fn load_config(
+    node: &Arc<rclrs::Node>,
+    path: &str,
+) -> Result<Arc<ReservationConfig>, config::ConfigError> {
+    if path.is_empty() {
+        rclrs::log_warn!(
+            node.logger(),
+            "No 'config_file' parameter provided; running with a permissive default \
+             configuration (all requested regions accepted)."
+        );
+        return Ok(Arc::new(ReservationConfig::default()));
+    }
+
+    let config = ReservationConfig::from_file(path).map_err(|err| {
+        rclrs::log_error!(
+            node.logger(),
+            "Failed to load reservation config from '{}': {}.",
+            path,
+            err
+        );
+        err
+    })?;
+
+    rclrs::log!(
+        node.logger(),
+        "Loaded reservation config from '{}': {} safe set(s), {} parking spot(s), \
+         grid_size {}.",
+        path,
+        config.safe_sets.len(),
+        config.parking_spots.len(),
+        config.grid_size
+    );
+    Ok(Arc::new(config))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = Context::default_from_env().unwrap();
     let mut executor = context.create_basic_executor();
     let node = Arc::new(executor.create_node("destination_server")?);
 
+    // Path to the reservation configuration file.
+    let config_file = node
+        .declare_parameter("config_file")
+        .default(Arc::from(""))
+        .mandatory()?;
+
+    let config = load_config(&node, &config_file.get())?;
+
     // 1. Create the Destinations worker (Data Plane)
-    let destinations_worker =
-        Arc::new(node.create_worker(DestinationsServer::new(Arc::clone(&node), 0.5)));
+    let destinations_worker = Arc::new(node.create_worker(DestinationsServer::new(
+        Arc::clone(&node),
+        Arc::clone(&config),
+    )));
 
     // 2. Create the Discovery worker (Control Plane), passing a reference to the Destinations worker
     let discovery_worker = Arc::new(node.create_worker(DiscoveryServer::new(
