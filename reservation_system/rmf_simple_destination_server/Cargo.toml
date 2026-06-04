@@ -11,6 +11,7 @@ rmf_participant_discovery = { path = "../../rmf_participant_discovery" }
 unique_identifier_msgs = "*"
 builtin_interfaces = { version = "2.0.3" }
 serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
 tokio = { version = "1.0", features = ["full"] }
 
 

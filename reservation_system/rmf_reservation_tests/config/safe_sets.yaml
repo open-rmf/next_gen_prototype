@@ -1,0 +1,27 @@
+# Test configuration for the safe-set launch test.
+
+grid_size: 0.5
+
+safe_sets:
+  - name: test_floor
+    region:
+      hint: axis_aligned_rectangle
+      points: [0.0, 0.0, 10.0, 10.0]
+  - name: dock
+    region:
+      hint: axis_aligned_rectangle
+      points: [20.0, 20.0, 30.0, 30.0]
+
+parking_spots:
+  - name: parking_a
+    x: 1.0
+    y: 1.0
+    region:
+      hint: axis_aligned_rectangle
+      points: [0.5, 0.5, 1.5, 1.5]
+  - name: parking_b
+    x: 8.0
+    y: 8.0
+    region:
+      hint: axis_aligned_rectangle
+      points: [7.5, 7.5, 8.5, 8.5]
