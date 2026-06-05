@@ -8,7 +8,7 @@ def generate_launch_description():
         package='rmf_path_server',
         executable='rmf_path_server',
         name='rmf_path_server',
-        output='screen'
+        output='both'
     )
 
     # 2. Start the web spawner & web dashboard hosting server (REST & SSE Bridge)
@@ -16,7 +16,7 @@ def generate_launch_description():
         package='rmf_path_server_demo',
         executable='robot_spawner',
         name='robot_spawner',
-        output='screen'
+        output='both'
     )
 
     # 3. Start the plan executor
@@ -24,7 +24,7 @@ def generate_launch_description():
         package='rmf_plan_executor',
         executable='rmf_plan_executor',
         name='rmf_plan_executor',
-        output='screen'
+        output='both'
     )
 
     return LaunchDescription([

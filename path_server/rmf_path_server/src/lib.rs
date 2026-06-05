@@ -321,7 +321,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                     };
                     (
                         id.clone(),
-                        Arc::new(mapf_post::shape::Ball::new(radius + 0.1))
+                        Arc::new(mapf_post::shape::Ball::new(radius))
                             as Arc<dyn mapf_post::shape::Shape>,
                     )
                 })
