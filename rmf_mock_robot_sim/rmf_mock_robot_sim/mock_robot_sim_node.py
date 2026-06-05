@@ -3,7 +3,7 @@ import math
 from geometry_msgs.msg import Point, Quaternion
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import Participant, ParticipantList, Plan, PlanRelease, Progress
 
 
@@ -63,24 +63,31 @@ class MockRobotSimNode(Node):
         self.released_waypoint_idx = 0
         self.was_blocked = False
 
-        # 3. Configure QoS for Discovery
+        # 3. Configure QoS for Discovery & Reliable Data
         discovery_qos = QoSProfile(
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST
         )
 
+        reliable_transient_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
         # 4. Create Publishers
         self.odom_pub = self.create_publisher(
             Odometry,
             f'{self.robot_name}/odom',
-            10
+            qos_profile=reliable_transient_qos
         )
 
         self.progress_pub = self.create_publisher(
             Progress,
             f'{self.robot_name}/plan/progress',
-            10
+            qos_profile=reliable_transient_qos
         )
 
         self.dest_discovery_pub = self.create_publisher(
@@ -101,7 +108,7 @@ class MockRobotSimNode(Node):
             Plan,
             f'{self.robot_name}/plan',
             self.handle_plan,
-            10
+            qos_profile=reliable_transient_qos
         )
 
         # Also subscribe to path topic as mentioned in the README
@@ -109,7 +116,7 @@ class MockRobotSimNode(Node):
             Plan,
             f'{self.robot_name}/path',
             self.handle_plan,
-            10
+            qos_profile=reliable_transient_qos
         )
 
         # Subscribe to plan release topic
@@ -117,7 +124,7 @@ class MockRobotSimNode(Node):
             PlanRelease,
             f'{self.robot_name}/plan/release',
             self.handle_release,
-            10
+            qos_profile=reliable_transient_qos
         )
 
         # 6. Timers

@@ -1,5 +1,5 @@
 use nav_msgs::msg::Odometry;
-use rclrs::{Context, CreateBasicExecutor, SpinOptions};
+use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use rmf_plan_executor::PlanExecutor;
 use rmf_prototype_msgs::msg::{ParticipantList, Plan};
 use std::collections::HashMap;
@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let plan_topic = robot_id.to_string() + "/plan";
 
                 let odom_sub = match server.executor_worker.create_subscription::<Odometry, _>(
-                    &odom_topic,
+                    odom_topic.as_str().transient_local().reliable(),
                     move |executor: &mut PlanExecutor, msg: Odometry| {
                         executor.handle_odometry(&robot_id_clone, msg);
                     },
@@ -94,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let plan_sub = match server.executor_worker.create_subscription::<Plan, _>(
-                    &plan_topic,
+                    plan_topic.as_str().transient_local().reliable(),
                     move |executor: &mut PlanExecutor, msg: Plan| {
                         executor.handle_plan(&robot_id_clone2, msg);
                     },

@@ -3,7 +3,7 @@ use mapf_post::SemanticPlan;
 use mapf_post::SemanticWaypoint;
 use mapf_post::na::Isometry2;
 use nav_msgs::msg::Odometry;
-use rclrs::Node;
+use rclrs::{IntoPrimitiveOptions, Node};
 use rmf_prototype_msgs::msg::Destination;
 use rmf_prototype_msgs::msg::Plan;
 use rmf_prototype_msgs::msg::PlanId;
@@ -197,7 +197,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                             // Publish the plans
                             if !self.plan_publishers.contains_key(robot_id) {
                                 let topic = format!("{}/plan", robot_id);
-                                match self.node.create_publisher::<Plan>(&topic) {
+                                match self.node.create_publisher::<Plan>(topic.as_str().transient_local().reliable()) {
                                     Ok(pub_) => {
                                         self.plan_publishers.insert(robot_id.clone(), pub_);
                                     }
@@ -454,4 +454,141 @@ impl<P: MapfPlanner> DiscoveryServer<P> {
             destinations_worker,
         }
     }
+}
+
+
+
+pub struct PathServerRunning<P: MapfPlanner> {
+    pub destinations_worker: Arc<rclrs::Worker<PlanServer<P>>>,
+    pub discovery_worker: Arc<rclrs::Worker<DiscoveryServer<P>>>,
+    pub replan_timer: Box<dyn std::any::Any + Send + Sync>,
+    pub list_subscription: rclrs::WorkerSubscription<rmf_prototype_msgs::msg::ParticipantList, DiscoveryServer<P>>,
+    pub discovery_subscription: rclrs::WorkerSubscription<rmf_prototype_msgs::msg::ParticipantList, DiscoveryServer<P>>,
+}
+
+pub fn start_path_server<P: MapfPlanner + 'static>(
+    node: Arc<rclrs::Node>,
+    planner: P,
+) -> Result<PathServerRunning<P>, Box<dyn std::error::Error>> {
+    let footprints = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let footprints_clone = Arc::clone(&footprints);
+
+    // Create the Destinations worker (Data Plane)
+    let destinations_worker = Arc::new(node.create_worker(PlanServer::new(
+        Arc::clone(&node),
+        planner,
+        footprints,
+    )));
+
+    // Create a periodic timer on the Destinations worker to trigger replans asynchronously.
+    let replan_timer = destinations_worker.create_timer_repeating(
+        std::time::Duration::from_millis(100),
+        move |server: &mut PlanServer<P>| {
+            server.replan();
+        },
+    )?;
+
+    // Create the Discovery worker (Control Plane), passing a reference to the Destinations worker
+    let discovery_worker = Arc::new(node.create_worker(DiscoveryServer::new(
+        Arc::clone(&node),
+        Arc::clone(&destinations_worker),
+    )));
+
+    let footprints_clone2 = Arc::clone(&footprints_clone);
+    let list_subscription = discovery_worker
+        .create_subscription::<rmf_prototype_msgs::msg::ParticipantList, _>(
+            "/destination/discovery",
+            move |_server: &mut DiscoveryServer<P>,
+                  msg: rmf_prototype_msgs::msg::ParticipantList| {
+                if let Ok(mut map) = footprints_clone2.lock() {
+                    for p in msg.participants {
+                        let radius = if p.radius > 0.0 { p.radius } else { 0.49 };
+                        map.insert(p.name, radius);
+                    }
+                }
+            },
+        )?;
+
+    // Subscribe to discovery on the Discovery worker using the shared generic helper
+    let discovery_subscription = rmf_participant_discovery::create_discovery_subscription(
+        &discovery_worker,
+        "/destination/discovery",
+        |server: &mut DiscoveryServer<P>, robot_id: &str| {
+            if !server.active_robots.contains_key(robot_id) {
+                rclrs::log!(
+                    server.node.logger(),
+                    "Discovered new participant: {}",
+                    robot_id
+                );
+
+                let robot_id_clone = robot_id.to_string();
+                let destination_topic = robot_id.to_string() + "/destination";
+                let odom_topic = robot_id.to_string() + "/odom";
+
+                // Create the subscription on the destinations_worker thread context!
+                let destination_sub = match server
+                    .destinations_worker
+                    .create_subscription::<Destination, _>(
+                        destination_topic.as_str().transient_local().reliable(),
+                        move |dest_server: &mut PlanServer<P>, dest_msg: Destination| {
+                            dest_server.handle_destination(&robot_id_clone, dest_msg);
+                        },
+                    ) {
+                    Ok(sub) => sub,
+                    Err(err) => {
+                        rclrs::log_error!(
+                            server.node.logger(),
+                            "Failed to create destination subscription on DestinationsWorker for {}: {:?}",
+                            robot_id,
+                            err
+                        );
+                        return;
+                    }
+                };
+
+                let robot_id_clone2 = robot_id.to_string();
+                // Subscribe to robot_name/odom as well.
+                let odom_sub = match server
+                    .destinations_worker
+                    .create_subscription::<Odometry, _>(
+                        odom_topic.as_str().transient_local().reliable(),
+                        move |dest_server: &mut PlanServer<P>, odom_msg: Odometry| {
+                            dest_server.handle_odometry(&robot_id_clone2, odom_msg);
+                        },
+                    ) {
+                    Ok(sub) => sub,
+                    Err(err) => {
+                        rclrs::log_error!(
+                            server.node.logger(),
+                            "Failed to create odom subscription on DestinationsWorker for {}: {:?}",
+                            robot_id,
+                            err
+                        );
+                        return;
+                    }
+                };
+
+                server.active_robots.insert(
+                    robot_id.to_string(),
+                    RobotPathConnections {
+                        _destination_subscription: destination_sub,
+                        _odom_subscription: odom_sub,
+                    },
+                );
+            }
+        },
+        |server: &mut DiscoveryServer<P>, robot_id: &str| {
+            if server.active_robots.remove(robot_id).is_some() {
+                rclrs::log!(server.node.logger(), "Participant left: {}", robot_id);
+            }
+        },
+    )?;
+
+    Ok(PathServerRunning {
+        destinations_worker,
+        discovery_worker,
+        replan_timer: Box::new(replan_timer),
+        list_subscription,
+        discovery_subscription,
+    })
 }

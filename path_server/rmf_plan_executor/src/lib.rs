@@ -5,7 +5,7 @@ use mapf_post::na::{Isometry2, Vector2};
 use mapf_post::spatial_allocation::{CurrentPosition, Grid2D};
 use nav_msgs::msg::Odometry;
 use nav2_msgs::msg::Costmap;
-use rclrs::Node;
+use rclrs::{IntoPrimitiveOptions, Node};
 use rmf_prototype_msgs::msg::{DestinationConstraints, Plan, PlanRelease, SafeZone, SafeZoneId};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -257,7 +257,7 @@ impl PlanExecutor {
         } else {
             let publisher = self
                 .node
-                .create_publisher(&format!("{}/plan/release", robot_id))
+                .create_publisher(format!("{}/plan/release", robot_id).as_str().transient_local().reliable())
                 .unwrap();
             let _ = publisher.publish(pr);
             self.plan_release_publishers
@@ -334,7 +334,7 @@ impl PlanExecutor {
         } else {
             let publisher = self
                 .node
-                .create_publisher(&format!("{}/safe_zone", robot_id))
+                .create_publisher(format!("{}/safe_zone", robot_id).as_str().transient_local().reliable())
                 .unwrap();
             let _ = publisher.publish(safe_zone);
             self.safezone_publishers
