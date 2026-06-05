@@ -159,8 +159,21 @@ class TestPathServerFollow(unittest.TestCase):
         self.node.create_subscription(Plan, 'robot_2/plan', r2_plan_cb, 10)
 
         # Publishers for destinations
-        r1_dest_pub = self.node.create_publisher(Destination, 'robot_1/destination', 10)
-        r2_dest_pub = self.node.create_publisher(Destination, 'robot_2/destination', 10)
+        dest_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST
+        )
+        r1_dest_pub = self.node.create_publisher(
+            Destination,
+            'robot_1/destination',
+            qos_profile=dest_qos
+        )
+        r2_dest_pub = self.node.create_publisher(
+            Destination,
+            'robot_2/destination',
+            qos_profile=dest_qos
+        )
 
         # Discovery publisher
         discovery_qos = QoSProfile(
@@ -212,61 +225,62 @@ class TestPathServerFollow(unittest.TestCase):
         min_distance = float('inf')
         distances = []
 
-        while time.time() - start_time < timeout:
-            discovery_pub.publish(discovery_msg)
-            rclpy.spin_once(self.node, timeout_sec=0.1)
+        try:
+            while time.time() - start_time < timeout:
+                discovery_pub.publish(discovery_msg)
+                rclpy.spin_once(self.node, timeout_sec=0.1)
 
-            if r1_positions and r2_positions:
-                pos1 = r1_positions[-1]
-                pos2 = r2_positions[-1]
-                dx = pos1[0] - pos2[0]
-                dy = pos1[1] - pos2[1]
-                dist = math.hypot(dx, dy)
-                distances.append(dist)
-                if dist < min_distance:
-                    min_distance = dist
+                if r1_positions and r2_positions:
+                    pos1 = r1_positions[-1]
+                    pos2 = r2_positions[-1]
+                    dx = pos1[0] - pos2[0]
+                    dy = pos1[1] - pos2[1]
+                    dist = math.hypot(dx, dy)
+                    distances.append(dist)
+                    if dist < min_distance:
+                        min_distance = dist
 
-                # Goal checks (within 0.25m from the target points)
-                if abs(pos1[0] - 9.0) < 0.25 and abs(pos1[1] - 0.0) < 0.25:
-                    r1_reached = True
-                if abs(pos2[0] - 10.0) < 0.25 and abs(pos2[1] - 0.0) < 0.25:
-                    r2_reached = True
+                    # Goal checks (within 0.25m from the target points)
+                    if abs(pos1[0] - 9.0) < 0.25 and abs(pos1[1] - 0.0) < 0.25:
+                        r1_reached = True
+                    if abs(pos2[0] - 10.0) < 0.25 and abs(pos2[1] - 0.0) < 0.25:
+                        r2_reached = True
 
-            if r1_reached and r2_reached:
-                break
+                if r1_reached and r2_reached:
+                    break
 
-            time.sleep(0.2)
+                time.sleep(0.2)
 
-        # Asserts
-        self.assertTrue(
-            r1_reached,
-            f'robot_1 did not reach destination (9.0, 0.0). '
-            f'Last pos: {r1_positions[-1] if r1_positions else "None"}'
-        )
-        self.assertTrue(
-            r2_reached,
-            f'robot_2 did not reach destination (10.0, 0.0). '
-            f'Last pos: {r2_positions[-1] if r2_positions else "None"}'
-        )
+            # Asserts
+            self.assertTrue(
+                r1_reached,
+                f'robot_1 did not reach destination (9.0, 0.0). '
+                f'Last pos: {r1_positions[-1] if r1_positions else "None"}'
+            )
+            self.assertTrue(
+                r2_reached,
+                f'robot_2 did not reach destination (10.0, 0.0). '
+                f'Last pos: {r2_positions[-1] if r2_positions else "None"}'
+            )
 
-        print(f'Recorded distances between robots: {distances}')
-        print(f'Minimum distance recorded: {min_distance}')
+            print(f'Recorded distances between robots: {distances}')
+            print(f'Minimum distance recorded: {min_distance}')
 
-        # Footprint check: radius of each is 0.49.
-        # Sum of radii = 0.98.
-        # If they get closer than 0.95 (with minor tolerances), we consider it a collision.
-        # Let's verify that the minimum distance is at least 0.95.
-        self.assertGreaterEqual(
-            min_distance,
-            0.95,
-            f'Collision detected! Minimum distance was {min_distance}, expected >= 0.95'
-        )
-
-        # Save trajectories to a single file
-        import os
-        os.makedirs('trajectories', exist_ok=True)
-        trajectory.sort(key=lambda item: item[0])
-        with open('trajectories/follow_test_trajectory.csv', 'w') as f:
-            f.write('t,robot_id,x,y\n')
-            for t, robot_id, x, y in trajectory:
-                f.write(f'{t - start_time},{robot_id},{x},{y}\n')
+            # Footprint check: radius of each is 0.49.
+            # Sum of radii = 0.98.
+            # If they get closer than 0.95 (with minor tolerances), we consider it a collision.
+            # Let's verify that the minimum distance is at least 0.95.
+            self.assertGreaterEqual(
+                min_distance,
+                0.95,
+                f'Collision detected! Minimum distance was {min_distance}, expected >= 0.95'
+            )
+        finally:
+            # Save trajectories to a single file
+            import os
+            os.makedirs('trajectories', exist_ok=True)
+            trajectory.sort(key=lambda item: item[0])
+            with open('trajectories/follow_test_trajectory.csv', 'w') as f:
+                f.write('t,robot_id,x,y\n')
+                for t, robot_id, x, y in trajectory:
+                    f.write(f'{t - start_time},{robot_id},{x},{y}\n')
