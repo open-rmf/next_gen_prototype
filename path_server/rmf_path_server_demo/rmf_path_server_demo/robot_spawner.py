@@ -13,6 +13,7 @@ from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
@@ -156,6 +157,7 @@ class RobotSpawnerNode(Node):
         self.use_destination_server = self.get_parameter('use_destination_server').value
 
         self.active_processes = {}
+        self.active_log_files = {}
         self.sse_clients = []
         self.sse_clients_lock = threading.Lock()
         self.robot_goals = {}
@@ -164,12 +166,24 @@ class RobotSpawnerNode(Node):
         self.progress_subs = {}
         self.destination_subs = {}
         self.discovery_timer = None
+        self.discovery_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST
+        )
+
+        self.reliable_transient_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
 
         # Publishers for ROS 2 control plane
         self.discovery_pub = self.create_publisher(
             ParticipantList,
             '/destination/discovery',
-            10
+            qos_profile=self.discovery_qos
         )
         self.dest_publishers = {}
         self.dest_goal_publishers = {}
@@ -245,10 +259,14 @@ class RobotSpawnerNode(Node):
         ]
 
         try:
+            os.makedirs('mock_sim_logs', exist_ok=True)
+            log_file = open(f'mock_sim_logs/{name}.log', 'w')
+            self.active_log_files[name] = log_file
+
             proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
                 preexec_fn=os.setsid if sys.platform != 'win32' else None
             )
             self.active_processes[name] = proc
@@ -285,7 +303,7 @@ class RobotSpawnerNode(Node):
             Odometry,
             f'{name}/odom',
             odom_callback,
-            10
+            qos_profile=self.reliable_transient_qos
         )
 
     def subscribe_to_plan(self, name):
@@ -320,7 +338,7 @@ class RobotSpawnerNode(Node):
             Plan,
             f'{name}/plan',
             plan_callback,
-            10
+            qos_profile=self.reliable_transient_qos
         )
 
     def subscribe_to_progress(self, name):
@@ -341,7 +359,7 @@ class RobotSpawnerNode(Node):
             Progress,
             f'{name}/plan/progress',
             progress_callback,
-            10
+            qos_profile=self.reliable_transient_qos
         )
 
     def subscribe_to_destination(self, name):
@@ -371,7 +389,7 @@ class RobotSpawnerNode(Node):
             Destination,
             f'{name}/destination',
             destination_callback,
-            10
+            qos_profile=self.reliable_transient_qos
         )
 
     def set_goal(self, name, x, y):
@@ -395,7 +413,7 @@ class RobotSpawnerNode(Node):
                 self.dest_goal_publishers[name] = self.create_publisher(
                     DestinationGoal,
                     f'{name}/destination/goal',
-                    10
+                    qos_profile=self.reliable_transient_qos
                 )
 
             goal_msg = DestinationGoal()
@@ -424,7 +442,7 @@ class RobotSpawnerNode(Node):
                 self.dest_publishers[name] = self.create_publisher(
                     Destination,
                     f'{name}/destination',
-                    10
+                    qos_profile=self.reliable_transient_qos
                 )
 
             gx, gy = goals[0]
@@ -498,6 +516,12 @@ class RobotSpawnerNode(Node):
             pass
 
         self.active_processes.clear()
+        for log_file in self.active_log_files.values():
+            try:
+                log_file.close()
+            except Exception:
+                pass
+        self.active_log_files.clear()
         self.robot_goals.clear()
 
         # Destroy subscriptions and publishers
