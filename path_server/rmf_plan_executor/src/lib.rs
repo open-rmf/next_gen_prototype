@@ -190,27 +190,8 @@ impl PlanExecutor {
             let mut blocked = false;
             for blocker in &wp.departure_blockers {
                 if let Some(blocker_sem) = semantic_waypoints.get(&blocker.name) {
-                    let mut blocker_progress = blocker_sem.trajectory_index as f32;
-                    if let Some(blocker_state) = self.active_robots.get(&blocker.name) {
-                        if let Some(blocker_plan) = &blocker_state.plan {
-                            let curr_idx = blocker_sem.trajectory_index;
-                            if curr_idx < blocker_plan.waypoints.len() {
-                                let curr_pos = &blocker_plan.waypoints[curr_idx].position;
-                                let mut all_same = true;
-                                for w in &blocker_plan.waypoints[curr_idx..] {
-                                    let dx = w.position[0] - curr_pos[0];
-                                    let dy = w.position[1] - curr_pos[1];
-                                    if dx.abs() > 1e-3 || dy.abs() > 1e-3 {
-                                        all_same = false;
-                                        break;
-                                    }
-                                }
-                                if all_same {
-                                    blocker_progress = blocker_plan.waypoints.len() as f32;
-                                }
-                            }
-                        }
-                    }
+                    let blocker_progress = blocker_sem.trajectory_index;
+                    let required_progress = blocker.required_progress.round() as usize;
                     rclrs::log!(
                         self.node.logger(),
                         "[Executor Debug] Blocker check for robot {} wp {}: blocker={} blocker_progress={} required={}",
@@ -218,9 +199,9 @@ impl PlanExecutor {
                         released_wp_idx,
                         blocker.name,
                         blocker_progress,
-                        blocker.required_progress
+                        required_progress
                     );
-                    if blocker_progress < blocker.required_progress {
+                    if blocker_progress < required_progress {
                         blocked = true;
                         break;
                     }
@@ -240,6 +221,21 @@ impl PlanExecutor {
                 break;
             }
             released_wp_idx += 1;
+        }
+
+        if released_wp_idx < plan.waypoints.len() {
+            let wp_pos = &plan.waypoints[released_wp_idx].position;
+            for (r_name, r_state) in &self.active_robots {
+                if r_name == robot_id { continue; }
+                if let Some(odom) = &r_state.latest_odom {
+                    let dx = wp_pos[0] - odom.pose.pose.position.x as f32;
+                    let dy = wp_pos[1] - odom.pose.pose.position.y as f32;
+                    if dx.hypot(dy) < 0.8 {
+                        released_wp_idx = released_wp_idx.saturating_sub(1);
+                        break;
+                    }
+                }
+            }
         }
 
         if released_wp_idx >= plan.waypoints.len() {
