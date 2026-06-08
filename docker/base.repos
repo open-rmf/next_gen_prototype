@@ -1,8 +1,4 @@
 repositories:
-  nav2/navigation2:
-    type: git
-    url: https://github.com/ros-navigation/navigation2.git
-    version: jazzy
   ros2_rust/src/ros2-rust/examples:
     type: git
     url: https://github.com/ros2-rust/examples.git
