@@ -1,4 +1,8 @@
 repositories:
+  ros2_rust/src/ros2-rust/ros2_rust:
+    type: git
+    url: https://github.com/ros2-rust/ros2_rust.git
+    version: main
   ros2_rust/src/ros2-rust/examples:
     type: git
     url: https://github.com/ros2-rust/examples.git
