@@ -1,0 +1,45 @@
+name: Next-Gen Prototype CI
+
+on:
+  push:
+    branches: [ arjoc/feat/ci_config ]
+  pull_request:
+    branches: [ arjoc/feat/ci_config ]
+
+jobs:
+  ci-check:
+    name: Colcon Overlay Build & Test Suite
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/arjo129/ros2_rust_base:jazzy
+      # Note: If base image is protected in private GHCR, uncomment credentials:
+      # credentials:
+      #   username: ${{ github.actor }}
+      #   password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout Prototype Repository
+        uses: actions/checkout@v4
+        with:
+          path: next_gen_ws/src/next_gen_prototype
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "next_gen_ws/src/next_gen_prototype/path_server/rmf_path_server"
+
+      - name: Build Prototype Packages (Overlay Workspace)
+        working-directory: next_gen_ws
+        run: |
+          source /opt/ros2_rust_ws/install/setup.bash
+          colcon build --packages-select rmf_prototype_msgs rmf_participant_discovery rmf_path_server rmf_plan_executor rmf_mock_robot_sim rmf_path_server_demo rmf_path_server_test
+        shell: bash
+
+      - name: Run Automated Verification Tests
+        working-directory: next_gen_ws
+        run: |setup.repos
+          source /opt/ros2_rust_ws/install/setup.bash
+          source install/setup.bash
+          colcon test --packages-select rmf_path_server_test --event-handlers console_direct+
+          colcon test-result --all
+        shell: bash

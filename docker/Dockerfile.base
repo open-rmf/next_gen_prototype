@@ -1,0 +1,51 @@
+FROM ros:jazzy-ros-base
+
+# Disable interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install core build dependencies, Rust prerequisites, and ROS 2 build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    python3-pip \
+    python3-vcstool \
+    clang \
+    libclang-dev \
+    build-essential \
+    python3-colcon-common-extensions \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain (Stable)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install Cargo / Colcon ROS 2 Rust integration tools via pip
+RUN pip3 install -U --break-system-packages colcon-cargo colcon-ros-cargo
+
+# Initialize Underlay Workspace
+WORKDIR /opt/ros2_rust_ws
+
+# Copy minimal ROS 2 Rust & Nav2 dependency definitions
+COPY base.repos .
+
+# Import base repositories
+RUN mkdir -p src && vcs import src < base.repos
+
+# Install ROS 2 dependencies via rosdep (skipping heavy navigation2 full source keys if needed)
+RUN apt-get update && \
+    rosdep init || true && \
+    rosdep update && \
+    rosdep install --from-paths src --ignore-src -y --skip-keys="navigation2" && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build the Underlay Workspace
+RUN /bin/bash -c "source /opt/ros/jazzy/setup.bash && \
+    colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release"
+
+# Provide automatic sourcing entrypoint configuration inside ~/.bashrc
+RUN echo "source /opt/ros/jazzy/setup.bash" >> /root/.bashrc && \
+    echo "source /opt/ros2_rust_ws/install/setup.bash" >> /root/.bashrc
+
+CMD ["/bin/bash"]
