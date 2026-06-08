@@ -12,12 +12,12 @@ def generate_launch_description():
     )
 
     # 2. Start the web spawner & web dashboard hosting server (REST & SSE Bridge)
-    robot_spawner = Node(
-        package='rmf_path_server_demo',
-        executable='robot_spawner',
-        name='robot_spawner',
-        output='both'
-    )
+    # robot_spawner = Node(
+    #     package='rmf_path_server_demo',
+    #     executable='robot_spawner',
+    #     name='robot_spawner',
+    #     output='both'
+    # )
 
     # 3. Start the plan executor
     plan_executor = Node(
