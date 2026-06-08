@@ -27,18 +27,22 @@ RUN pip3 install -U --break-system-packages colcon-cargo colcon-ros-cargo
 # Initialize Underlay Workspace
 WORKDIR /opt/ros2_rust_ws
 
-# Copy minimal ROS 2 Rust dependency definitions
-COPY base.repos .
+# Copy minimal ROS 2 Rust dependency definitions (from repo root context)
+COPY docker/base.repos ./base.repos
 
 # Import base repositories (now including main ros2_rust repo with rclrs)
 RUN mkdir -p src && vcs import src < base.repos
 
-# Install ROS 2 dependencies via rosdep (skipping unneeded or custom source keys)
+# Stage the prototype branch to resolve its rosdep system dependencies directly into the base image
+COPY . /tmp/next_gen_prototype
+
+# Install ROS 2 dependencies via rosdep for both underlay and prototype branch
 RUN apt-get update && \
     rosdep init || true && \
     rosdep update && \
-    rosdep install --from-paths src --ignore-src -y --skip-keys="navigation2 rclrs" && \
-    rm -rf /var/lib/apt/lists/*
+    rosdep install --from-paths src /tmp/next_gen_prototype --ignore-src -y --skip-keys="rclrs" && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm -rf /tmp/next_gen_prototype
 
 # Build the Underlay Workspace
 RUN /bin/bash -c "source /opt/ros/jazzy/setup.bash && \
