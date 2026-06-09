@@ -1,7 +1,9 @@
 mod config;
+mod reservation;
 
 use config::ReservationConfig;
 use rclrs::{Context, CreateBasicExecutor, SpinOptions};
+use reservation::{Outcome, ReservationState};
 use rmf_prototype_msgs::msg::{
     Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, Region,
     TargetRegion,
@@ -135,6 +137,8 @@ impl DomainDestinationGoal {
 struct DomainDestination {
     pub constraints: DomainDestinationConstraints,
     pub session: SessionUUID,
+    /// The original goal session when this destination is a parking detour.
+    pub detour_for_goal: Option<SessionUUID>,
 }
 
 impl DomainDestination {
@@ -143,6 +147,12 @@ impl DomainDestination {
             constraints: self.constraints.to_ros(),
             session: unique_identifier_msgs::msg::UUID {
                 uuid: self.session.uuid,
+            },
+            detour_for_goal: unique_identifier_msgs::msg::UUID {
+                uuid: match self.detour_for_goal {
+                    Some(session) => session.uuid,
+                    None => [0u8; 16],
+                },
             },
             ..Default::default()
         }
@@ -196,11 +206,6 @@ struct CurrentlyOccupiedDestinations {
     grid_size: f32,
 }
 
-#[derive(Debug, PartialEq)]
-enum ReservationError {
-    NoAvailableConstraints,
-}
-
 impl CurrentlyOccupiedDestinations {
     fn new(grid_size: f32) -> Self {
         Self {
@@ -219,42 +224,33 @@ impl Default for CurrentlyOccupiedDestinations {
 }
 
 impl CurrentlyOccupiedDestinations {
-    fn reserve_one_of(
+    fn is_constraints_free(&self, constraints: &DomainDestinationConstraints) -> bool {
+        constraints.regions.iter().all(|target_region| {
+            self.check_if_region_free(&target_region.region)
+                .unwrap_or(false)
+        })
+    }
+
+    fn first_free_option(&self, options: &[DomainDestinationConstraints]) -> Option<usize> {
+        options.iter().position(|c| self.is_constraints_free(c))
+    }
+
+    // Callers check that the constraints are free before reserving them.
+    fn reserve_constraints(
         &mut self,
         agent: &str,
-        constraints: &[DomainDestinationConstraints],
         session: &SessionUUID,
-    ) -> Result<DomainDestinationConstraints, ReservationError> {
-        let mut allocated_id = None;
-        for (id, c) in constraints.iter().enumerate() {
-            // check all  regions are free
-            let all_free = c.regions.iter().all(|target_region| {
-                self.check_if_region_free(&target_region.region)
-                    .unwrap_or(false)
-            });
-
-            if all_free {
-                allocated_id = Some(id);
-                break;
-            }
+        constraints: &DomainDestinationConstraints,
+    ) {
+        for target_region in &constraints.regions {
+            self.mark_region(session, &target_region.region);
         }
+        self.agent_to_session.insert(agent.to_string(), *session);
+    }
 
-        if let Some(id) = allocated_id {
-            // Check if the agent holds a reservation
-            if let Some(old_uuid) = self.agent_to_session.get(agent) {
-                self.clear_old_uuid(&old_uuid.clone());
-            }
-
-            let selected_constraints = constraints[id].clone();
-
-            // Mark the new regions
-            for target_region in &selected_constraints.regions {
-                self.mark_region(session, &target_region.region);
-            }
-            self.agent_to_session.insert(agent.to_string(), *session);
-            Ok(selected_constraints)
-        } else {
-            Err(ReservationError::NoAvailableConstraints)
+    fn release_agent(&mut self, agent: &str) {
+        if let Some(session) = self.agent_to_session.remove(agent) {
+            self.clear_old_uuid(&session);
         }
     }
 
@@ -380,103 +376,105 @@ impl CurrentlyOccupiedDestinations {
     }
 }
 
-struct RobotConnections {
-    goal_publisher: rclrs::Publisher<Destination>,
-    error_publisher: rclrs::Publisher<DestinationError>,
-    _goal_subscription: rclrs::WorkerSubscription<DestinationGoal, DestinationsServer>,
+struct RobotPublishers {
+    goal: rclrs::Publisher<Destination>,
+    error: rclrs::Publisher<DestinationError>,
 }
 
 struct DestinationsServer {
-    currently_occupied: CurrentlyOccupiedDestinations,
-    config: Arc<ReservationConfig>,
+    state: ReservationState,
+    robot_publishers: HashMap<String, RobotPublishers>,
     node: Arc<rclrs::Node>,
 }
 
 impl DestinationsServer {
     fn new(node: Arc<rclrs::Node>, config: Arc<ReservationConfig>) -> Self {
         Self {
-            currently_occupied: CurrentlyOccupiedDestinations::new(config.grid_size),
-            config,
+            state: ReservationState::new(config),
+            robot_publishers: HashMap::new(),
             node,
         }
     }
 
-    fn request_destination(
+    fn register_robot(
         &mut self,
-        agent_id: &str,
-        goals: &DomainDestinationGoal,
-    ) -> Result<DomainDestination, DomainDestinationError> {
-        if !goals.cost_bias.is_empty() && goals.one_of.len() != goals.cost_bias.len() {
-            return Err(DomainDestinationError {
-                error: DomainError {
-                    code: 0, //TODO(arjoc): reserve a code,
-                    message: "Number of goals and destinations do not match".into(),
-                    parameters: "TODO".into(),
-                },
-                session: goals.session,
-            });
-        }
+        robot_id: &str,
+        goal: rclrs::Publisher<Destination>,
+        error: rclrs::Publisher<DestinationError>,
+    ) {
+        self.robot_publishers
+            .insert(robot_id.to_string(), RobotPublishers { goal, error });
+    }
 
-        let mut sorted_one_of = goals.one_of.clone();
-        sorted_one_of.sort_by_key(|c| c.regions.len());
+    fn deregister_robot(&mut self, robot_id: &str) {
+        self.robot_publishers.remove(robot_id);
+        let outcomes = self.state.remove(robot_id);
+        self.dispatch(outcomes);
+    }
 
-        if sorted_one_of.is_empty() {
-            return Err(DomainDestinationError {
-                error: DomainError {
-                    code: 0,
-                    message: "No goals provided".into(),
-                    parameters: "one_of is empty".into(),
-                },
-                session: goals.session,
-            });
-        }
+    fn handle_goal(&mut self, robot_id: &str, goal_msg: DestinationGoal) {
+        let goal = DomainDestinationGoal::from_ros(&goal_msg);
+        rclrs::log!(
+            self.node.logger(),
+            "Received goal for {} (session UUID {})",
+            robot_id,
+            goal.session
+        );
+        let outcomes = self.state.request(robot_id, goal);
+        self.dispatch(outcomes);
+    }
 
-        // Every requested region must lie within one of the predefined safe sets.
-        if self.config.enforces_safe_sets() {
-            for constraints in &sorted_one_of {
-                for target_region in &constraints.regions {
-                    let region = &target_region.region;
-                    if !self
-                        .config
-                        .is_region_within_safe_sets(region.hint, &region.points)
-                    {
-                        return Err(DomainDestinationError {
-                            error: DomainError {
-                                code: DestinationError::CODE_UNREACHABLE,
-                                message: "Requested region is outside the predefined safe sets"
-                                    .into(),
-                                parameters: format!("{{\"points\": {:?}}}", region.points),
-                            },
-                            session: goals.session,
-                        });
+    fn dispatch(&self, outcomes: Vec<Outcome>) {
+        for outcome in outcomes {
+            match outcome {
+                Outcome::Reserve { agent, destination } => {
+                    let Some(publishers) = self.robot_publishers.get(&agent) else {
+                        rclrs::log_warn!(
+                            self.node.logger(),
+                            "No publisher registered for {}; dropping destination",
+                            agent
+                        );
+                        continue;
+                    };
+                    match destination.detour_for_goal {
+                        Some(goal_session) => rclrs::log!(
+                            self.node.logger(),
+                            "Diverting {} to a parking spot (detour session {}) while it waits \
+                             for goal {}",
+                            agent,
+                            destination.session,
+                            goal_session
+                        ),
+                        None => rclrs::log!(
+                            self.node.logger(),
+                            "Reserved goal for {} (session UUID {})",
+                            agent,
+                            destination.session
+                        ),
                     }
+                    let _ = publishers.goal.publish(&destination.to_ros());
+                }
+                Outcome::Error { agent, error } => {
+                    let Some(publishers) = self.robot_publishers.get(&agent) else {
+                        continue;
+                    };
+                    rclrs::log_error!(
+                        self.node.logger(),
+                        "Failed to reserve destination for {} (session UUID {}): {}",
+                        agent,
+                        error.session,
+                        error.error.message
+                    );
+                    let _ = publishers.error.publish(&error.to_ros());
                 }
             }
-        }
-
-        match self
-            .currently_occupied
-            .reserve_one_of(agent_id, &sorted_one_of, &goals.session)
-        {
-            Ok(constraints) => Ok(DomainDestination {
-                constraints,
-                session: goals.session,
-            }),
-            Err(_) => Err(DomainDestinationError {
-                error: DomainError {
-                    code: 0,
-                    message: "No available constraints".into(),
-                    parameters: "".into(),
-                },
-                session: goals.session,
-            }),
         }
     }
 }
 
 struct DiscoveryServer {
     node: Arc<rclrs::Node>,
-    active_robots: HashMap<String, RobotConnections>,
+    active_robots: HashMap<String, rclrs::WorkerSubscription<DestinationGoal, DestinationsServer>>,
     destinations_worker: Arc<rclrs::Worker<DestinationsServer>>,
 }
 
@@ -600,43 +598,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                let goal_pub_clone = goal_publisher.clone();
-                let error_pub_clone = error_publisher.clone();
                 let robot_id_clone = robot_id.to_string();
 
+                // Queue registration first so a goal cannot arrive before its
+                // publishers are available.
+                let register_id = robot_id.to_string();
+                std::mem::drop(server.destinations_worker.run(
+                    move |dest_server: &mut DestinationsServer| {
+                        dest_server.register_robot(&register_id, goal_publisher, error_publisher);
+                    },
+                ));
+
                 // Create the goal subscription on the destinations_worker thread context!
-                let subscription = match server.destinations_worker
+                let subscription = match server
+                    .destinations_worker
                     .create_subscription::<DestinationGoal, _>(
                         &(robot_id.to_string() + "/destination/goal"),
                         move |dest_server: &mut DestinationsServer, goal_msg: DestinationGoal| {
-                            let domain_goal = DomainDestinationGoal::from_ros(&goal_msg);
-                            rclrs::log!(
-                                dest_server.node.logger(),
-                                "Received goal for {} (session UUID {})",
-                                robot_id_clone,
-                                domain_goal.session
-                            );
-                            match dest_server.request_destination(&robot_id_clone, &domain_goal) {
-                                Ok(dest) => {
-                                    rclrs::log!(
-                                        dest_server.node.logger(),
-                                        "Successfully reserved destination for {} (session UUID {})",
-                                        robot_id_clone,
-                                        dest.session
-                                    );
-                                    let _ = goal_pub_clone.publish(&dest.to_ros());
-                                }
-                                Err(err) => {
-                                    rclrs::log_error!(
-                                        dest_server.node.logger(),
-                                        "Failed to reserve destination for {} (session UUID {}): {:?}",
-                                        robot_id_clone,
-                                        err.session,
-                                        err
-                                    );
-                                    let _ = error_pub_clone.publish(&err.to_ros());
-                                }
-                            }
+                            dest_server.handle_goal(&robot_id_clone, goal_msg);
                         },
                     ) {
                     Ok(sub) => sub,
@@ -651,19 +630,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                server.active_robots.insert(
-                    robot_id.to_string(),
-                    RobotConnections {
-                        goal_publisher,
-                        error_publisher,
-                        _goal_subscription: subscription,
-                    },
-                );
+                server
+                    .active_robots
+                    .insert(robot_id.to_string(), subscription);
             }
         },
         |server: &mut DiscoveryServer, robot_id: &str| {
             if server.active_robots.remove(robot_id).is_some() {
                 rclrs::log!(server.node.logger(), "Participant left: {}", robot_id);
+                let deregister_id = robot_id.to_string();
+                std::mem::drop(server.destinations_worker.run(
+                    move |dest_server: &mut DestinationsServer| {
+                        dest_server.deregister_robot(&deregister_id);
+                    },
+                ));
             }
         },
     )?;
@@ -747,19 +727,19 @@ mod tests {
             },
         ];
 
-        // Reserve first option
-        let res = od.reserve_one_of(agent, &constraints, &session1);
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), constraints[0]);
+        let id = od.first_free_option(&constraints).unwrap();
+        assert_eq!(id, 0);
+        od.release_agent(agent);
+        od.reserve_constraints(agent, &session1, &constraints[id]);
         assert_eq!(od.agent_to_session.get(agent), Some(&session1));
         assert!(!od
             .check_if_region_free(&constraints[0].regions[0].region)
             .unwrap());
 
-        // Reserve second option (should clear first)
-        let res = od.reserve_one_of(agent, &[constraints[1].clone()], &session2);
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), constraints[1]);
+        let only_second = [constraints[1].clone()];
+        let id = od.first_free_option(&only_second).unwrap();
+        od.release_agent(agent);
+        od.reserve_constraints(agent, &session2, &only_second[id]);
         assert_eq!(od.agent_to_session.get(agent), Some(&session2));
         assert!(od
             .check_if_region_free(&constraints[0].regions[0].region)
@@ -768,9 +748,6 @@ mod tests {
             .check_if_region_free(&constraints[1].regions[0].region)
             .unwrap());
 
-        // Try to reserve an occupied region
-        let session3 = SessionUUID { uuid: [3; 16] };
-        let res = od.reserve_one_of("robot_2", &[constraints[1].clone()], &session3);
-        assert_eq!(res, Err(ReservationError::NoAvailableConstraints));
+        assert!(od.first_free_option(&only_second).is_none());
     }
 }
