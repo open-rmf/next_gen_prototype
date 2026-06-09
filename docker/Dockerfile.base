@@ -41,7 +41,7 @@ COPY . /tmp/next_gen_prototype
 RUN apt-get update && \
     rosdep init || true && \
     rosdep update && \
-    rosdep install --from-paths src /tmp/next_gen_prototype --ignore-src -y --skip-keys="rclrs" && \
+    rosdep install --from-paths src /tmp/next_gen_prototype --ignore-src -y --skip-keys="rclrs ament_cargo ament_python" && \
     rm -rf /var/lib/apt/lists/* && \
     rm -rf /tmp/next_gen_prototype
 
