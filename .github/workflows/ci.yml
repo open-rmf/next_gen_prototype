@@ -12,10 +12,6 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/arjo129/ros2_rust_base:jazzy
-      # Note: If base image is protected in private GHCR, uncomment credentials:
-      # credentials:
-      #   username: ${{ github.actor }}
-      #   password: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout Prototype Repository
@@ -23,16 +19,12 @@ jobs:
         with:
           path: next_gen_ws/src/next_gen_prototype
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "next_gen_ws/src/next_gen_prototype/path_server/rmf_path_server"
-
       - name: Build Prototype Packages (Overlay Workspace)
         working-directory: next_gen_ws
         run: |
+          source /opt/ros/jazzy/setup.bash
           source /opt/ros2_rust_ws/install/setup.bash
-          colcon build --packages-select rmf_prototype_msgs rmf_participant_discovery rmf_path_server rmf_plan_executor rmf_mock_robot_sim rmf_path_server_demo rmf_path_server_test
+          colcon build
         shell: bash
 
       - name: Run Automated Verification Tests
