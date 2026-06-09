@@ -1,7 +1,7 @@
+use mapf_post::na::Isometry2;
 use mapf_post::MapfResult;
 use mapf_post::SemanticPlan;
 use mapf_post::SemanticWaypoint;
-use mapf_post::na::Isometry2;
 use nav_msgs::msg::Odometry;
 use rclrs::{IntoPrimitiveOptions, Node};
 use rmf_prototype_msgs::msg::Destination;
@@ -159,7 +159,6 @@ impl<P: MapfPlanner> PlanServer<P> {
                             self.active_plan_ids.insert(robot_id.clone(), plan_id);
                         }
 
-
                         // Use traffic_dependencies to populate Plan message for each agent
                         let mut plans = HashMap::new();
                         for (agent_idx, robot_id) in robot_ids.iter().enumerate() {
@@ -180,10 +179,17 @@ impl<P: MapfPlanner> PlanServer<P> {
                         for (robot_id, plan) in &plans {
                             let mut wp_strs = Vec::new();
                             for (j, wp) in plan.waypoints.iter().enumerate() {
-                                let blockers: Vec<String> = wp.departure_blockers.iter().map(|b| {
-                                    format!("{} progress >= {}", b.name, b.required_progress)
-                                }).collect();
-                                wp_strs.push(format!("  wp {}: pos {:?}, progress {}, blockers: {:?}", j, wp.position, wp.progress, blockers));
+                                let blockers: Vec<String> = wp
+                                    .departure_blockers
+                                    .iter()
+                                    .map(|b| {
+                                        format!("{} progress >= {}", b.name, b.required_progress)
+                                    })
+                                    .collect();
+                                wp_strs.push(format!(
+                                    "  wp {}: pos {:?}, progress {}, blockers: {:?}",
+                                    j, wp.position, wp.progress, blockers
+                                ));
                             }
                             rclrs::log!(
                                 self.node.logger(),
@@ -197,7 +203,9 @@ impl<P: MapfPlanner> PlanServer<P> {
                             // Publish the plans
                             if !self.plan_publishers.contains_key(robot_id) {
                                 let topic = format!("{}/plan", robot_id);
-                                match self.node.create_publisher::<Plan>(topic.as_str().transient_local().reliable()) {
+                                match self.node.create_publisher::<Plan>(
+                                    topic.as_str().transient_local().reliable(),
+                                ) {
                                     Ok(pub_) => {
                                         self.plan_publishers.insert(robot_id.clone(), pub_);
                                     }
@@ -456,14 +464,14 @@ impl<P: MapfPlanner> DiscoveryServer<P> {
     }
 }
 
-
-
 pub struct PathServerRunning<P: MapfPlanner> {
     pub destinations_worker: Arc<rclrs::Worker<PlanServer<P>>>,
     pub discovery_worker: Arc<rclrs::Worker<DiscoveryServer<P>>>,
     pub replan_timer: Box<dyn std::any::Any + Send + Sync>,
-    pub list_subscription: rclrs::WorkerSubscription<rmf_prototype_msgs::msg::ParticipantList, DiscoveryServer<P>>,
-    pub discovery_subscription: rclrs::WorkerSubscription<rmf_prototype_msgs::msg::ParticipantList, DiscoveryServer<P>>,
+    pub list_subscription:
+        rclrs::WorkerSubscription<rmf_prototype_msgs::msg::ParticipantList, DiscoveryServer<P>>,
+    pub discovery_subscription:
+        rclrs::WorkerSubscription<rmf_prototype_msgs::msg::ParticipantList, DiscoveryServer<P>>,
 }
 
 pub fn start_path_server<P: MapfPlanner + 'static>(
@@ -474,11 +482,8 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
     let footprints_clone = Arc::clone(&footprints);
 
     // Create the Destinations worker (Data Plane)
-    let destinations_worker = Arc::new(node.create_worker(PlanServer::new(
-        Arc::clone(&node),
-        planner,
-        footprints,
-    )));
+    let destinations_worker =
+        Arc::new(node.create_worker(PlanServer::new(Arc::clone(&node), planner, footprints)));
 
     // Create a periodic timer on the Destinations worker to trigger replans asynchronously.
     let replan_timer = destinations_worker.create_timer_repeating(
@@ -547,11 +552,10 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
                 };
 
                 let robot_id_clone2 = robot_id.to_string();
-                // Subscribe to robot_name/odom as well.
                 let odom_sub = match server
                     .destinations_worker
                     .create_subscription::<Odometry, _>(
-                        odom_topic.as_str().transient_local().reliable(),
+                        odom_topic.as_str(),
                         move |dest_server: &mut PlanServer<P>, odom_msg: Odometry| {
                             dest_server.handle_odometry(&robot_id_clone2, odom_msg);
                         },

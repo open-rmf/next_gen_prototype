@@ -1,14 +1,19 @@
 use geometry_msgs::msg::Pose;
-use mapf_post::MapfResult;
-use mapf_post::WaypointFollower;
-use mapf_post::na::{Isometry2, Vector2};
-use mapf_post::spatial_allocation::{CurrentPosition, Grid2D};
-use nav_msgs::msg::Odometry;
+use mapf_post::{
+    na::{Isometry2, Vector2},
+    spatial_allocation::{CurrentPosition, Grid2D},
+    MapfResult, WaypointFollower,
+};
 use nav2_msgs::msg::Costmap;
+use nav_msgs::msg::Odometry;
 use rclrs::{IntoPrimitiveOptions, Node};
-use rmf_prototype_msgs::msg::{DestinationConstraints, Plan, PlanRelease, SafeZone, SafeZoneId};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use rmf_prototype_msgs::msg::{
+    DestinationConstraints, Plan, PlanRelease, SafeZone, SafeZoneId, TargetOrientation,
+};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 pub struct RobotState {
     pub radius: f32,
@@ -226,7 +231,9 @@ impl PlanExecutor {
         if released_wp_idx < plan.waypoints.len() {
             let wp_pos = &plan.waypoints[released_wp_idx].position;
             for (r_name, r_state) in &self.active_robots {
-                if r_name == robot_id { continue; }
+                if r_name == robot_id {
+                    continue;
+                }
                 if let Some(odom) = &r_state.latest_odom {
                     let dx = wp_pos[0] - odom.pose.pose.position.x as f32;
                     let dy = wp_pos[1] - odom.pose.pose.position.y as f32;
@@ -253,7 +260,12 @@ impl PlanExecutor {
         } else {
             let publisher = self
                 .node
-                .create_publisher(format!("{}/plan/release", robot_id).as_str().transient_local().reliable())
+                .create_publisher(
+                    format!("{}/plan/release", robot_id)
+                        .as_str()
+                        .transient_local()
+                        .reliable(),
+                )
                 .unwrap();
             let _ = publisher.publish(pr);
             self.plan_release_publishers
@@ -301,6 +313,20 @@ impl PlanExecutor {
             .get_alloc_for_agent(agent_idx)
             .unwrap_or_default();
 
+        let mut max_wp_idx = curr_wp_idx;
+        for &(x, y) in &positions {
+            if let Some(priority) = allocation_field.get_alloc_priority(x as isize, y as isize) {
+                if priority > max_wp_idx {
+                    max_wp_idx = priority;
+                }
+            }
+        }
+        if max_wp_idx > released_wp_idx {
+            max_wp_idx = released_wp_idx;
+        }
+
+        let target_wp = &plan.waypoints[max_wp_idx];
+
         let costmap = Self::to_costmap_msg(
             &positions,
             self.grid_width,
@@ -312,11 +338,22 @@ impl PlanExecutor {
 
         let safe_zone = SafeZone {
             incremental_target: DestinationConstraints {
-                regions: vec![],
+                regions: vec![rmf_prototype_msgs::msg::TargetRegion {
+                    tolerance: 0.2,
+                    region: rmf_prototype_msgs::msg::Region {
+                        points: vec![target_wp.position[0], target_wp.position[1]],
+                        hint: rmf_prototype_msgs::msg::Region::HINT_POINT,
+                    },
+                    orientations: vec![TargetOrientation {
+                        orientation_radians: 0.0, // TODO(@xiyuoh)
+                        spread_radians: 0.0,
+                        tolerance_radians: 0.0,
+                    }], // TODO(@xiyuoh) calculate actual orientation
+                }],
                 nodes: vec![],
             },
             costmap,
-            target_waypoint: vec![curr_wp_idx as u64].try_into().unwrap(),
+            target_waypoint: vec![max_wp_idx as u64].try_into().unwrap(),
             last_waypoint: released_wp_idx as u64,
             target_progress: 0.0,
             id: SafeZoneId {
@@ -330,7 +367,12 @@ impl PlanExecutor {
         } else {
             let publisher = self
                 .node
-                .create_publisher(format!("{}/safe_zone", robot_id).as_str().transient_local().reliable())
+                .create_publisher(
+                    format!("{}/plan/safe_zone", robot_id)
+                        .as_str()
+                        .transient_local()
+                        .reliable(),
+                )
                 .unwrap();
             let _ = publisher.publish(safe_zone);
             self.safezone_publishers
@@ -364,7 +406,10 @@ impl PlanExecutor {
         let mut data = vec![254u8; (width * height) as usize];
         for &(x, y) in positions {
             if x < width as usize && y < height as usize {
-                let index = y * (width as usize) + x;
+                // Grid2D from mapf_post returns y with top-left origin (i.e. flipped)
+                // We need to invert y back for ROS Costmap which expects bottom-left origin
+                let inverted_y = (height - 1) as usize - y;
+                let index = inverted_y * (width as usize) + x;
                 data[index] = 0;
             }
         }
@@ -391,8 +436,8 @@ impl PlanExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mapf_post::{Trajectory, WaypointFollower};
     use mapf_post::na::{Isometry2, Vector2};
+    use mapf_post::{Trajectory, WaypointFollower};
 
     #[test]
     fn test_robot_2_follower() {
@@ -409,7 +454,7 @@ mod tests {
             Isometry2::new(Vector2::new(10.0, 0.0), 0.0),
         ];
         let mut follower = WaypointFollower::from_trajectory(0, Trajectory { poses });
-        
+
         // Simulating the robot moving through the path:
         follower.update_position_estimate(&Isometry2::new(Vector2::new(3.0, 0.0), 0.0), 0.5);
         assert_eq!(follower.get_semantic_waypoint().trajectory_index, 0);
@@ -433,13 +478,21 @@ mod tests {
         assert_eq!(follower.get_semantic_waypoint().trajectory_index, 6);
 
         follower.update_position_estimate(&Isometry2::new(Vector2::new(10.0, 0.0), 0.0), 0.5);
-        println!("After reaching 10.0: index is {}", follower.get_semantic_waypoint().trajectory_index);
-        
+        println!(
+            "After reaching 10.0: index is {}",
+            follower.get_semantic_waypoint().trajectory_index
+        );
+
         follower.update_position_estimate(&Isometry2::new(Vector2::new(10.0, 0.0), 0.0), 0.5);
-        println!("After waiting at 10.0 (1st time): index is {}", follower.get_semantic_waypoint().trajectory_index);
-        
+        println!(
+            "After waiting at 10.0 (1st time): index is {}",
+            follower.get_semantic_waypoint().trajectory_index
+        );
+
         follower.update_position_estimate(&Isometry2::new(Vector2::new(10.0, 0.0), 0.0), 0.5);
-        println!("After waiting at 10.0 (2nd time): index is {}", follower.get_semantic_waypoint().trajectory_index);
+        println!(
+            "After waiting at 10.0 (2nd time): index is {}",
+            follower.get_semantic_waypoint().trajectory_index
+        );
     }
 }
-
