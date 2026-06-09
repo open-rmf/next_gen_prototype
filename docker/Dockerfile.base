@@ -17,10 +17,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust toolchain (Stable)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-RUN cargo install cargo-ament-build
+# Install Rust toolchain (Stable) and global Cargo tools accessible to all users
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path && \
+    cargo install cargo-ament-build && \
+    chmod -R a+rwX /usr/local/cargo /usr/local/rustup
 
 # Install Cargo / Colcon ROS 2 Rust integration tools via pip
 RUN pip3 install -U --break-system-packages colcon-cargo colcon-ros-cargo
