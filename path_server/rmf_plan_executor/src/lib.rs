@@ -36,6 +36,8 @@ pub struct PlanExecutor {
 
 impl PlanExecutor {
     pub fn new(node: Arc<Node>) -> Self {
+        let mut origin = Pose::default();
+        origin.orientation.w = 1.0;
         Self {
             node,
             active_robots: BTreeMap::new(),
@@ -45,7 +47,7 @@ impl PlanExecutor {
             grid_width: 20,
             grid_height: 20,
             grid_resolution: 1.0,
-            grid_origin: Pose::default(),
+            grid_origin: origin,
         }
     }
 
@@ -272,6 +274,54 @@ impl PlanExecutor {
                 .insert(robot_id.to_string(), publisher);
         }
 
+        // --- Dynamic grid resizing ---
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+
+        for r_state in self.active_robots.values() {
+            let r_plan = r_state.plan.as_ref().unwrap();
+            let r_odom = r_state.latest_odom.as_ref().unwrap();
+
+            min_x = min_x.min(r_odom.pose.pose.position.x as f32);
+            min_y = min_y.min(r_odom.pose.pose.position.y as f32);
+            max_x = max_x.max(r_odom.pose.pose.position.x as f32);
+            max_y = max_y.max(r_odom.pose.pose.position.y as f32);
+
+            for wp in &r_plan.waypoints {
+                min_x = min_x.min(wp.position[0]);
+                min_y = min_y.min(wp.position[1]);
+                max_x = max_x.max(wp.position[0]);
+                max_y = max_y.max(wp.position[1]);
+            }
+        }
+
+        let current_min_x = self.grid_origin.position.x as f32;
+        let current_min_y = self.grid_origin.position.y as f32;
+        let current_max_x = current_min_x + (self.grid_width as f32 * self.grid_resolution);
+        let current_max_y = current_min_y + (self.grid_height as f32 * self.grid_resolution);
+
+        if min_x < current_min_x || min_y < current_min_y || max_x > current_max_x || max_y > current_max_y {
+            let new_min_x = min_x - 20.0;
+            let new_min_y = min_y - 20.0;
+            let new_max_x = max_x + 20.0;
+            let new_max_y = max_y + 20.0;
+
+            self.grid_origin.position.x = new_min_x as f64;
+            self.grid_origin.position.y = new_min_y as f64;
+            self.grid_origin.orientation.w = 1.0;
+
+            self.grid_width = ((new_max_x - new_min_x) / self.grid_resolution).ceil() as u32;
+            self.grid_height = ((new_max_y - new_min_y) / self.grid_resolution).ceil() as u32;
+
+            self.grid = Arc::new(Grid2D::new(
+                vec![vec![0; self.grid_height as usize]; self.grid_width as usize],
+                self.grid_resolution,
+            ));
+        }
+        // --- End dynamic grid resizing ---
+
         // 2. Generate and publish SafeZone
         let mut trajectories = Vec::new();
         let mut footprints = Vec::new();
@@ -284,7 +334,15 @@ impl PlanExecutor {
             let traj_poses: Vec<Isometry2<f32>> = r_plan
                 .waypoints
                 .iter()
-                .map(|wp| Isometry2::new(Vector2::new(wp.position[0], wp.position[1]), 0.0))
+                .map(|wp| {
+                    Isometry2::new(
+                        Vector2::new(
+                            wp.position[0] - self.grid_origin.position.x as f32,
+                            wp.position[1] - self.grid_origin.position.y as f32,
+                        ),
+                        0.0,
+                    )
+                })
                 .collect();
             trajectories.push(mapf_post::Trajectory { poses: traj_poses });
             footprints.push(Arc::new(mapf_post::shape::Ball::new(r_state.radius))
@@ -294,8 +352,8 @@ impl PlanExecutor {
             current_positions.push(CurrentPosition {
                 semantic_position,
                 real_position: (
-                    r_odom.pose.pose.position.x as f32,
-                    r_odom.pose.pose.position.y as f32,
+                    r_odom.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
+                    r_odom.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
                 ),
             });
         }
