@@ -20,6 +20,8 @@ pub struct RobotState {
     pub latest_odom: Option<Odometry>,
     pub plan: Option<Plan>,
     pub waypoint_follower: Option<WaypointFollower>,
+    pub safe_zone_version: u64,
+    pub last_incremental_target_wp: Option<usize>,
 }
 
 pub struct PlanExecutor {
@@ -66,6 +68,8 @@ impl PlanExecutor {
                     latest_odom: None,
                     plan: None,
                     waypoint_follower: None,
+                    safe_zone_version: 0,
+                    last_incremental_target_wp: None,
                 },
             );
             self.reindex_followers();
@@ -131,6 +135,8 @@ impl PlanExecutor {
         };
 
         state.plan = Some(msg);
+        state.safe_zone_version = 0;
+        state.last_incremental_target_wp = None;
 
         // Reindex because we updated the plan
         self.reindex_followers();
@@ -383,7 +389,8 @@ impl PlanExecutor {
             max_wp_idx = released_wp_idx;
         }
 
-        let target_wp = &plan.waypoints[max_wp_idx];
+        let target_x = plan.waypoints[max_wp_idx].position[0];
+        let target_y = plan.waypoints[max_wp_idx].position[1];
 
         let costmap = Self::to_costmap_msg(
             &positions,
@@ -394,12 +401,26 @@ impl PlanExecutor {
             msg.header.stamp.clone(),
         );
 
+        let plan_id = plan.plan_id.clone();
+        
+        // Update SafeZone version if the target waypoint changed
+        let (safe_zone_version, _is_new_target) = {
+            let state = self.active_robots.get_mut(robot_id).unwrap();
+            if state.last_incremental_target_wp != Some(max_wp_idx) {
+                if state.last_incremental_target_wp.is_some() {
+                    state.safe_zone_version += 1;
+                }
+                state.last_incremental_target_wp = Some(max_wp_idx);
+            }
+            (state.safe_zone_version, state.last_incremental_target_wp == Some(max_wp_idx))
+        };
+
         let safe_zone = SafeZone {
             incremental_target: DestinationConstraints {
                 regions: vec![rmf_prototype_msgs::msg::TargetRegion {
                     tolerance: 0.2,
                     region: rmf_prototype_msgs::msg::Region {
-                        points: vec![target_wp.position[0], target_wp.position[1]],
+                        points: vec![target_x, target_y],
                         hint: rmf_prototype_msgs::msg::Region::HINT_POINT,
                     },
                     orientations: vec![TargetOrientation {
@@ -415,8 +436,8 @@ impl PlanExecutor {
             last_waypoint: released_wp_idx as u64,
             target_progress: 0.0,
             id: SafeZoneId {
-                plan_id: plan.plan_id.clone(),
-                safe_zone_version: 0,
+                plan_id,
+                safe_zone_version,
             },
         };
 
