@@ -317,14 +317,14 @@ mod tests {
         })
     }
 
-    fn make_goal(session_byte: u8, x: f32, y: f32, size: f32) -> DomainDestinationGoal {
+    fn goal_for_region(session_byte: u8, points: Vec<f32>) -> DomainDestinationGoal {
         DomainDestinationGoal {
             one_of: vec![DomainDestinationConstraints {
                 regions: vec![DomainTargetRegion {
                     tolerance: 0.0,
                     region: DomainRegion {
                         hint: DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE,
-                        points: vec![x, y, x + size, y + size],
+                        points,
                     },
                 }],
             }],
@@ -333,6 +333,10 @@ mod tests {
                 uuid: [session_byte; 16],
             },
         }
+    }
+
+    fn make_goal(session_byte: u8, x: f32, y: f32, size: f32) -> DomainDestinationGoal {
+        goal_for_region(session_byte, vec![x, y, x + size, y + size])
     }
 
     fn reserved_for<'a>(outcomes: &'a [Outcome], agent: &str) -> Option<&'a DomainDestination> {
@@ -460,6 +464,107 @@ mod tests {
         let outcomes = state.remove("robot_1");
         let r2 = reserved_for(&outcomes, "robot_2").expect("robot_2 should advance");
         assert_eq!(r2.detour_for_goal, None);
+        assert!(state.queue.is_empty());
+    }
+
+    #[test]
+    fn transitivity_preserved_when_occupied_spot_is_a_diversion() {
+        let mut state = ReservationState::new(queueing_config());
+
+        // Robot 1 requests A
+        let a = state.request("robot_1", make_goal(1, 10.0, 10.0, 1.0));
+        let r1 = reserved_for(&a, "robot_1").expect("robot_1 takes A");
+        assert_eq!(r1.detour_for_goal, None);
+        let spot_a = r1.constraints.regions[0].region.points.clone();
+
+        // Robot 2 requests A => Robot 2 is diverted to B
+        let outcomes = state.request("robot_2", make_goal(2, 10.0, 10.0, 1.0));
+        let r2_diversion = reserved_for(&outcomes, "robot_2").expect("robot_2 diverted");
+        assert_eq!(
+            r2_diversion.detour_for_goal,
+            Some(SessionUUID { uuid: [2; 16] })
+        );
+        let spot_b = r2_diversion.constraints.regions[0].region.points.clone();
+        assert!(state.queue.contains(&"robot_2".to_string()));
+
+        // Robot 3 requests B => Robot 3 is diverted elsewhere
+        let outcomes = state.request("robot_3", goal_for_region(3, spot_b.clone()));
+        let r3_diversion = reserved_for(&outcomes, "robot_3").expect("robot_3 diverted");
+        assert_eq!(
+            r3_diversion.detour_for_goal,
+            Some(SessionUUID { uuid: [3; 16] })
+        );
+        assert_ne!(r3_diversion.constraints.regions[0].region.points, spot_b);
+        assert!(state.queue.contains(&"robot_3".to_string()));
+
+        // Robot 1 moves out of A
+        let outcomes = state.request("robot_1", make_goal(4, 8.0, 8.0, 1.0));
+
+        // Robot 2 and Robot 3 move into A and B respectively.
+        let r2 = reserved_for(&outcomes, "robot_2").expect("robot_2 advances to A");
+        assert_eq!(r2.detour_for_goal, None);
+        assert_eq!(r2.session, SessionUUID { uuid: [2; 16] });
+        assert_eq!(r2.constraints.regions[0].region.points, spot_a);
+        let r3 = reserved_for(&outcomes, "robot_3").expect("robot_3 advances to B");
+        assert_eq!(r3.detour_for_goal, None);
+        assert_eq!(r3.session, SessionUUID { uuid: [3; 16] });
+        assert_eq!(r3.constraints.regions[0].region.points, spot_b);
+
+        assert!(state.queue.is_empty());
+    }
+
+    #[test]
+    fn three_robots_same_goal_get_unique_parking_and_complete_in_turn() {
+        // Three robots request the same goal A. Only the first is awarded it.
+        // The remaining two are diverted to distinct parking spots. As each holder
+        // of A leaves, the next queued robot advances into A, so every robot
+        // eventually completes its original request.
+        let mut state = ReservationState::new(queueing_config());
+
+        // Robot 1 requests A and is awarded it
+        let r1 = state.request("robot_1", make_goal(1, 10.0, 10.0, 1.0));
+        let r1_dest = reserved_for(&r1, "robot_1").expect("robot_1 takes A");
+        assert_eq!(r1_dest.detour_for_goal, None);
+        let spot_a = r1_dest.constraints.regions[0].region.points.clone();
+
+        // Robot 2 requests A => Robot 2 is diverted to a parking spot
+        let r2 = state.request("robot_2", make_goal(2, 10.0, 10.0, 1.0));
+        let r2_diversion = reserved_for(&r2, "robot_2").expect("robot_2 diverted");
+        assert_eq!(
+            r2_diversion.detour_for_goal,
+            Some(SessionUUID { uuid: [2; 16] })
+        );
+        let r2_spot = r2_diversion.constraints.regions[0].region.points.clone();
+
+        // Robot 3 requests A => Robot 3 is diverted to a different parking spot
+        let r3 = state.request("robot_3", make_goal(3, 10.0, 10.0, 1.0));
+        let r3_diversion = reserved_for(&r3, "robot_3").expect("robot_3 diverted");
+        assert_eq!(
+            r3_diversion.detour_for_goal,
+            Some(SessionUUID { uuid: [3; 16] })
+        );
+        let r3_spot = r3_diversion.constraints.regions[0].region.points.clone();
+
+        // The two diverted robots rest away from A and in distinct spots.
+        assert_ne!(r2_spot, spot_a);
+        assert_ne!(r3_spot, spot_a);
+        assert_ne!(r2_spot, r3_spot);
+        assert!(state.queue.contains(&"robot_2".to_string()));
+        assert!(state.queue.contains(&"robot_3".to_string()));
+
+        // Robot 1 leaves A, robot 2 advances into it, robot 3 keeps waiting.
+        let outcomes = state.remove("robot_1");
+        let r2 = reserved_for(&outcomes, "robot_2").expect("robot_2 advances to A");
+        assert_eq!(r2.detour_for_goal, None);
+        assert_eq!(r2.session, SessionUUID { uuid: [2; 16] });
+        assert!(reserved_for(&outcomes, "robot_3").is_none());
+        assert!(state.queue.contains(&"robot_3".to_string()));
+
+        // Robot 2 leaves A, robot 3 completes its request.
+        let outcomes = state.remove("robot_2");
+        let r3 = reserved_for(&outcomes, "robot_3").expect("robot_3 advances to A");
+        assert_eq!(r3.detour_for_goal, None);
+        assert_eq!(r3.session, SessionUUID { uuid: [3; 16] });
         assert!(state.queue.is_empty());
     }
 }
