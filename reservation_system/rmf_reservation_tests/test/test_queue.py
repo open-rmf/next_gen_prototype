@@ -1,4 +1,4 @@
-"""Test that a robot waits in parking while another robot occupies its goal."""
+"""Tests for diversion, queue advancement and cancellation."""
 
 import os
 import time
@@ -70,28 +70,29 @@ class TestQueue(unittest.TestCase):
             ParticipantList, "/destination/discovery", 10
         )
 
-        # Discovery messages may arrive before the server is ready, so keep
-        # publishing until every robot has matched topics.
-        parts = ParticipantList()
-        for name in ROBOT_NAMES:
-            p = Participant()
-            p.name = name
-            parts.participants.append(p)
-
-        deadline = time.time() + 30.0
-        while time.time() < deadline:
-            cls.discovery_pub.publish(parts)
-            rclpy.spin_once(cls.node, timeout_sec=0.1)
-            if all(cls._robot_matched(name) for name in ROBOT_NAMES):
-                break
-            time.sleep(0.1)
-        else:
-            raise AssertionError("Server never matched all per-robot topics")
-
     @classmethod
     def tearDownClass(cls):
         cls.node.destroy_node()
         rclpy.shutdown()
+
+    def setUp(self):
+        # Reset the shared server so tests are order-independent: deregister
+        # every robot, re-register them, and drop any leftover messages.
+
+        self.assertTrue(
+            self._drive_discovery_until(
+                [], lambda: all(not self._robot_matched(n) for n in ROBOT_NAMES)
+            ),
+            "robots never deregistered between tests",
+        )
+        self.assertTrue(
+            self._drive_discovery_until(
+                ROBOT_NAMES, lambda: all(self._robot_matched(n) for n in ROBOT_NAMES)
+            ),
+            "server never matched all per-robot topics",
+        )
+        for buffer in self.destinations.values():
+            buffer.clear()
 
     @classmethod
     def _robot_matched(cls, name):
@@ -99,6 +100,23 @@ class TestQueue(unittest.TestCase):
             cls.node.count_subscribers(f"{name}/destination/goal") >= 1
             and cls.node.count_publishers(f"{name}/destination") >= 1
         )
+
+    def _drive_discovery_until(self, names, predicate, timeout=30.0):
+        """Publish a discovery list of `names` until `predicate()` holds."""
+        parts = ParticipantList()
+        for name in names:
+            participant = Participant()
+            participant.name = name
+            parts.participants.append(participant)
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.discovery_pub.publish(parts)
+            rclpy.spin_once(self.node, timeout_sec=0.1)
+            if predicate():
+                return True
+            time.sleep(0.1)
+        return False
 
     def create_goal(self, session_id, x, y, size):
         msg = DestinationGoal()
@@ -131,12 +149,14 @@ class TestQueue(unittest.TestCase):
         r1 = self.destinations["robot_1"]
         r2 = self.destinations["robot_2"]
 
+        # robot_1 claims goal A directly.
         self._publish_until(
             "robot_1", self.create_goal(10, 10.0, 10.0, 1.0), lambda: len(r1) > 0
         )
         self.assertTrue(r1, "robot_1 did not receive its goal destination")
         self.assertEqual(list(r1[-1].detour_for_goal.uuid), ZERO_UUID)
 
+        # robot_2 wants the same goal and is diverted to a parking spot.
         self._publish_until(
             "robot_2", self.create_goal(11, 10.0, 10.0, 1.0), lambda: len(r2) > 0
         )
@@ -145,6 +165,7 @@ class TestQueue(unittest.TestCase):
         self.assertEqual(list(divert.detour_for_goal.uuid), [11] * 16)
         self.assertNotEqual(list(divert.session.uuid), [11] * 16)
 
+        # robot_1 leaves A, robot_2 advances into it.
         r2.clear()
         self._publish_until(
             "robot_1",
@@ -156,3 +177,36 @@ class TestQueue(unittest.TestCase):
             advanced, "robot_2 did not advance to its goal after it freed up"
         )
         self.assertEqual(list(advanced[-1].session.uuid), [11] * 16)
+
+    def test_cancellation_frees_goal_for_queued_robot(self):
+        r1 = self.destinations["robot_1"]
+        r2 = self.destinations["robot_2"]
+
+        # robot_1 claims goal A directly.
+        self._publish_until(
+            "robot_1", self.create_goal(20, 10.0, 10.0, 1.0), lambda: len(r1) > 0
+        )
+        self.assertTrue(r1, "robot_1 did not receive its goal destination")
+        self.assertEqual(list(r1[-1].detour_for_goal.uuid), ZERO_UUID)
+
+        # robot_2 wants the same goal and is diverted to a parking spot.
+        self._publish_until(
+            "robot_2", self.create_goal(21, 10.0, 10.0, 1.0), lambda: len(r2) > 0
+        )
+        self.assertTrue(r2, "robot_2 was not diverted to a parking spot")
+        divert = r2[-1]
+        self.assertEqual(list(divert.detour_for_goal.uuid), [21] * 16)
+        self.assertNotEqual(list(divert.session.uuid), [21] * 16)
+
+        # Cancel robot_1 by dropping it from discovery.
+        # robot_2 should advance from parking into goal A.
+        r2.clear()
+        advanced = self._drive_discovery_until(
+            ["robot_2"],
+            lambda: any(list(m.detour_for_goal.uuid) == ZERO_UUID for m in r2),
+        )
+        self.assertTrue(
+            advanced, "robot_2 did not advance after robot_1 was cancelled"
+        )
+        arrived = [m for m in r2 if list(m.detour_for_goal.uuid) == ZERO_UUID]
+        self.assertEqual(list(arrived[-1].session.uuid), [21] * 16)
