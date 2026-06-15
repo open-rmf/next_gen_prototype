@@ -102,6 +102,19 @@ function initSSE() {
           r.active_goal_y = msg.y;
           r.goal_x = msg.x;
           r.goal_y = msg.y;
+          // A destination was granted; clear any prior rejection.
+          if (r.status === 'Unreachable') r.status = 'Planning';
+          r.errorMessage = null;
+          updateRobotListUI();
+        }
+      } else if (msg.type === 'destination_error') {
+        const r = robots.find(robot => robot.name === msg.name);
+        if (r) {
+          // The destination server rejected this robot's goal (e.g. outside the
+          // safe sets), so it would otherwise sit in "Planning" forever.
+          r.status = 'Unreachable';
+          r.errorMessage = msg.message;
+          console.warn(`Destination rejected for ${msg.name}: ${msg.message}`);
           updateRobotListUI();
         }
       }
@@ -204,6 +217,11 @@ function updateRobotListUI() {
     let statusClass = '';
     if (r.status === 'Moving') statusClass = 'moving';
     else if (r.status === 'Reached') statusClass = 'reached';
+    else if (r.status === 'Unreachable') statusClass = 'unreachable';
+
+    const errorRow = r.errorMessage
+      ? `<div class="robot-item-error"><i class="fa-solid fa-triangle-exclamation"></i> ${r.errorMessage}</div>`
+      : '';
 
     html += `
       <div class="robot-item ${isSelected}" data-robot-name="${r.name}">
@@ -218,6 +236,7 @@ function updateRobotListUI() {
           <span><span class="coord-label">Pos:</span> (${r.current_x.toFixed(1)}, ${r.current_y.toFixed(1)})</span>
           <span><span class="coord-label">Goal:</span> ${goalStr}</span>
         </div>
+        ${errorRow}
       </div>
     `;
   });

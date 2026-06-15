@@ -386,6 +386,24 @@ body {
   color: var(--success-neon);
 }
 
+.robot-item-status.unreachable {
+  color: var(--danger-neon);
+}
+
+.robot-item-error {
+  margin-top: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.72rem;
+  color: var(--danger-neon);
+  background-color: rgba(255, 0, 91, 0.08);
+  border: 1px solid rgba(255, 0, 91, 0.25);
+  border-radius: 8px;
+  padding: 0.4rem 0.6rem;
+  line-height: 1.3;
+}
+
 .robot-item-coords {
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.75rem;

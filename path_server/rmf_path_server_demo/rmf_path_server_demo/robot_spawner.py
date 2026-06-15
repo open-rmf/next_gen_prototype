@@ -17,6 +17,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
+    DestinationError,
     DestinationGoal,
     Participant,
     ParticipantList,
@@ -172,6 +173,7 @@ class RobotSpawnerNode(Node):
         self.plan_subs = {}
         self.progress_subs = {}
         self.destination_subs = {}
+        self.destination_error_subs = {}
         self.discovery_timer = None
         self.initial_goal_timer = None
         self.discovery_qos = QoSProfile(
@@ -326,6 +328,7 @@ class RobotSpawnerNode(Node):
             self.subscribe_to_plan(name)
             self.subscribe_to_progress(name)
             self.subscribe_to_destination(name)
+            self.subscribe_to_destination_error(name)
 
         except Exception as e:
             self.get_logger().error(f"Failed to spawn robot process: {e}")
@@ -438,6 +441,30 @@ class RobotSpawnerNode(Node):
             Destination,
             f'{name}/destination',
             destination_callback,
+            qos_profile=self.reliable_transient_qos
+        )
+
+    def subscribe_to_destination_error(self, name):
+        if name in self.destination_error_subs:
+            return
+
+        self.get_logger().info(f"Subscribing to destination error topic for '{name}'")
+
+        def error_callback(msg, r_name=name):
+            data = json.dumps({
+                "type": "destination_error",
+                "name": r_name,
+                "code": int(msg.error.code),
+                "message": msg.error.message,
+            })
+            self.get_logger().warn(
+                f"Destination rejected for '{r_name}': {msg.error.message}")
+            self.broadcast(data)
+
+        self.destination_error_subs[name] = self.create_subscription(
+            DestinationError,
+            f'{name}/destination/error',
+            error_callback,
             qos_profile=self.reliable_transient_qos
         )
 
@@ -621,6 +648,10 @@ class RobotSpawnerNode(Node):
         for sub in self.destination_subs.values():
             self.destroy_subscription(sub)
         self.destination_subs.clear()
+
+        for sub in self.destination_error_subs.values():
+            self.destroy_subscription(sub)
+        self.destination_error_subs.clear()
 
         for pub in self.dest_publishers.values():
             self.destroy_publisher(pub)
