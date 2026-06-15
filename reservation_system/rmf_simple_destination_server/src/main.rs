@@ -2,11 +2,11 @@ mod config;
 mod reservation;
 
 use config::ReservationConfig;
-use rclrs::{Context, CreateBasicExecutor, SpinOptions};
+use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use reservation::{Outcome, ReservationState};
 use rmf_prototype_msgs::msg::{
-    Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, Region,
-    TargetRegion,
+    Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, NamedRegion,
+    Region, ReservationConfig as ReservationConfigMsg, TargetRegion,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -530,6 +530,34 @@ fn load_config(
     Ok(Arc::new(config))
 }
 
+/// Convert the loaded reservation config to its ROS message.
+fn config_to_ros(config: &ReservationConfig) -> ReservationConfigMsg {
+    let region_to_ros = |region: &config::ConfigRegion| Region {
+        points: region.points.clone(),
+        hint: region.hint,
+    };
+
+    ReservationConfigMsg {
+        grid_size: config.grid_size,
+        safe_sets: config
+            .safe_sets
+            .iter()
+            .map(|set| NamedRegion {
+                name: set.name.clone(),
+                region: region_to_ros(&set.region),
+            })
+            .collect(),
+        parking_spots: config
+            .parking_spots
+            .iter()
+            .map(|spot| NamedRegion {
+                name: spot.name.clone(),
+                region: region_to_ros(&spot.region),
+            })
+            .collect(),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = Context::default_from_env().unwrap();
     let mut executor = context.create_basic_executor();
@@ -542,6 +570,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .mandatory()?;
 
     let config = load_config(&node, &config_file.get())?;
+
+    // Transient local durability makes the config available to late subscribers.
+    let config_publisher = node.create_publisher::<ReservationConfigMsg>(
+        "/destination/reservation_config"
+            .transient_local()
+            .reliable(),
+    )?;
+    config_publisher.publish(config_to_ros(&config))?;
+    rclrs::log!(
+        node.logger(),
+        "Published reservation config on /destination/reservation_config"
+    );
 
     // 1. Create the Destinations worker (Data Plane)
     let destinations_worker = Arc::new(node.create_worker(DestinationsServer::new(

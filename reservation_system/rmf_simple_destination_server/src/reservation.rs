@@ -297,8 +297,6 @@ mod tests {
             parking_spots: vec![
                 ParkingSpot {
                     name: "parking_a".to_string(),
-                    x: 1.0,
-                    y: 1.0,
                     region: ConfigRegion {
                         hint: Region::HINT_AXIS_ALIGNED_RECTANGLE,
                         points: vec![0.5, 0.5, 1.5, 1.5],
@@ -306,8 +304,6 @@ mod tests {
                 },
                 ParkingSpot {
                     name: "parking_b".to_string(),
-                    x: 18.0,
-                    y: 18.0,
                     region: ConfigRegion {
                         hint: Region::HINT_AXIS_ALIGNED_RECTANGLE,
                         points: vec![17.5, 17.5, 18.5, 18.5],

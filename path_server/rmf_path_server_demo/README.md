@@ -31,3 +31,7 @@ ros2 launch rmf_path_server_demo demo_destination_server.launch.py
 - **Finish Goal Setup**: Click the robot's name in the sidebar list again to finish setting goals for it.
 - **Send**: Click "Send Scenario" to submit goals for resolution and start planning.
 - The canvas will highlight the chosen goals in solid colors and fade out the unused alternatives.
+
+## Reservation Config Visualization
+
+When the destination server loads a reservation configuration, it republishes the parsed config on the transient-local topic `/destination/reservation_config`. The dashboard subscribes to this topic and draws the config as a background layer on the canvas.

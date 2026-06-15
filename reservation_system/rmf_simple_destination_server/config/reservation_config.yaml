@@ -22,14 +22,10 @@ safe_sets:
 # Each parking spot must lie within one of the safe sets above.
 parking_spots:
   - name: parking_a
-    x: 1.0
-    y: 1.0
     region:
       hint: axis_aligned_rectangle
       points: [0.5, 0.5, 1.5, 1.5]
   - name: parking_b
-    x: 18.0
-    y: 18.0
     region:
       hint: axis_aligned_rectangle
       points: [17.5, 17.5, 18.5, 18.5]

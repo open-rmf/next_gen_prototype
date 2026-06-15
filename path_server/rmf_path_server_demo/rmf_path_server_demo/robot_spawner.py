@@ -21,6 +21,7 @@ from rmf_prototype_msgs.msg import (
     Participant,
     ParticipantList,
     Region,
+    ReservationConfig,
     TargetRegion,
     Plan,
     Progress,
@@ -90,6 +91,11 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_ok_response({"status": "spawned", "name": name, "radius": 0.49})
             else:
                 self.send_error_response("Missing name or spawner node inactive")
+            return
+
+        elif self.path.startswith('/reservation_config'):
+            config = spawner_node.reservation_config if spawner_node else None
+            self.send_ok_response(config or {})
             return
 
         elif self.path.startswith('/config'):
@@ -188,6 +194,15 @@ class RobotSpawnerNode(Node):
         self.dest_publishers = {}
         self.dest_goal_publishers = {}
 
+        # Forward the destination server's active reservation config.
+        self.reservation_config = None
+        self.reservation_config_sub = self.create_subscription(
+            ReservationConfig,
+            '/destination/reservation_config',
+            self.reservation_config_callback,
+            qos_profile=self.reliable_transient_qos
+        )
+
         # Get the package share directory and resolve static files path
         try:
             share_dir = get_package_share_directory('rmf_path_server_demo')
@@ -232,6 +247,38 @@ class RobotSpawnerNode(Node):
         with self.sse_clients_lock:
             for q in self.sse_clients:
                 q.put(data)
+
+    def reservation_config_callback(self, msg):
+        def region_to_dict(region):
+            return {
+                "hint": int(region.hint),
+                "points": [float(point) for point in region.points],
+            }
+
+        config = {
+            "type": "reservation_config",
+            "grid_size": float(msg.grid_size),
+            "safe_sets": [
+                {
+                    "name": safe_set.name,
+                    "region": region_to_dict(safe_set.region),
+                }
+                for safe_set in msg.safe_sets
+            ],
+            "parking_spots": [
+                {
+                    "name": spot.name,
+                    "region": region_to_dict(spot.region),
+                }
+                for spot in msg.parking_spots
+            ],
+        }
+        self.reservation_config = config
+        self.get_logger().info(
+            f"Received reservation config: {len(config['safe_sets'])} safe set(s), "
+            f"{len(config['parking_spots'])} parking spot(s)"
+        )
+        self.broadcast(json.dumps(config))
 
     # Spawns a mock simulator node
     def spawn_robot(self, name, x, y):

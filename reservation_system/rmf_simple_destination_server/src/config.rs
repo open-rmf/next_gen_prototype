@@ -57,8 +57,6 @@ struct RawSafeSet {
 #[derive(Debug, Clone, Deserialize)]
 struct RawParkingSpot {
     name: String,
-    x: f32,
-    y: f32,
     region: RawRegion,
 }
 
@@ -167,8 +165,6 @@ pub struct SafeSet {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParkingSpot {
     pub name: String,
-    pub x: f32,
-    pub y: f32,
     pub region: ConfigRegion,
 }
 
@@ -285,8 +281,6 @@ fn parse_parking_spots(raw: &RawConfig) -> Result<Vec<ParkingSpot>, ConfigError>
         }
         spots.push(ParkingSpot {
             name: raw_spot.name.clone(),
-            x: raw_spot.x,
-            y: raw_spot.y,
             region: ConfigRegion::from_raw(&raw_spot.region)?,
         });
     }
@@ -306,14 +300,10 @@ safe_sets:
       points: [0.0, 0.0, 20.0, 20.0]
 parking_spots:
   - name: parking_a
-    x: 1.0
-    y: 1.0
     region:
       hint: axis_aligned_rectangle
       points: [0.5, 0.5, 1.5, 1.5]
   - name: parking_b
-    x: 18.0
-    y: 18.0
     region:
       hint: axis_aligned_rectangle
       points: [17.5, 17.5, 18.5, 18.5]
@@ -411,8 +401,6 @@ safe_sets:
       points: [0.0, 0.0, 10.0, 10.0]
 parking_spots:
   - name: bad_spot
-    x: 50.0
-    y: 50.0
     region:
       points: [49.0, 49.0, 51.0, 51.0]
 "#;

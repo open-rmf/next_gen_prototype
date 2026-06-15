@@ -7,6 +7,7 @@ let config = {
   use_destination_server: false
 };
 let robots = [];
+let reservationConfig = null;
 let selectedRobotName = null;
 let interactionMode = 'normal'; // 'normal', 'add-robot', 'set-goal'
 let systemMode = 'setup'; // 'setup', 'live'
@@ -20,6 +21,8 @@ const ctx = canvas.getContext('2d');
 const scale = 25; // pixels per meter
 const centerX = canvas.width / 2;
 const centerY = canvas.height / 2;
+const REGION_HINT_POINT = 1;
+const REGION_HINT_AXIS_ALIGNED_RECTANGLE = 2;
 
 // Color palette for robots
 const robotColors = [
@@ -60,7 +63,10 @@ function initSSE() {
   eventSource.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
-      if (msg.type === 'odom') {
+      if (msg.type === 'reservation_config') {
+        reservationConfig = msg;
+        console.log(`Received reservation config: ${msg.safe_sets.length} safe set(s), ${msg.parking_spots.length} parking spot(s).`);
+      } else if (msg.type === 'odom') {
         const r = robots.find(robot => robot.name === msg.name);
         if (r) {
           r.current_x = msg.x;
@@ -410,6 +416,7 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   // Re-init SSE stream connection
   initSSE();
   fetchConfig();
+  fetchReservationConfig();
 });
 
 // Helper to draw dependency arrow with optional dash animation
@@ -449,6 +456,123 @@ function drawDependencyArrow(ctx, fromX, fromY, toX, toY, isBlocking) {
   ctx.fill();
   
   ctx.restore();
+}
+
+function regionBounds(region) {
+  const points = region.points || [];
+  if (points.length < 2) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i + 1 < points.length; i += 2) {
+    minX = Math.min(minX, points[i]);
+    maxX = Math.max(maxX, points[i]);
+    minY = Math.min(minY, points[i + 1]);
+    maxY = Math.max(maxY, points[i + 1]);
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function addRegionPath(region) {
+  const points = region.points || [];
+  if (points.length < 2) return false;
+
+  if (region.hint === REGION_HINT_POINT) {
+    const position = toPixel(points[0], points[1]);
+    ctx.arc(position.x, position.y, 3, 0, 2 * Math.PI);
+    return true;
+  }
+
+  if (region.hint === REGION_HINT_AXIS_ALIGNED_RECTANGLE) {
+    const bounds = regionBounds(region);
+    if (!bounds) return false;
+    const topLeft = toPixel(bounds.minX, bounds.maxY);
+    ctx.rect(
+      topLeft.x,
+      topLeft.y,
+      (bounds.maxX - bounds.minX) * scale,
+      (bounds.maxY - bounds.minY) * scale
+    );
+    return true;
+  }
+
+  if (points.length < 6) return false;
+  const first = toPixel(points[0], points[1]);
+  ctx.moveTo(first.x, first.y);
+  for (let i = 2; i + 1 < points.length; i += 2) {
+    const position = toPixel(points[i], points[i + 1]);
+    ctx.lineTo(position.x, position.y);
+  }
+  ctx.closePath();
+  return true;
+}
+
+function drawReservationConfig() {
+  if (!reservationConfig) return;
+
+  (reservationConfig.safe_sets || []).forEach(set => {
+    const bounds = regionBounds(set.region);
+    if (!bounds) return;
+    const labelPosition = toPixel(bounds.minX, bounds.maxY);
+
+    ctx.save();
+    ctx.shadowBlur = 0;
+    ctx.beginPath();
+    if (!addRegionPath(set.region)) {
+      ctx.restore();
+      return;
+    }
+    ctx.fillStyle = 'rgba(0, 255, 135, 0.06)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0, 255, 135, 0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.stroke();
+
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(0, 255, 135, 0.8)';
+    ctx.font = '600 11px Outfit';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(
+      `safe: ${set.name}`,
+      labelPosition.x + 4,
+      labelPosition.y + 4
+    );
+    ctx.restore();
+  });
+
+  (reservationConfig.parking_spots || []).forEach(spot => {
+    const bounds = regionBounds(spot.region);
+    if (!bounds) return;
+    const position = toPixel(
+      (bounds.minX + bounds.maxX) / 2,
+      (bounds.minY + bounds.maxY) / 2
+    );
+
+    ctx.save();
+    ctx.shadowBlur = 0;
+
+    ctx.beginPath();
+    if (addRegionPath(spot.region)) {
+      ctx.fillStyle = 'rgba(255, 153, 0, 0.10)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255, 153, 0, 0.6)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = '#ff9900';
+    ctx.font = 'bold 12px Outfit';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('P', position.x, position.y);
+
+    ctx.fillStyle = 'rgba(255, 153, 0, 0.85)';
+    ctx.font = '600 10px Outfit';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(spot.name, position.x + 8, position.y - 4);
+    ctx.restore();
+  });
 }
 
 // Rendering grid background and actors
@@ -506,6 +630,9 @@ function drawGrid() {
     const pix = toPixel(0, y);
     ctx.fillText(y.toString(), centerX - 8, pix.y);
   }
+
+  // Draw the reservation config behind plans and robots.
+  drawReservationConfig();
 
   // 4. Draw plans, actual routes, and dependencies
   robots.forEach(r => {
@@ -757,7 +884,20 @@ function fetchConfig() {
     .catch(err => console.error('Failed to load config:', err));
 }
 
+function fetchReservationConfig() {
+  fetch('/reservation_config')
+    .then(res => res.json())
+    .then(data => {
+      if (data && data.safe_sets) {
+        reservationConfig = data;
+        console.log('Loaded reservation config:', reservationConfig);
+      }
+    })
+    .catch(err => console.error('Failed to load reservation config:', err));
+}
+
 // Boot application
 fetchConfig();
+fetchReservationConfig();
 initSSE();
 animationLoop();
