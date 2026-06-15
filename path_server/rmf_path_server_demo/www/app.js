@@ -256,9 +256,12 @@ function selectRobot(name) {
 // Interactive canvas click/hover bindings
 canvas.addEventListener('mousemove', (e) => {
   const rect = canvas.getBoundingClientRect();
-  mouseX = e.clientX - rect.left;
-  mouseY = e.clientY - rect.top;
-  
+  // Map display coordinates to the canvas drawing buffer.
+  const sx = canvas.width / rect.width;
+  const sy = canvas.height / rect.height;
+  mouseX = (e.clientX - rect.left) * sx;
+  mouseY = (e.clientY - rect.top) * sy;
+
   const gridPos = toGrid(mouseX, mouseY);
   document.getElementById('coords-display').textContent = `X: ${gridPos.x} | Y: ${gridPos.y}`;
 });
@@ -270,8 +273,10 @@ canvas.addEventListener('click', (e) => {
   }
 
   const rect = canvas.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
+  const sx = canvas.width / rect.width;
+  const sy = canvas.height / rect.height;
+  const mx = (e.clientX - rect.left) * sx;
+  const my = (e.clientY - rect.top) * sy;
   const gridPos = toGrid(mx, my);
 
   if (interactionMode === 'add-robot') {
@@ -884,8 +889,27 @@ function drawGrid() {
   });
 }
 
+let lastCanvasDisplaySize = -1;
+function resizeCanvasDisplay() {
+  const container = canvas.parentElement;
+  const style = getComputedStyle(container);
+  const padX = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+  const padY = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+  const availW = container.clientWidth - padX;
+  const availH = container.clientHeight - padY;
+  const size = Math.max(0, Math.floor(Math.min(availW, availH)));
+  if (size !== lastCanvasDisplaySize) {
+    lastCanvasDisplaySize = size;
+    canvas.style.width = size + 'px';
+    canvas.style.height = size + 'px';
+  }
+}
+
+window.addEventListener('resize', resizeCanvasDisplay);
+
 // Periodic loop for canvas redraw
 function animationLoop() {
+  resizeCanvasDisplay();
   drawGrid();
   requestAnimationFrame(animationLoop);
 }
@@ -914,6 +938,7 @@ function fetchReservationConfig() {
 }
 
 // Boot application
+resizeCanvasDisplay();
 fetchConfig();
 fetchReservationConfig();
 initSSE();
