@@ -28,7 +28,7 @@ ros2 launch rmf_path_server_demo demo_destination_server.launch.py
 - Open `http://localhost:8080` in your web browser.
 - **Add Robot**: Click "Add Robot" and place robots on the grid canvas.
 - **Set Goals**: Click the grid multiple times to place **multiple alternative goal locations** (labeled `G_<robot_id>.<index>`). Conflicting goals can be assigned as the destination server will resolve them automatically.
-- **Finish Goal Setup**: Click the robot's name in the sidebar list again to finish setting goals for it.
+- **Switch or Finish**: Select another robot in the sidebar to switch goal editing to it. Select the current robot again in the sidebar list to finish. Canvas clicks always place goals while editing, including on another robot's current position.
 - **Send**: Click "Send Scenario" to submit goals for resolution and start planning.
 - The canvas will highlight the chosen goals in solid colors and fade out the unused alternatives.
 

@@ -205,7 +205,7 @@ function updateRobotListUI() {
     else if (r.status === 'Reached') statusClass = 'reached';
 
     html += `
-      <div class="robot-item ${isSelected}" onclick="selectRobot('${r.name}')">
+      <div class="robot-item ${isSelected}" data-robot-name="${r.name}">
         <div class="robot-item-top">
           <span class="robot-item-name">
             <span class="robot-dot-color" style="background-color: ${r.color}; box-shadow: 0 0 6px ${r.color}"></span>
@@ -224,6 +224,14 @@ function updateRobotListUI() {
   listDiv.innerHTML = html;
 }
 
+// Delegate selection because robot rows are redrawn as state changes.
+document.getElementById('robot-list').addEventListener('pointerdown', event => {
+  const item = event.target.closest('.robot-item');
+  if (!item) return;
+  event.preventDefault();
+  selectRobot(item.dataset.robotName);
+});
+
 function selectRobot(name) {
   if (selectedRobotName === name) {
     selectedRobotName = null;
@@ -236,7 +244,7 @@ function selectRobot(name) {
   interactionMode = 'set-goal';
   const verb = systemMode === 'live' ? 'NEW Goal' : 'Goal';
   if (config.use_destination_server) {
-    showInstruction(`Click on the grid to add alternative goals for ${name}. Click the robot name in the list again to finish.`);
+    showInstruction(`Click the grid to add alternative goals for ${name}. Use the robot list to switch, or select ${name} again in the list to finish.`);
   } else {
     showInstruction(`Click on the grid to place the ${verb} for ${name}.`);
   }
