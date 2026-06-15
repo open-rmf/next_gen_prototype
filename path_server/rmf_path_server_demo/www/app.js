@@ -11,6 +11,7 @@ let reservationConfig = null;
 let selectedRobotName = null;
 let interactionMode = 'normal'; // 'normal', 'add-robot', 'set-goal'
 let systemMode = 'setup'; // 'setup', 'live'
+let pendingGoalReset = false;
 let eventSource = null;
 let mouseX = 0;
 let mouseY = 0;
@@ -242,6 +243,7 @@ function selectRobot(name) {
   }
   selectedRobotName = name;
   interactionMode = 'set-goal';
+  pendingGoalReset = systemMode === 'live' && config.use_destination_server;
   const verb = systemMode === 'live' ? 'NEW Goal' : 'Goal';
   if (config.use_destination_server) {
     showInstruction(`Click the grid to add alternative goals for ${name}. Use the robot list to switch, or select ${name} again in the list to finish.`);
@@ -325,6 +327,13 @@ canvas.addEventListener('click', (e) => {
       if (config.use_destination_server) {
         if (!robot.goals) {
           robot.goals = [];
+        }
+        // A live re-selection starts a new set of goal alternatives.
+        if (pendingGoalReset) {
+          robot.goals = [];
+          robot.active_goal_x = undefined;
+          robot.active_goal_y = undefined;
+          pendingGoalReset = false;
         }
         if (robot.goals.some(g => g.x === gridPos.x && g.y === gridPos.y)) {
           alert('This goal is already added for this robot!');
