@@ -377,20 +377,8 @@ impl PlanExecutor {
             .get_alloc_for_agent(agent_idx)
             .unwrap_or_default();
 
-        let mut max_wp_idx = curr_wp_idx;
-        for &(x, y) in &positions {
-            if let Some(priority) = allocation_field.get_alloc_priority(x as isize, y as isize) {
-                if priority > max_wp_idx {
-                    max_wp_idx = priority;
-                }
-            }
-        }
-        if max_wp_idx > released_wp_idx {
-            max_wp_idx = released_wp_idx;
-        }
-
-        let target_x = plan.waypoints[max_wp_idx].position[0];
-        let target_y = plan.waypoints[max_wp_idx].position[1];
+        let target_x = plan.waypoints[released_wp_idx].position[0];
+        let target_y = plan.waypoints[released_wp_idx].position[1];
 
         let costmap = Self::to_costmap_msg(
             &positions,
@@ -406,13 +394,13 @@ impl PlanExecutor {
         // Update SafeZone version if the target waypoint changed
         let (safe_zone_version, _is_new_target) = {
             let state = self.active_robots.get_mut(robot_id).unwrap();
-            if state.last_incremental_target_wp != Some(max_wp_idx) {
+            if state.last_incremental_target_wp != Some(released_wp_idx) {
                 if state.last_incremental_target_wp.is_some() {
                     state.safe_zone_version += 1;
                 }
-                state.last_incremental_target_wp = Some(max_wp_idx);
+                state.last_incremental_target_wp = Some(released_wp_idx);
             }
-            (state.safe_zone_version, state.last_incremental_target_wp == Some(max_wp_idx))
+            (state.safe_zone_version, state.last_incremental_target_wp == Some(released_wp_idx))
         };
 
         let safe_zone = SafeZone {
@@ -432,7 +420,7 @@ impl PlanExecutor {
                 nodes: vec![],
             },
             costmap,
-            target_waypoint: vec![max_wp_idx as u64].try_into().unwrap(),
+            target_waypoint: vec![released_wp_idx as u64].try_into().unwrap(),
             last_waypoint: released_wp_idx as u64,
             target_progress: 0.0,
             id: SafeZoneId {
