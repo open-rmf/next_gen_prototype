@@ -34,6 +34,7 @@ spawner_node = None
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
 
 class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
@@ -646,7 +647,7 @@ def main(args=None):
     finally:
         spawner_node.shutdown()
         spawner_node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':
