@@ -172,6 +172,7 @@ class RobotSpawnerNode(Node):
         self.progress_subs = {}
         self.destination_subs = {}
         self.discovery_timer = None
+        self.initial_goal_timer = None
         self.discovery_qos = QoSProfile(
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -449,12 +450,7 @@ class RobotSpawnerNode(Node):
         if self.discovery_timer:
             self.publish_destination(name)
 
-    def publish_destination(self, name):
-        import uuid
-        goals = self.robot_goals.get(name, [])
-        if not goals:
-            return
-
+    def ensure_destination_publisher(self, name):
         if self.use_destination_server:
             if name not in self.dest_goal_publishers:
                 self.dest_goal_publishers[name] = self.create_publisher(
@@ -462,7 +458,31 @@ class RobotSpawnerNode(Node):
                     f'{name}/destination/goal',
                     qos_profile=self.reliable_transient_qos
                 )
+            return
 
+        if name not in self.dest_publishers:
+            self.dest_publishers[name] = self.create_publisher(
+                Destination,
+                f'{name}/destination',
+                qos_profile=self.reliable_transient_qos
+            )
+
+    def destination_subscription_ready(self, name):
+        if self.use_destination_server:
+            topic = f'{name}/destination/goal'
+        else:
+            topic = f'{name}/destination'
+        return self.count_subscribers(topic) >= 1
+
+    def publish_destination(self, name):
+        import uuid
+        goals = self.robot_goals.get(name, [])
+        if not goals:
+            return
+
+        self.ensure_destination_publisher(name)
+
+        if self.use_destination_server:
             goal_msg = DestinationGoal()
             goal_msg.session.uuid = list(uuid.uuid4().bytes)
 
@@ -485,13 +505,6 @@ class RobotSpawnerNode(Node):
             self.get_logger().info(f"Published DestinationGoal for '{name}' with {len(goals)} options, session {goal_msg.session.uuid}")
 
         else:
-            if name not in self.dest_publishers:
-                self.dest_publishers[name] = self.create_publisher(
-                    Destination,
-                    f'{name}/destination',
-                    qos_profile=self.reliable_transient_qos
-                )
-
             gx, gy = goals[0]
             dest_msg = Destination()
             dest_msg.session.uuid = list(uuid.uuid4().bytes)
@@ -534,9 +547,26 @@ class RobotSpawnerNode(Node):
 
         self.discovery_timer = self.create_timer(1.0, timer_callback)
 
-        # 2. Publish goals for all robots to their destination topics
+        if self.initial_goal_timer:
+            self.initial_goal_timer.cancel()
+
         for name in self.robot_goals.keys():
-            self.publish_destination(name)
+            self.ensure_destination_publisher(name)
+
+        def publish_initial_goals_when_ready():
+            if not all(
+                self.destination_subscription_ready(name)
+                for name in self.robot_goals.keys()
+            ):
+                return
+
+            self.initial_goal_timer.cancel()
+            self.initial_goal_timer = None
+            for name in self.robot_goals.keys():
+                self.publish_destination(name)
+
+        self.initial_goal_timer = self.create_timer(
+            0.1, publish_initial_goals_when_ready)
 
     def reset_scenario(self):
         self.get_logger().info("Resetting scenario, shutting down all simulator processes...")
@@ -545,6 +575,9 @@ class RobotSpawnerNode(Node):
         if self.discovery_timer:
             self.discovery_timer.cancel()
             self.discovery_timer = None
+        if self.initial_goal_timer:
+            self.initial_goal_timer.cancel()
+            self.initial_goal_timer = None
 
         # Kill all mock robot subprocesses
         for name, proc in self.active_processes.items():
