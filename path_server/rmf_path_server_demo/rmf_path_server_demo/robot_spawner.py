@@ -188,6 +188,12 @@ class RobotSpawnerNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             reliability=ReliabilityPolicy.RELIABLE,
         )
+        self.reliable_volatile_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
 
         # Publishers for ROS 2 control plane
         self.discovery_pub = self.create_publisher(
@@ -441,7 +447,7 @@ class RobotSpawnerNode(Node):
             Destination,
             f'{name}/destination',
             destination_callback,
-            qos_profile=self.reliable_transient_qos
+            qos_profile=self.reliable_volatile_qos
         )
 
     def subscribe_to_destination_error(self, name):
@@ -465,7 +471,7 @@ class RobotSpawnerNode(Node):
             DestinationError,
             f'{name}/destination/error',
             error_callback,
-            qos_profile=self.reliable_transient_qos
+            qos_profile=self.reliable_volatile_qos
         )
 
     def set_goal(self, name, x, y):
