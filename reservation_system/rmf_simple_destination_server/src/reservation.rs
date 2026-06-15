@@ -363,6 +363,35 @@ mod tests {
     }
 
     #[test]
+    fn second_robot_diverted_for_negative_goal() {
+        let config = Arc::new(ReservationConfig {
+            grid_size: 0.5,
+            safe_sets: vec![SafeSet {
+                name: "floor".to_string(),
+                region: ConfigRegion {
+                    hint: Region::HINT_AXIS_ALIGNED_RECTANGLE,
+                    points: vec![-10.0, -10.0, 10.0, 10.0],
+                },
+            }],
+            parking_spots: vec![ParkingSpot {
+                name: "p_a".to_string(),
+                region: ConfigRegion {
+                    hint: Region::HINT_AXIS_ALIGNED_RECTANGLE,
+                    points: vec![-8.5, -8.5, -7.5, -7.5],
+                },
+            }],
+        });
+        let mut state = ReservationState::new(config);
+
+        let _ = state.request("robot_1", make_goal(1, -5.0, -5.0, 1.0));
+        let outcomes = state.request("robot_2", make_goal(2, -5.0, -5.0, 1.0));
+
+        let dest = reserved_for(&outcomes, "robot_2").expect("robot_2 should be diverted");
+        assert_eq!(dest.detour_for_goal, Some(SessionUUID { uuid: [2; 16] }));
+        assert!(state.queue.contains(&"robot_2".to_string()));
+    }
+
+    #[test]
     fn second_robot_is_diverted_to_parking() {
         let mut state = ReservationState::new(queueing_config());
         let _ = state.request("robot_1", make_goal(1, 10.0, 10.0, 1.0));

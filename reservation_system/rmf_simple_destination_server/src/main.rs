@@ -194,11 +194,11 @@ impl DomainDestinationError {
 }
 
 struct CurrentlyOccupiedDestinations {
-    // A simple occupancy grid. If None, the region is considered free, if Some it is allocated to the session
-    floor_space: Vec<Vec<Option<SessionUUID>>>,
+    // Sparse occupancy grid keyed by signed cell coordinates.
+    floor_space: HashMap<(i32, i32), SessionUUID>,
 
     // This helps with book keeping of the occupancy grid.
-    session_to_location: HashMap<SessionUUID, Vec<(u32, u32)>>,
+    session_to_location: HashMap<SessionUUID, Vec<(i32, i32)>>,
 
     // Each agent can have only one session
     agent_to_session: HashMap<String, SessionUUID>,
@@ -209,7 +209,7 @@ struct CurrentlyOccupiedDestinations {
 impl CurrentlyOccupiedDestinations {
     fn new(grid_size: f32) -> Self {
         Self {
-            floor_space: Vec::new(),
+            floor_space: HashMap::new(),
             session_to_location: HashMap::new(),
             agent_to_session: HashMap::new(),
             grid_size,
@@ -255,18 +255,15 @@ impl CurrentlyOccupiedDestinations {
     }
 
     fn clear_old_uuid(&mut self, session: &SessionUUID) {
-        let Some(locations) = self.session_to_location.get(session) else {
+        let Some(locations) = self.session_to_location.remove(session) else {
             return;
         };
-        for location in locations {
-            if let Some(row) = self.floor_space.get_mut(location.1 as usize) {
-                if let Some(cell) = row.get_mut(location.0 as usize) {
-                    *cell = None;
-                }
+        for cell in locations {
+            // Do not clear cells reassigned to another session.
+            if self.floor_space.get(&cell) == Some(session) {
+                self.floor_space.remove(&cell);
             }
         }
-
-        self.session_to_location.remove(session);
     }
 
     fn mark_region(&mut self, session: &SessionUUID, region: &DomainRegion) {
@@ -274,30 +271,18 @@ impl CurrentlyOccupiedDestinations {
             return;
         };
 
-        // Resize floor_space if needed
-        if self.floor_space.len() <= end_y {
-            self.floor_space.resize(end_y + 1, Vec::new());
-        }
-
         for y in start_y..=end_y {
-            let row = &mut self.floor_space[y];
-            if row.len() <= end_x {
-                row.resize(end_x + 1, None);
-            }
             for x in start_x..=end_x {
-                row[x] = Some(*session);
+                self.floor_space.insert((x, y), *session);
                 self.session_to_location
                     .entry(*session)
                     .or_default()
-                    .push((x as u32, y as u32));
+                    .push((x, y));
             }
         }
     }
 
-    fn get_region_grid_bounds(
-        &self,
-        region: &DomainRegion,
-    ) -> Option<(usize, usize, usize, usize)> {
+    fn get_region_grid_bounds(&self, region: &DomainRegion) -> Option<(i32, i32, i32, i32)> {
         if region.hint == DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE {
             if region.points.len() < 2 || region.points.len() % 2 != 0 {
                 return None;
@@ -324,51 +309,28 @@ impl CurrentlyOccupiedDestinations {
             max_y = max_y.max(y);
         }
 
-        if min_x < 0.0 || min_y < 0.0 {
-            // As per instructions, we don't care about negative coords for now.
-            // But let's at least clip them to 0 if they are partly negative,
-            // or return None if fully negative.
-            if max_x < 0.0 || max_y < 0.0 {
-                return None;
-            }
-            min_x = min_x.max(0.0);
-            min_y = min_y.max(0.0);
-        }
-
-        let start_x = (min_x / self.grid_size).floor() as usize;
-        let end_x = (max_x / self.grid_size).ceil() as usize;
-        let start_y = (min_y / self.grid_size).floor() as usize;
-        let end_y = (max_y / self.grid_size).ceil() as usize;
+        let start_x = (min_x / self.grid_size).floor() as i32;
+        let end_x = (max_x / self.grid_size).ceil() as i32;
+        let start_y = (min_y / self.grid_size).floor() as i32;
+        let end_y = (max_y / self.grid_size).ceil() as i32;
 
         Some((start_x, end_x, start_y, end_y))
     }
 
     fn check_if_region_free(&self, region: &DomainRegion) -> Result<bool, ShapeErr> {
-        let bounds = self.get_region_grid_bounds(region);
-        let Some((start_x, end_x, start_y, end_y)) = bounds else {
-            // If we can't get bounds (invalid points or negative), we treat it as an error
-            // but for simplicity here we'll just check hint if it was invalid points.
+        let Some((start_x, end_x, start_y, end_y)) = self.get_region_grid_bounds(region) else {
             if region.hint == DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE
                 || region.hint == DomainRegion::HINT_POINT
             {
-                if region.points.len() < 2 {
-                    return Err(ShapeErr::InvalidPoints);
-                }
-            } else {
-                return Err(ShapeErr::UnsupportedHint);
+                return Err(ShapeErr::InvalidPoints);
             }
-            // If points were okay but negative, we can return true (it's "free" in our tracked positive space)
-            return Ok(true);
+            return Err(ShapeErr::UnsupportedHint);
         };
 
         for y_idx in start_y..=end_y {
-            if let Some(row) = self.floor_space.get(y_idx) {
-                for x_idx in start_x..=end_x {
-                    if let Some(cell) = row.get(x_idx) {
-                        if cell.is_some() {
-                            return Ok(false);
-                        }
-                    }
+            for x_idx in start_x..=end_x {
+                if self.floor_space.contains_key(&(x_idx, y_idx)) {
+                    return Ok(false);
                 }
             }
         }
@@ -720,6 +682,29 @@ mod tests {
         // Check if book-keeping works
         assert!(od.session_to_location.contains_key(&session));
         assert_eq!(od.session_to_location.get(&session).unwrap().len(), 9); // (0,0) to (2,2) inclusive is 3x3=9 cells
+    }
+
+    #[test]
+    fn test_mark_and_check_negative_region() {
+        let mut od = create_test_occupied();
+        let session = SessionUUID { uuid: [7; 16] };
+        let region = DomainRegion {
+            hint: DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE,
+            points: vec![-8.0, -8.0, -7.0, -7.0],
+        };
+
+        assert!(od.check_if_region_free(&region).unwrap());
+        od.mark_region(&session, &region);
+        assert!(!od.check_if_region_free(&region).unwrap());
+
+        let positive = DomainRegion {
+            hint: DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE,
+            points: vec![1.0, 1.0, 2.0, 2.0],
+        };
+        assert!(od.check_if_region_free(&positive).unwrap());
+
+        od.clear_old_uuid(&session);
+        assert!(od.check_if_region_free(&region).unwrap());
     }
 
     #[test]
