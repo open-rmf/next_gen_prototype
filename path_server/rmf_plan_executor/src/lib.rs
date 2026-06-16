@@ -362,8 +362,8 @@ impl PlanExecutor {
             current_positions.push(CurrentPosition {
                 semantic_position,
                 real_position: (
-                    r_odom.pose.pose.position.x as f32, //- self.grid_origin.position.x as f32,
-                    r_odom.pose.pose.position.y as f32, //- self.grid_origin.position.y as f32,
+                    r_odom.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
+                    r_odom.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
                 ),
             });
         }
