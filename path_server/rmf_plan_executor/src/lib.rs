@@ -90,7 +90,7 @@ impl PlanExecutor {
     }
 
     fn get_agent_index(&self, robot_id: &str) -> Option<usize> {
-        self.active_robots.keys().position(|k| k == robot_id)
+        self.active_robots.keys().position(|k| k == robot_id) // TODO(arjoc): Peak tier AI-SLOP code.
     }
 
     fn reindex_followers(&mut self) {
@@ -308,7 +308,11 @@ impl PlanExecutor {
         let current_max_x = current_min_x + (self.grid_width as f32 * self.grid_resolution);
         let current_max_y = current_min_y + (self.grid_height as f32 * self.grid_resolution);
 
-        if min_x < current_min_x || min_y < current_min_y || max_x > current_max_x || max_y > current_max_y {
+        if min_x < current_min_x
+            || min_y < current_min_y
+            || max_x > current_max_x
+            || max_y > current_max_y
+        {
             let new_min_x = min_x - 20.0;
             let new_min_y = min_y - 20.0;
             let new_max_x = max_x + 20.0;
@@ -358,11 +362,13 @@ impl PlanExecutor {
             current_positions.push(CurrentPosition {
                 semantic_position,
                 real_position: (
-                    r_odom.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
-                    r_odom.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
+                    r_odom.pose.pose.position.x as f32, //- self.grid_origin.position.x as f32,
+                    r_odom.pose.pose.position.y as f32, //- self.grid_origin.position.y as f32,
                 ),
             });
         }
+
+        //self.active_robots.get()
 
         let mapf_result = MapfResult {
             trajectories,
@@ -390,9 +396,9 @@ impl PlanExecutor {
         );
 
         let plan_id = plan.plan_id.clone();
-        
+
         // Update SafeZone version if the target waypoint changed
-        let (safe_zone_version, _is_new_target) = {
+        /* let (safe_zone_version, _is_new_target) = {
             let state = self.active_robots.get_mut(robot_id).unwrap();
             if state.last_incremental_target_wp != Some(released_wp_idx) {
                 if state.last_incremental_target_wp.is_some() {
@@ -401,7 +407,10 @@ impl PlanExecutor {
                 state.last_incremental_target_wp = Some(released_wp_idx);
             }
             (state.safe_zone_version, state.last_incremental_target_wp == Some(released_wp_idx))
-        };
+        };*/
+
+        let state = self.active_robots.get_mut(robot_id).unwrap();
+        state.safe_zone_version += 1;
 
         let safe_zone = SafeZone {
             incremental_target: DestinationConstraints {
@@ -425,7 +434,7 @@ impl PlanExecutor {
             target_progress: 0.0,
             id: SafeZoneId {
                 plan_id,
-                safe_zone_version,
+                safe_zone_version: state.safe_zone_version,
             },
         };
 

@@ -104,14 +104,14 @@ impl<P: MapfPlanner> PlanServer<P> {
     /// For now both the plan server and executor's logic is embodied in this
     /// function.
     pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) {
-        rclrs::log!(
+        /*rclrs::log!(
             self.node.logger(),
             "PathServer (DestinationsWorker) received odometry for {}: Position({:.2}, {:.2}, {:.2})",
             robot_id,
             msg.pose.pose.position.x,
             msg.pose.pose.position.y,
             msg.pose.pose.position.z
-        );
+        );*/
         self.latest_pose_estimate
             .insert(robot_id.to_string(), msg.clone());
     }
@@ -481,7 +481,7 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
     let footprints = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let footprints_clone = Arc::clone(&footprints);
 
-    // Create the Destinations worker (Data Plane)
+    // Create the Destinations worke
     let destinations_worker =
         Arc::new(node.create_worker(PlanServer::new(Arc::clone(&node), planner, footprints)));
 
@@ -536,6 +536,7 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
                     .create_subscription::<Destination, _>(
                         destination_topic.as_str().transient_local().reliable(),
                         move |dest_server: &mut PlanServer<P>, dest_msg: Destination| {
+                            //rclrs::log!(server.node.logger(), "Received destination for robot");
                             dest_server.handle_destination(&robot_id_clone, dest_msg);
                         },
                     ) {
