@@ -368,8 +368,6 @@ impl PlanExecutor {
             });
         }
 
-        //self.active_robots.get()
-
         let mapf_result = MapfResult {
             trajectories,
             footprints,
