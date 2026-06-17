@@ -5,9 +5,10 @@ use config::ReservationConfig;
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use reservation::{Outcome, ReservationState};
 use rmf_prototype_msgs::msg::{
-    Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, NamedRegion,
-    Region, ReservationConfig as ReservationConfigMsg, TargetRegion,
+    Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, Region,
+    TargetRegion,
 };
+use rmf_reservation_msgs::msg::{NamedRegion, ReservationConfig as ReservationConfigMsg};
 use std::collections::HashMap;
 use std::sync::Arc;
 

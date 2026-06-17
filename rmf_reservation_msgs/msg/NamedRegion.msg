@@ -4,4 +4,4 @@
 string name
 
 # The named map region.
-Region region
+rmf_prototype_msgs/Region region

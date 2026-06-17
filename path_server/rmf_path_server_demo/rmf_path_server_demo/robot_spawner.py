@@ -22,11 +22,11 @@ from rmf_prototype_msgs.msg import (
     Participant,
     ParticipantList,
     Region,
-    ReservationConfig,
     TargetRegion,
     Plan,
     Progress,
 )
+from rmf_reservation_msgs.msg import ReservationConfig
 
 
 # Global node reference for the HTTP request handler to access
