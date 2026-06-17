@@ -1,3 +1,5 @@
+[Posted on Discourse](https://discourse.openrobotics.org/t/traffic-management-interfaces-for-the-next-generation/44414)
+
 # Quick Summary
 
 * Proposing topics and messages for next generation Open-RMF traffic management interfaces

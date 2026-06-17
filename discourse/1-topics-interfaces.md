@@ -1,3 +1,5 @@
+[Posted on Discourse](https://discourse.openrobotics.org/t/taxonomy-of-interfaces-for-the-next-generation/44310)
+
 # Quick Summary
 
 Defining ROS topic patterns for the Next Generation of Open-RMF and looking for feedback from the community.
