@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Subscribe to discovery on the executor_worker manually to handle state and footprints
     let mut tracker = rmf_participant_discovery::ParticipantTracker::new();
     let _footprints_subscription = executor_worker.create_subscription::<ParticipantList, _>(
-        "/destination/discovery",
+        "/destination/discovery".transient_local().reliable().keep_all(),
         move |executor: &mut PlanExecutor, msg: ParticipantList| {
             let (added, removed) = tracker.update(&msg);
             for robot_id in removed {
@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let plan_topic = robot_id.to_string() + "/plan";
 
                 let odom_sub = match server.executor_worker.create_subscription::<Odometry, _>(
-                    odom_topic.as_str().transient_local().reliable(),
+                    odom_topic.as_str(),
                     move |executor: &mut PlanExecutor, msg: Odometry| {
                         executor.handle_odometry(&robot_id_clone, msg);
                     },

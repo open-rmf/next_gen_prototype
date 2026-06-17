@@ -191,13 +191,16 @@ impl MapfPlanner for PibtPlanner {
             };
 
         let mut trajectories = vec![Vec::new(); robot_ids.len()];
+        let mut data = String::new();
         for time_step in solved_paths {
             for (agent_idx, pos) in time_step.iter().enumerate() {
                 let world_x = pos.0 as f32 + offset_x;
                 let world_y = pos.1 as f32 + offset_y;
                 trajectories[agent_idx].push(Isometry2::translation(world_x, world_y));
+                data.push_str(&format!("{} {} {}\n", agent_idx, world_x, world_y));
             }
         }
+        std::fs::write("output.csv", data).unwrap();
 
         Ok(trajectories)
     }

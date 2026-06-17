@@ -1,6 +1,7 @@
 use rmf_prototype_msgs::msg::ParticipantList;
 use std::collections::HashSet;
 use std::sync::Arc;
+use rclrs::IntoPrimitiveOptions;
 
 #[derive(Debug, Clone, Default)]
 pub struct ParticipantTracker {
@@ -69,7 +70,7 @@ where
 {
     let mut tracker = ParticipantTracker::new();
     worker.create_subscription::<ParticipantList, _>(
-        topic,
+        topic.transient_local().reliable().keep_all(),
         move |server: &mut T, msg: ParticipantList| {
             let (added, removed) = tracker.update(&msg);
 
