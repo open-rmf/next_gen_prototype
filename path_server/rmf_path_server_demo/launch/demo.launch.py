@@ -11,11 +11,11 @@ def generate_launch_description():
         output='both'
     )
 
-    # 2. Start the destination server
-    destination_server = Node(
-        package='rmf_simple_destination_server',
-        executable='rmf_simple_destination_server',
-        name='rmf_simple_destination_server',
+    # 2. Start the web spawner & web dashboard hosting server (REST & SSE Bridge)
+    robot_spawner = Node(
+        package='rmf_path_server_demo',
+        executable='robot_spawner',
+        name='robot_spawner',
         output='both'
     )
 
@@ -29,6 +29,6 @@ def generate_launch_description():
 
     return LaunchDescription([
         path_server,
-        destination_server,
+        robot_spawner,
         plan_executor
     ])
