@@ -473,7 +473,6 @@ class RobotSpawnerNode(Node):
             p = Participant()
             p.name = name
             p.components = []
-            p.radius = 0.49
             discovery_msg.participants.append(p)
 
         self.discovery_pub.publish(discovery_msg)
