@@ -152,7 +152,6 @@ class MockRobotSimNode(Node):
         p = Participant()
         p.name = self.robot_name
         p.components = []
-        p.radius = 0.49
         msg.participants.append(p)
 
         self.dest_discovery_pub.publish(msg)
@@ -177,22 +176,24 @@ class MockRobotSimNode(Node):
 
     def handle_release(self, msg: PlanRelease):
         self.get_logger().info(
-            f"Received PlanRelease: waypoint_id={msg.waypoint_id}, "
-            f"plan_version={msg.plan_id.plan_version}"
+            f'Received PlanRelease: waypoint_id={msg.waypoint_id}, '
+            f'plan_version={msg.plan_id.plan_version}'
         )
         if not self.current_plan_id:
-            self.get_logger().info("Cannot update release: current_plan_id is None")
+            self.get_logger().info('Cannot update release: current_plan_id is None')
             return
-        
-        uuid_matches = list(msg.plan_id.destination_session.uuid) == list(self.current_plan_id.destination_session.uuid)
+
+        msg_uuid = list(msg.plan_id.destination_session.uuid)
+        curr_uuid = list(self.current_plan_id.destination_session.uuid)
+        uuid_matches = msg_uuid == curr_uuid
         version_matches = msg.plan_id.plan_version == self.current_plan_id.plan_version
         self.get_logger().info(
-            f"PlanRelease check: uuid_matches={uuid_matches}, version_matches={version_matches}"
+            f'PlanRelease check: uuid_matches={uuid_matches}, version_matches={version_matches}'
         )
         if uuid_matches and version_matches:
             self.released_waypoint_idx = msg.waypoint_id
             self.get_logger().info(
-                f"Successfully updated released_waypoint_idx to {self.released_waypoint_idx}"
+                f'Successfully updated released_waypoint_idx to {self.released_waypoint_idx}'
             )
 
     def is_blocked(self):
@@ -217,8 +218,8 @@ class MockRobotSimNode(Node):
             if self.is_blocked():
                 if not self.was_blocked:
                     self.get_logger().info(
-                        f"Blocked! current_waypoint_idx={self.current_waypoint_idx}, "
-                        f"released_waypoint_idx={self.released_waypoint_idx}"
+                        f'Blocked! current_waypoint_idx={self.current_waypoint_idx}, '
+                        f'released_waypoint_idx={self.released_waypoint_idx}'
                     )
                     self.was_blocked = True
                 # Blocked by traffic dependencies! Do not move.
@@ -226,8 +227,8 @@ class MockRobotSimNode(Node):
             else:
                 if self.was_blocked:
                     self.get_logger().info(
-                        f"Unblocked! current_waypoint_idx={self.current_waypoint_idx}, "
-                        f"released_waypoint_idx={self.released_waypoint_idx}"
+                        f'Unblocked! current_waypoint_idx={self.current_waypoint_idx}, '
+                        f'released_waypoint_idx={self.released_waypoint_idx}'
                     )
                     self.was_blocked = False
                 if self.wait_time_remaining > 0.0:

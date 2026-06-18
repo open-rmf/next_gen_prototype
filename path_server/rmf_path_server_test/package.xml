@@ -13,6 +13,7 @@
   <test_depend>launch_testing_ros</test_depend>
   <test_depend>rmf_mock_robot_sim</test_depend>
   <test_depend>rmf_path_server</test_depend>
+  <test_depend>rmf_plan_executor</test_depend>
   <test_depend>rmf_prototype_msgs</test_depend>
   <test_depend>rclpy</test_depend>
 

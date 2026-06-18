@@ -507,8 +507,7 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
                   msg: rmf_prototype_msgs::msg::ParticipantList| {
                 if let Ok(mut map) = footprints_clone2.lock() {
                     for p in msg.participants {
-                        let radius = if p.radius > 0.0 { p.radius } else { 0.49 };
-                        map.insert(p.name, radius);
+                        map.insert(p.name, 0.49);
                     }
                 }
             },

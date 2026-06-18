@@ -43,7 +43,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Subscribe to discovery on the executor_worker manually to handle state and footprints
     let mut tracker = rmf_participant_discovery::ParticipantTracker::new();
     let _footprints_subscription = executor_worker.create_subscription::<ParticipantList, _>(
-        "/destination/discovery".transient_local().reliable().keep_all(),
+        "/destination/discovery"
+            .transient_local()
+            .reliable()
+            .keep_all(),
         move |executor: &mut PlanExecutor, msg: ParticipantList| {
             let (added, removed) = tracker.update(&msg);
             for robot_id in removed {
@@ -51,8 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             for p in msg.participants {
                 if added.contains(&p.name) {
-                    let radius = if p.radius > 0.0 { p.radius } else { 0.49 };
-                    executor.handle_robot_added(&p.name, radius);
+                    executor.handle_robot_added(&p.name, 0.49);
                 }
             }
         },

@@ -7,7 +7,7 @@ import launch_testing
 from nav_msgs.msg import Odometry
 import pytest
 import rclpy
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import ParticipantList, Plan, PlanId, PlanRelease, Progress, Waypoint
 
 
@@ -116,16 +116,23 @@ class TestMockRobotSim(unittest.TestCase):
             10
         )
 
+        reliable_transient_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
         plan_pub = self.node.create_publisher(
             Plan,
             f'{robot_name}/plan',
-            10
+            qos_profile=reliable_transient_qos
         )
 
         release_pub = self.node.create_publisher(
             PlanRelease,
             f'{robot_name}/plan/release',
-            10
+            qos_profile=reliable_transient_qos
         )
 
         # 3. Construct and publish Plan
