@@ -474,7 +474,7 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
     let footprints = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let footprints_clone = Arc::clone(&footprints);
 
-    // Create the Destinations worke
+    // Create the Destinations worker
     let destinations_worker =
         Arc::new(node.create_worker(PlanServer::new(Arc::clone(&node), planner, footprints)));
 
