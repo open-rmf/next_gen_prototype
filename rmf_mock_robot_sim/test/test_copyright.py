@@ -1,4 +1,4 @@
-# Copyright 2015 Open Source Robotics Foundation, Inc.
+# Copyright 2026 OSRA
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,8 +16,6 @@ from ament_copyright.main import main
 import pytest
 
 
-# Remove the `skip` decorator once the source file(s) have a copyright header
-@pytest.mark.skip(reason='No copyright header has been placed in the generated source file.')
 @pytest.mark.copyright
 @pytest.mark.linter
 def test_copyright():
