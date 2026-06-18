@@ -1,7 +1,4 @@
-use mapf_post::na::Isometry2;
-use mapf_post::MapfResult;
-use mapf_post::SemanticPlan;
-use mapf_post::SemanticWaypoint;
+use mapf_post::{na::Isometry2, MapfResult, SemanticPlan, SemanticWaypoint};
 use nav_msgs::msg::Odometry;
 use rclrs::{IntoPrimitiveOptions, Node};
 use rmf_prototype_msgs::msg::{Destination, Plan, PlanId, TrafficDependency, Waypoint};
