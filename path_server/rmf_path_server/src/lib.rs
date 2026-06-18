@@ -4,11 +4,7 @@ use mapf_post::SemanticPlan;
 use mapf_post::SemanticWaypoint;
 use nav_msgs::msg::Odometry;
 use rclrs::{IntoPrimitiveOptions, Node};
-use rmf_prototype_msgs::msg::Destination;
-use rmf_prototype_msgs::msg::Plan;
-use rmf_prototype_msgs::msg::PlanId;
-use rmf_prototype_msgs::msg::TrafficDependency;
-use rmf_prototype_msgs::msg::Waypoint;
+use rmf_prototype_msgs::msg::{Destination, Plan, PlanId, TrafficDependency, Waypoint};
 use std::collections::HashMap;
 use std::sync::Arc;
 
