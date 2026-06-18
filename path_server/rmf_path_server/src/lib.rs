@@ -37,7 +37,7 @@ pub enum PlanResult {
 }
 
 pub struct PlanServer<P: MapfPlanner> {
-    pub active_plans: HashMap<String, Destination>,
+    pub active_destinations: HashMap<String, Destination>,
     pub latest_pose_estimate: HashMap<String, Odometry>,
     pub node: Arc<Node>,
     pub replan_queue: Vec<(String, Destination)>,
@@ -61,7 +61,7 @@ impl<P: MapfPlanner> PlanServer<P> {
     ) -> Self {
         let (plan_sender, plan_receiver) = std::sync::mpsc::channel();
         Self {
-            active_plans: HashMap::new(),
+            active_destinations: HashMap::new(),
             latest_pose_estimate: HashMap::new(),
             node,
             replan_queue: Vec::new(),
@@ -91,7 +91,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                 .join("")
         );
 
-        let is_new_session = match self.active_plans.get(robot_id) {
+        let is_new_session = match self.active_destinations.get(robot_id) {
             Some(active_dest) => active_dest.session.uuid != msg.session.uuid,
             None => true,
         };
@@ -111,21 +111,13 @@ impl<P: MapfPlanner> PlanServer<P> {
     /// For now both the plan server and executor's logic is embodied in this
     /// function.
     pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) {
-        /*rclrs::log!(
-            self.node.logger(),
-            "PathServer (DestinationsWorker) received odometry for {}: Position({:.2}, {:.2}, {:.2})",
-            robot_id,
-            msg.pose.pose.position.x,
-            msg.pose.pose.position.y,
-            msg.pose.pose.position.z
-        );*/
         self.latest_pose_estimate
             .insert(robot_id.to_string(), msg.clone());
     }
 
     pub fn replan(&mut self) {
         // 1. Check if any planning results have arrived from the background thread
-        if let Ok(receiver) = self.plan_receiver.lock() {
+        if let Ok(receiver) = self.plan_receiver.get_mut() {
             while let Ok(result) = receiver.try_recv() {
                 match result {
                     PlanResult::Success(success) => {
@@ -170,7 +162,14 @@ impl<P: MapfPlanner> PlanServer<P> {
                         let mut plans = HashMap::new();
                         for (agent_idx, robot_id) in robot_ids.iter().enumerate() {
                             let plan_id = self.active_plan_ids.get(robot_id).unwrap().clone();
-                            let traj = &basic_plan[agent_idx];
+                            let Some(traj) = &basic_plan.get(agent_idx) else {
+                                rclrs::log_error!(
+                                    self.node.logger(),
+                                    "Missing plan trajectory for agent {}",
+                                    agent_idx
+                                );
+                                continue;
+                            };
                             let plan = Self::to_plan_msg(
                                 agent_idx,
                                 traj,
@@ -240,9 +239,10 @@ impl<P: MapfPlanner> PlanServer<P> {
                             }
                         }
 
-                        self.active_plans = goals;
+                        self.active_destinations = goals;
                     }
                     PlanResult::Failure { session_id, error } => {
+                        // TODO(arjoc): Publish error message
                         if Some(session_id) != self.current_planning_session {
                             continue;
                         }
@@ -272,7 +272,7 @@ impl<P: MapfPlanner> PlanServer<P> {
 
         rclrs::log!(self.node.logger(), "Need to trigger plan");
         // Retrieve goals of all participants
-        let mut goals = self.active_plans.clone();
+        let mut goals = self.active_destinations.clone();
 
         for (robot_id, dest) in &self.replan_queue {
             goals.insert(robot_id.clone(), dest.clone());
