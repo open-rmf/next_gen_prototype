@@ -44,7 +44,7 @@ pub struct PlanServer<P: MapfPlanner> {
     pub planner: Arc<P>,
     pub plan_publishers: HashMap<String, rclrs::Publisher<Plan>>,
     pub plan_receiver: std::sync::Mutex<std::sync::mpsc::Receiver<PlanResult>>,
-    pub plan_sender: std::sync::Mutex<std::sync::mpsc::Sender<PlanResult>>,
+    pub plan_sender: std::sync::mpsc::Sender<PlanResult>,
     pub is_planning: bool,
     pub current_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub planning_session_id: u64,
@@ -67,7 +67,7 @@ impl<P: MapfPlanner> PlanServer<P> {
             replan_queue: Vec::new(),
             planner: Arc::new(planner),
             plan_publishers: HashMap::new(),
-            plan_sender: std::sync::Mutex::new(plan_sender),
+            plan_sender,
             plan_receiver: std::sync::Mutex::new(plan_receiver),
             is_planning: false,
             current_cancellation: None,
@@ -320,13 +320,7 @@ impl<P: MapfPlanner> PlanServer<P> {
 
         let planner_clone = Arc::clone(&self.planner);
         let footprints_clone = Arc::clone(&self.footprints);
-        let sender_clone = match self.plan_sender.lock() {
-            Ok(sender) => sender.clone(),
-            Err(_) => {
-                self.is_planning = false;
-                return;
-            }
-        };
+        let sender_clone = self.plan_sender.clone();
 
         std::thread::spawn(move || {
             if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
