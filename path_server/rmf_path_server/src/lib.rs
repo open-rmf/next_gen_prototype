@@ -103,9 +103,10 @@ impl<P: MapfPlanner> PlanServer<P> {
             self.is_planning = false;
             self.current_planning_session = None;
             self.current_cancellation = None;
+            self.replan_queue.push((robot_id.to_owned(), msg));
+        } else {
+            rclrs::log_error!(self.node.logger(), "Duplicate session id received");
         }
-
-        self.replan_queue.push((robot_id.to_owned(), msg));
     }
 
     /// For now both the plan server and executor's logic is embodied in this
@@ -348,8 +349,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                 &footprints_map,
                 &robot_ids,
                 Arc::clone(&cancellation),
-            )
-            {
+            ) {
                 Ok(plan) => plan,
                 Err(err) => {
                     let _ = sender_clone.send(PlanResult::Failure {

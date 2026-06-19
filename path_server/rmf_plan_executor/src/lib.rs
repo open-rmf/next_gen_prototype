@@ -409,18 +409,9 @@ impl PlanExecutor {
 
         let plan_id = plan.plan_id.clone();
 
-        // Update SafeZone version if the target waypoint changed
-        /* let (safe_zone_version, _is_new_target) = {
-            let state = self.active_robots.get_mut(robot_id).unwrap();
-            if state.last_incremental_target_wp != Some(released_wp_idx) {
-                if state.last_incremental_target_wp.is_some() {
-                    state.safe_zone_version += 1;
-                }
-                state.last_incremental_target_wp = Some(released_wp_idx);
-            }
-            (state.safe_zone_version, state.last_incremental_target_wp == Some(released_wp_idx))
-        };*/
-
+        // We need to update safezones all the time.
+        // TODO(arjoc) see if we can update safezones only when there are changes in the
+        // shape of the safe zone or target to limit network traffic.
         let state = self.active_robots.get_mut(robot_id).unwrap();
         state.safe_zone_version += 1;
 
