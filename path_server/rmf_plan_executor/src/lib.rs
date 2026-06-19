@@ -40,6 +40,9 @@ pub struct RobotState {
 
 pub struct PlanExecutor {
     pub node: Node,
+    // TODO(arjoc) The use of BTreeMap here is to make sure robts are ordered by their names
+    // this helps with maintaining correspondance between their `mapf_post` ids and the input.
+    // We should re-visit this after re-designing the mapf-post API a little.
     pub active_robots: BTreeMap<String, RobotState>,
     pub plan_release_publishers: HashMap<String, rclrs::Publisher<PlanRelease>>,
     pub safezone_publishers: HashMap<String, rclrs::Publisher<SafeZone>>,
