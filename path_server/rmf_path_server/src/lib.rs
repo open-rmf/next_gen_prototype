@@ -16,7 +16,7 @@ use mapf_post::{na::Isometry2, MapfResult, SemanticPlan, SemanticWaypoint};
 use nav_msgs::msg::Odometry;
 use rclrs::{IntoPrimitiveOptions, Node};
 use rmf_prototype_msgs::msg::{Destination, Plan, PlanId, TrafficDependency, Waypoint};
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::sync::Arc;
 
 pub mod planner;
@@ -214,35 +214,34 @@ impl<P: MapfPlanner> PlanServer<P> {
                             );
 
                             // Publish the plans
-                            if !self.plan_publishers.contains_key(robot_id) {
-                                let topic = format!("{}/plan", robot_id);
-                                match self.node.create_publisher::<Plan>(
-                                    topic.as_str().transient_local().reliable(),
-                                ) {
-                                    Ok(pub_) => {
-                                        self.plan_publishers.insert(robot_id.clone(), pub_);
-                                    }
-                                    Err(err) => {
-                                        rclrs::log_error!(
-                                            self.node.logger(),
-                                            "Failed to create plan publisher for {}: {:?}",
-                                            robot_id,
-                                            err
-                                        );
-                                        continue;
+                            let publisher = match self.plan_publishers.entry(robot_id.clone()) {
+                                Entry::Occupied(entry) => entry.into_mut(),
+                                Entry::Vacant(entry) => {
+                                    let topic = format!("{}/plan", robot_id);
+                                    match self.node.create_publisher::<Plan>(
+                                        topic.as_str().transient_local().reliable(),
+                                    ) {
+                                        Ok(pub_) => entry.insert(pub_),
+                                        Err(err) => {
+                                            rclrs::log_error!(
+                                                self.node.logger(),
+                                                "Failed to create plan publisher for {}: {:?}",
+                                                robot_id,
+                                                err
+                                            );
+                                            continue;
+                                        }
                                     }
                                 }
-                            }
+                            };
 
-                            if let Some(publisher) = self.plan_publishers.get(robot_id) {
-                                if let Err(err) = publisher.publish(plan) {
-                                    rclrs::log_error!(
-                                        self.node.logger(),
-                                        "Failed to publish plan for {}: {:?}",
-                                        robot_id,
-                                        err
-                                    );
-                                }
+                            if let Err(err) = publisher.publish(plan) {
+                                rclrs::log_error!(
+                                    self.node.logger(),
+                                    "Failed to publish plan for {}: {:?}",
+                                    robot_id,
+                                    err
+                                );
                             }
                         }
 
