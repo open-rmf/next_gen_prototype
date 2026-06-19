@@ -111,6 +111,12 @@ impl<P: MapfPlanner> PlanServer<P> {
 
     /// For now both the plan server and executor's logic is embodied in this
     /// function.
+    ///
+    /// Note: We do not trigger a replan directly from this function when new
+    /// odometry arrives. Instead, a 100ms periodic timer (configured in `start_path_server`)
+    /// polls `replan()`, which will process any queued replan requests once
+    /// odometry for all active robots is available. This prevents planning freeze
+    /// if planning was previously skipped due to missing odometry.
     pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) {
         self.latest_pose_estimate
             .insert(robot_id.to_string(), msg.clone());
