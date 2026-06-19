@@ -326,21 +326,23 @@ impl<P: MapfPlanner> PlanServer<P> {
                 return;
             }
 
-            let footprints_map: HashMap<String, Arc<dyn mapf_post::shape::Shape>> = robot_ids
-                .iter()
-                .map(|id| {
-                    let radius = if let Ok(map) = footprints_clone.lock() {
-                        *map.get(id).unwrap_or(&0.49)
-                    } else {
-                        0.49
-                    };
-                    (
-                        id.clone(),
-                        Arc::new(mapf_post::shape::Ball::new(radius))
-                            as Arc<dyn mapf_post::shape::Shape>,
-                    )
-                })
-                .collect();
+            let footprints_map: HashMap<String, Arc<dyn mapf_post::shape::Shape>> = {
+                let guard = footprints_clone.lock();
+                robot_ids
+                    .iter()
+                    .map(|id| {
+                        let radius = match guard.as_ref() {
+                            Ok(map) => *map.get(id).unwrap_or(&0.49),
+                            Err(_) => 0.49,
+                        };
+                        (
+                            id.clone(),
+                            Arc::new(mapf_post::shape::Ball::new(radius))
+                                as Arc<dyn mapf_post::shape::Shape>,
+                        )
+                    })
+                    .collect()
+            };
 
             let basic_plan = match planner_clone.plan(
                 &starts,
