@@ -351,6 +351,7 @@ impl<P: MapfPlanner> PlanServer<P> {
             ) {
                 Ok(plan) => plan,
                 Err(err) => {
+                    // TODO(arjoc): publish an error on the {robot}/destination/errors
                     let _ = sender_clone.send(PlanResult::Failure {
                         session_id,
                         error: format!("{:?}", err),
