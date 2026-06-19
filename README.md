@@ -6,3 +6,50 @@ documents for the next generation of Open-RMF.
 If you would like to give feedback or input on the designs, you are welcome to
 open issue tickets, submit pull requests, or post to the [ideas board](https://discourse.ros.org/c/open-rmf/open-rmf-ideas/105)
 on discourse.
+
+
+# Setup & Building
+
+:warning: As this is a project under construction, these instructions are likely to change rapidly.
+
+## Pre-requisites
+
+* ROS 2 jazzy
+* The latest Rust compiler.
+
+
+## Build Instructions
+
+1. **Import Workspace Dependencies (via `.repos` file)**  
+   Create a workspace and import the required ROS 2 Rust and navigation dependencies using this [`setup.repos`](https://gist.github.com/arjo129/1711acb6fdf2956640f022a1ebde3869):
+   ```bash
+   mkdir -p rmf_ws/src
+   cd rmf_ws
+   vcs import src < setup.repos
+   ```
+
+2. **Build the PR Packages**  
+   Ensure you are at the workspace root inside the `jazzy` distrobox container, then build the relevant packages:
+   ```bash
+   colcon build --packages-select rmf_prototype_msgs rmf_participant_discovery rmf_path_server rmf_plan_executor rmf_mock_robot_sim rmf_path_server_demo rmf_path_server_test
+   ```
+
+## Running Automated Integration Tests
+Verify core scenario coordination and robust following behavior:
+```bash
+colcon test --packages-select rmf_path_server_test --event-handlers console_direct+
+```
+
+## Running the Interactive Web Demonstration
+
+https://github.com/user-attachments/assets/d5793eee-515d-49a9-a92c-9926617b48ed
+
+
+Launch the fully standalone path server dashboard:
+```bash
+ros2 launch rmf_path_server_demo demo.launch.py
+```
+1. Open `http://localhost:8080` in your web browser.
+2. Click **Add Robot** to drop active participants onto the canvas.
+3. Select a robot and click a cell to place its goal.
+4. Click **Send Scenario** to observe multi-agent trajectory generation and live execution progress.
