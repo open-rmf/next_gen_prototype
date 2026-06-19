@@ -1,4 +1,4 @@
-// Copyright 2026 OSRA
+// Copyright 2026 Open Source Robotics Foundation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
 use rclrs::IntoPrimitiveOptions;
 use rmf_prototype_msgs::msg::ParticipantList;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
 pub struct ParticipantTracker {
@@ -72,7 +71,7 @@ impl ParticipantTracker {
 /// It tracks additions and removals using `ParticipantTracker` under the hood
 /// and invokes the supplied callback functions when those events occur.
 pub fn create_discovery_subscription<T, AddFn, RemFn>(
-    worker: &Arc<rclrs::Worker<T>>,
+    worker: &rclrs::Worker<T>,
     topic: &str,
     mut on_added: AddFn,
     mut on_removed: RemFn,

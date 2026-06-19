@@ -1,4 +1,4 @@
-// Copyright 2026 OSRA
+// Copyright 2026 Open Source Robotics Foundation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use rmf_plan_executor::PlanExecutor;
 use rmf_prototype_msgs::msg::{ParticipantList, Plan};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 struct RobotConnections {
     _odom_subscription: rclrs::WorkerSubscription<Odometry, PlanExecutor>,
@@ -25,13 +24,13 @@ struct RobotConnections {
 }
 
 struct ExecutorDiscoveryServer {
-    node: Arc<rclrs::Node>,
+    node: rclrs::Node,
     active_robots: HashMap<String, RobotConnections>,
-    executor_worker: Arc<rclrs::Worker<PlanExecutor>>,
+    executor_worker: rclrs::Worker<PlanExecutor>,
 }
 
 impl ExecutorDiscoveryServer {
-    fn new(node: Arc<rclrs::Node>, executor_worker: Arc<rclrs::Worker<PlanExecutor>>) -> Self {
+    fn new(node: rclrs::Node, executor_worker: rclrs::Worker<PlanExecutor>) -> Self {
         Self {
             node,
             active_robots: HashMap::new(),
@@ -43,16 +42,16 @@ impl ExecutorDiscoveryServer {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = Context::default_from_env().unwrap();
     let mut executor = context.create_basic_executor();
-    let node = Arc::new(executor.create_node("plan_executor")?);
+    let node = executor.create_node("plan_executor")?;
 
     // Create the executor worker
-    let executor_worker = Arc::new(node.create_worker(PlanExecutor::new(Arc::clone(&node))));
+    let executor_worker = node.create_worker(PlanExecutor::new(node.clone()));
 
     // Create the discovery worker
-    let discovery_worker = Arc::new(node.create_worker(ExecutorDiscoveryServer::new(
-        Arc::clone(&node),
-        Arc::clone(&executor_worker),
-    )));
+    let discovery_worker = node.create_worker(ExecutorDiscoveryServer::new(
+        node.clone(),
+        executor_worker.clone(),
+    ));
 
     // 1. Subscribe to discovery on the executor_worker manually to handle state and footprints
     let mut tracker = rmf_participant_discovery::ParticipantTracker::new();

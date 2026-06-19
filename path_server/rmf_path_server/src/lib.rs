@@ -1,4 +1,4 @@
-// Copyright 2026 OSRA
+// Copyright 2026 Open Source Robotics Foundation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ pub enum PlanResult {
 pub struct PlanServer<P: MapfPlanner> {
     pub active_destinations: HashMap<String, Destination>,
     pub latest_pose_estimate: HashMap<String, Odometry>,
-    pub node: Arc<Node>,
+    pub node: Node,
     pub replan_queue: Vec<(String, Destination)>,
     pub planner: Arc<P>,
     pub plan_publishers: HashMap<String, rclrs::Publisher<Plan>>,
@@ -55,7 +55,7 @@ pub struct PlanServer<P: MapfPlanner> {
 
 impl<P: MapfPlanner> PlanServer<P> {
     pub fn new(
-        node: Arc<Node>,
+        node: Node,
         planner: P,
         footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
     ) -> Self {
@@ -342,7 +342,13 @@ impl<P: MapfPlanner> PlanServer<P> {
                 })
                 .collect();
 
-            let basic_plan = match planner_clone.plan(&starts, &goals, &footprints_map, &robot_ids)
+            let basic_plan = match planner_clone.plan(
+                &starts,
+                &goals,
+                &footprints_map,
+                &robot_ids,
+                Arc::clone(&cancellation),
+            )
             {
                 Ok(plan) => plan,
                 Err(err) => {
@@ -456,13 +462,13 @@ pub struct RobotPathConnections<P: MapfPlanner> {
 }
 
 pub struct DiscoveryServer<P: MapfPlanner> {
-    pub node: Arc<Node>,
+    pub node: Node,
     pub active_robots: HashMap<String, RobotPathConnections<P>>,
-    pub destinations_worker: Arc<rclrs::Worker<PlanServer<P>>>,
+    pub destinations_worker: rclrs::Worker<PlanServer<P>>,
 }
 
 impl<P: MapfPlanner> DiscoveryServer<P> {
-    pub fn new(node: Arc<Node>, destinations_worker: Arc<rclrs::Worker<PlanServer<P>>>) -> Self {
+    pub fn new(node: Node, destinations_worker: rclrs::Worker<PlanServer<P>>) -> Self {
         Self {
             node,
             active_robots: HashMap::new(),
@@ -472,8 +478,8 @@ impl<P: MapfPlanner> DiscoveryServer<P> {
 }
 
 pub struct PathServerRunning<P: MapfPlanner> {
-    pub destinations_worker: Arc<rclrs::Worker<PlanServer<P>>>,
-    pub discovery_worker: Arc<rclrs::Worker<DiscoveryServer<P>>>,
+    pub destinations_worker: rclrs::Worker<PlanServer<P>>,
+    pub discovery_worker: rclrs::Worker<DiscoveryServer<P>>,
     pub replan_timer: Box<dyn std::any::Any + Send + Sync>,
     pub list_subscription:
         rclrs::WorkerSubscription<rmf_prototype_msgs::msg::ParticipantList, DiscoveryServer<P>>,
@@ -482,7 +488,7 @@ pub struct PathServerRunning<P: MapfPlanner> {
 }
 
 pub fn start_path_server<P: MapfPlanner + 'static>(
-    node: Arc<rclrs::Node>,
+    node: rclrs::Node,
     planner: P,
 ) -> Result<PathServerRunning<P>, Box<dyn std::error::Error>> {
     let footprints = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -490,7 +496,7 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
 
     // Create the Destinations worker
     let destinations_worker =
-        Arc::new(node.create_worker(PlanServer::new(Arc::clone(&node), planner, footprints)));
+        node.create_worker(PlanServer::new(node.clone(), planner, footprints));
 
     // Create a periodic timer on the Destinations worker to trigger replans asynchronously.
     let replan_timer = destinations_worker.create_timer_repeating(
@@ -501,10 +507,10 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
     )?;
 
     // Create the Discovery worker (Control Plane), passing a reference to the Destinations worker
-    let discovery_worker = Arc::new(node.create_worker(DiscoveryServer::new(
-        Arc::clone(&node),
-        Arc::clone(&destinations_worker),
-    )));
+    let discovery_worker = node.create_worker(DiscoveryServer::new(
+        node.clone(),
+        destinations_worker.clone(),
+    ));
 
     let footprints_clone2 = Arc::clone(&footprints_clone);
     let list_subscription = discovery_worker

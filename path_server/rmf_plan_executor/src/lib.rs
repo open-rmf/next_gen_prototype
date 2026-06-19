@@ -39,7 +39,7 @@ pub struct RobotState {
 }
 
 pub struct PlanExecutor {
-    pub node: Arc<Node>,
+    pub node: Node,
     pub active_robots: BTreeMap<String, RobotState>,
     pub plan_release_publishers: HashMap<String, rclrs::Publisher<PlanRelease>>,
     pub safezone_publishers: HashMap<String, rclrs::Publisher<SafeZone>>,
@@ -51,7 +51,7 @@ pub struct PlanExecutor {
 }
 
 impl PlanExecutor {
-    pub fn new(node: Arc<Node>) -> Self {
+    pub fn new(node: Node) -> Self {
         let mut origin = Pose::default();
         origin.orientation.w = 1.0;
         Self {

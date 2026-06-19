@@ -1,4 +1,4 @@
-// Copyright 2026 OSRA
+// Copyright 2026 Open Source Robotics Foundation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ use nav_msgs::msg::Odometry;
 use rmf_prototype_msgs::msg::Destination;
 use std::collections::HashMap;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// Implement this trait to use your own custom MAPF
@@ -30,6 +31,7 @@ pub trait MapfPlanner: Send + Sync + 'static {
         goals: &HashMap<String, Destination>,
         footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
+        cancellation: Arc<AtomicBool>,
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>>;
 }
 
@@ -43,6 +45,7 @@ impl MapfPlanner for MockPlanner {
         _goals: &HashMap<String, Destination>,
         _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
+        _cancellation: Arc<AtomicBool>,
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
         let mut plan = Vec::new();
         for _ in 0..robot_ids.len() {
@@ -76,6 +79,7 @@ impl MapfPlanner for PibtPlanner {
         goals: &HashMap<String, Destination>,
         _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
+        _cancellation: Arc<AtomicBool>,
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
         if robot_ids.is_empty() {
             return Ok(Vec::new());
@@ -205,16 +209,13 @@ impl MapfPlanner for PibtPlanner {
             };
 
         let mut trajectories = vec![Vec::new(); robot_ids.len()];
-        let mut data = String::new();
         for time_step in solved_paths {
             for (agent_idx, pos) in time_step.iter().enumerate() {
                 let world_x = pos.0 as f32 + offset_x;
                 let world_y = pos.1 as f32 + offset_y;
                 trajectories[agent_idx].push(Isometry2::translation(world_x, world_y));
-                data.push_str(&format!("{} {} {}\n", agent_idx, world_x, world_y));
             }
         }
-        std::fs::write("output.csv", data).unwrap();
 
         Ok(trajectories)
     }
