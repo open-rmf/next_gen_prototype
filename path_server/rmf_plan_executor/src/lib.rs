@@ -151,6 +151,12 @@ impl PlanExecutor {
             return;
         };
 
+        if msg.waypoints.len() == 0 {
+            // TODO(arjoc): publish an error message
+            rclrs::log_error!(self.node.logger(), "Received empty plan. Ignoring.");
+            return;
+        }
+
         state.plan = Some(msg);
         state.safe_zone_version = 0;
         state.last_incremental_target_wp = None;
@@ -271,6 +277,8 @@ impl PlanExecutor {
         }
 
         if released_wp_idx >= plan.waypoints.len() {
+            // Plan validation takes place in the ros2 callback so it should
+            // be safe to subtract the waypoint length.
             released_wp_idx = plan.waypoints.len() - 1;
         }
 
