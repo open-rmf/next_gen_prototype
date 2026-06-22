@@ -25,7 +25,7 @@ on discourse.
    ```bash
    mkdir -p rmf_ws/src
    cd rmf_ws
-   vcs import src < setup.repos
+   vcs import src --input https://gist.githubusercontent.com/arjo129/1711acb6fdf2956640f022a1ebde3869/raw/5786aa3d5e87a556c5c6769cc0983264b06a20d7/gistfile1.txt
    ```
 
 2. **Build the PR Packages**  
