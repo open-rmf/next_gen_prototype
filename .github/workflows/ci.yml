@@ -1,0 +1,37 @@
+name: Next-Gen Prototype CI
+
+on:
+  push:
+    branches: [ arjoc/feat/ci_config ]
+  pull_request:
+    branches: [ arjoc/feat/ci_config ]
+
+jobs:
+  ci-check:
+    name: Colcon Overlay Build & Test Suite
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/arjo129/ros2_rust_base:jazzy
+
+    steps:
+      - name: Checkout Prototype Repository
+        uses: actions/checkout@v4
+        with:
+          path: next_gen_ws/src/next_gen_prototype
+
+      - name: Build Prototype Packages (Overlay Workspace)
+        working-directory: next_gen_ws
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source /opt/ros2_rust_ws/install/setup.bash
+          colcon build
+        shell: bash
+
+      - name: Run Automated Verification Tests
+        working-directory: next_gen_ws
+        run: |
+          source /opt/ros2_rust_ws/install/setup.bash
+          source install/setup.bash
+          colcon test --packages-select rmf_path_server_test --event-handlers console_direct+
+          colcon test-result --all
+        shell: bash
