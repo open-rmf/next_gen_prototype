@@ -31,7 +31,7 @@ on discourse.
 2. **Build the PR Packages**  
    Ensure you are at the workspace root inside the `jazzy` distrobox container, then build the relevant packages:
    ```bash
-   colcon build --packages-select rmf_prototype_msgs rmf_participant_discovery rmf_path_server rmf_plan_executor rmf_mock_robot_sim rmf_path_server_demo rmf_path_server_test
+   colcon build
    ```
 
 ## Running Automated Integration Tests
