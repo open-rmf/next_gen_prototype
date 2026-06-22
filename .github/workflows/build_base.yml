@@ -2,7 +2,7 @@ name: Build and Publish Base Container
 
 on:
   push:
-    branches: [ arjoc/feat/ci_config ]
+    branches: [ arjoc/feat/ci_config_next_gen, epic/next-gen-base ]
     paths:
       - 'docker/Dockerfile.base'
       - 'docker/base.repos'
