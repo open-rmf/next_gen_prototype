@@ -15,13 +15,25 @@ on discourse.
 ## Pre-requisites
 
 * ROS 2 jazzy
-* ROS 2 rust (see installation instructions [here](https://github.com/ros2-rust/ros2_rust))
 * The latest Rust compiler.
 
 
 ## Build Instructions
 
-1. **Import Workspace Dependencies (via `.repos` file)**  
+1. Install `rust`, `colcon-cargo` and `colcon-cargo-ros`:
+```
+# Install Rust (see https://rustup.rs/)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Install required system packages
+sudo apt install -y git libclang-dev python3-pip python3-vcstool
+
+# Install colcon plugins for Rust
+pip install --break-system-packages colcon-cargo colcon-ros-cargo
+
+```
+
+2. **Import Workspace Dependencies (via `.repos` file)**  
    Create a workspace and import the required ROS 2 Rust and navigation dependencies using this [`setup.repos`](https://gist.github.com/arjo129/1711acb6fdf2956640f022a1ebde3869):
    ```bash
    mkdir -p rmf_ws/src
@@ -29,7 +41,7 @@ on discourse.
    vcs import src --input https://gist.githubusercontent.com/arjo129/1711acb6fdf2956640f022a1ebde3869/raw/5786aa3d5e87a556c5c6769cc0983264b06a20d7/gistfile1.txt
    ```
 
-2. **Build the PR Packages**  
+3. **Build the PR Packages**  
    Ensure you are at the workspace root inside the `jazzy` distrobox container, then build the relevant packages:
    ```bash
    colcon build
