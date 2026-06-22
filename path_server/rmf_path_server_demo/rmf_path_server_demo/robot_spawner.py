@@ -258,12 +258,6 @@ class RobotSpawnerNode(Node):
                 self.get_logger().info(f"Robot '{name}' is already running.")
                 return
 
-        # Ensure any orphaned mock robot simulation process for this name is killed first
-        try:
-            subprocess.run(['pkill', '-f', f'robot_name:={name}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-
         self.get_logger().info(f"Spawning robot '{name}' at ({x:.2f}, {y:.2f})")
 
         cmd = [
