@@ -29,8 +29,8 @@ setup(
     zip_safe=True,
     maintainer='Arjo Chakravarty',
     maintainer_email='arjoc@intrinsic.ai',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='Python mock robot simulator that follows RMF plans.',
+    license='Apache License 2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [

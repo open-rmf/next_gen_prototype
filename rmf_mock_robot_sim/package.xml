@@ -3,9 +3,9 @@
 <package format="3">
   <name>rmf_mock_robot_sim</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="arjoc@intrinsic.ai">arjoc</maintainer>
-  <license>TODO: License declaration</license>
+  <description>Lightweight Python mock robot simulator that publishes odometry and follows RMF plans</description>
+  <maintainer email="arjoc@intrinsic.ai">Arjo Chakravarty</maintainer>
+  <license>Apache License 2.0</license>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
