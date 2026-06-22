@@ -15,6 +15,7 @@ on discourse.
 ## Pre-requisites
 
 * ROS 2 jazzy
+* ROS 2 rust (see installation instructions [here](https://github.com/ros2-rust/ros2_rust))
 * The latest Rust compiler.
 
 
