@@ -69,10 +69,9 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
 
-            q = queue.Queue()
+            q = queue.Queue(maxsize=1000)
             if spawner_node:
                 spawner_node.add_client(q)
-
             try:
                 while True:
                     try:
@@ -245,7 +244,11 @@ class RobotSpawnerNode(Node):
     def broadcast(self, data):
         with self.sse_clients_lock:
             for q in self.sse_clients:
-                q.put(data)
+                try:
+                    q.put_nowait(data)
+                except queue.Full:
+                    # Drop messages for slow clients to avoid blocking ROS callbacks
+                    pass
 
     # Spawns a mock simulator node
     def spawn_robot(self, name, x, y):
