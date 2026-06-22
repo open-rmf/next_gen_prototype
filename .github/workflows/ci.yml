@@ -2,9 +2,9 @@ name: Next-Gen Prototype CI
 
 on:
   push:
-    branches: [ arjoc/feat/ci_config ]
+    branches: [ epic/next-gen-base ]
   pull_request:
-    branches: [ arjoc/feat/ci_config ]
+    branches: [ epic/next-gen-base ]
 
 jobs:
   ci-check:
