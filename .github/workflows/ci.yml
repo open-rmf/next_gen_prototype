@@ -23,7 +23,6 @@ jobs:
         working-directory: next_gen_ws
         run: |
           source /opt/ros/jazzy/setup.bash
-          sudo rosdep init || true
           rodep update
           rosdep install --from-paths . --ignore-src -y --skip-keys="rclrs ament_cargo ament_python"
           colcon build
