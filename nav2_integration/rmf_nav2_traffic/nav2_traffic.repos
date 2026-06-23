@@ -59,7 +59,3 @@ repositories:
     type: git
     url: https://github.com/ros2-rust/ros2_rust.git
     version: main
-  spatio_temporal_partitioning:
-    type: git
-    url: https://github.com/arjo129/spatio_temporal_partitioning.git
-    version: xiyu/next_gen
