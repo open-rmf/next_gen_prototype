@@ -11,7 +11,7 @@ jobs:
     name: Colcon Overlay Build & Test Suite
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/arjo129/ros2_rust_base:jazzy
+      image: ghcr.io/open-rmf/ros2_rust_base:jazzy
 
     steps:
       - name: Checkout Prototype Repository
