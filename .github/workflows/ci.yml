@@ -23,14 +23,14 @@ jobs:
         working-directory: next_gen_ws
         run: |
           source /opt/ros/jazzy/setup.bash
+          rosdep install --from-paths . --ignore-src -y --skip-keys="rclrs ament_cargo ament_python"
           colcon build
         shell: bash
 
       - name: Run Automated Verification Tests
         working-directory: next_gen_ws
         run: |
-          source /opt/ros2_rust_ws/install/setup.bash
-          rosdep install --from-paths . --ignore-src -y --skip-keys="rclrs ament_cargo ament_python" &
+          source /opt/ros/jazzy/setup.bash
           source install/setup.bash
           colcon test --packages-select rmf_path_server_test --event-handlers console_direct+
           colcon test-result --all
