@@ -34,7 +34,6 @@ on discourse.
 
    # Install colcon plugins for Rust
    pip install --break-system-packages colcon-cargo colcon-ros-cargo
-
    ```
 
    **Method 2: Using a container**
