@@ -31,12 +31,6 @@ RUN pip3 install -U --break-system-packages colcon-cargo colcon-ros-cargo
 # Initialize Underlay Workspace
 WORKDIR /opt/ros2_rust_ws
 
-# Copy minimal ROS 2 Rust dependency definitions (from repo root context)
-COPY docker/base.repos ./base.repos
-
-# Import base repositories (now including main ros2_rust repo with rclrs)
-# RUN mkdir -p src && vcs import src < base.repos
-
 # Stage the prototype branch to resolve its rosdep system dependencies directly into the base image
 COPY . /tmp/next_gen_prototype
 

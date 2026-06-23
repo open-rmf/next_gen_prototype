@@ -49,7 +49,7 @@ on discourse.
    ```bash
    mkdir -p rmf_ws/src
    cd rmf_ws/src
-   git clone git@github.com:open-rmf/next_gen_prototype.git
+   git clone https://github.com/open-rmf/next_gen_prototype.git
    cd ..
    ```
 
