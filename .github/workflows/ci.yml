@@ -23,7 +23,6 @@ jobs:
         working-directory: next_gen_ws
         run: |
           source /opt/ros/jazzy/setup.bash
-          source /opt/ros2_rust_ws/install/setup.bash
           colcon build
         shell: bash
 
