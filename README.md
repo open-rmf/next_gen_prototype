@@ -38,18 +38,19 @@ on discourse.
 
    **Method 2: Using a container**
    We pre-build base containers with all the dependencies you can use `rocker`, `distrobox`, `podman` or
-   <insert your favorite container tool>  to get a base dev environment. For the purposes of this set of instructions we use distrobox:
+   anyother oci compliant tool to get a base dev environment. For the purposes of this set of instructions we use distrobox:
    ```
    distrobox create --image ghcr.io/open-rmf/ros2_rust_base:jazzy -n ros2_rust_base
    distrobox enter ros2_rust_base
    ```
 
 2. **Import Workspace Dependencies (via `.repos` file)**  
-   Create a workspace and import the required ROS 2 Rust and navigation dependencies using this [`setup.repos`](https://gist.github.com/arjo129/1711acb6fdf2956640f022a1ebde3869):
+   Create a workspace and clone the repo:
    ```bash
    mkdir -p rmf_ws/src
-   cd rmf_ws
-   vcs import src --input https://gist.githubusercontent.com/arjo129/1711acb6fdf2956640f022a1ebde3869/raw/5786aa3d5e87a556c5c6769cc0983264b06a20d7/gistfile1.txt
+   cd rmf_ws/src
+   git clone git@github.com:open-rmf/next_gen_prototype.git
+   cd ..
    ```
 
 3. **Build the PR Packages**  
