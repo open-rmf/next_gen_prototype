@@ -31,6 +31,7 @@ jobs:
         working-directory: next_gen_ws
         run: |
           source /opt/ros2_rust_ws/install/setup.bash
+          rosdep install --from-paths src /tmp/next_gen_prototype --ignore-src -y --skip-keys="rclrs ament_cargo ament_python" &
           source install/setup.bash
           colcon test --packages-select rmf_path_server_test --event-handlers console_direct+
           colcon test-result --all
