@@ -33,7 +33,8 @@ on discourse.
    sudo apt install -y git libclang-dev python3-pip
 
    # Install colcon plugins for Rust
-   sudo apt install python3-colcon-cargo 
+   sudo apt install python3-colcon-cargo
+   pip3 install --break-system-packages colcon-ros-cargo
    ```
 
    **Method 2: Using a container**
