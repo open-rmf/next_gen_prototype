@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nav_msgs::msg::Odometry;
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use rmf_plan_executor::PlanExecutor;
-use rmf_prototype_msgs::msg::{ParticipantList, Plan};
+use ros_env::nav_msgs::msg::Odometry;
+use ros_env::rmf_prototype_msgs::msg::{ParticipantList, Plan};
 use std::collections::HashMap;
 
 struct RobotConnections {

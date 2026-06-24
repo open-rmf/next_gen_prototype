@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use rclrs::IntoPrimitiveOptions;
-use rmf_prototype_msgs::msg::ParticipantList;
+use ros_env::rmf_prototype_msgs::msg::ParticipantList;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Default)]
@@ -101,7 +101,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmf_prototype_msgs::msg::Participant;
+    use ros_env::rmf_prototype_msgs::msg::Participant;
 
     #[test]
     fn test_participant_tracker() {
