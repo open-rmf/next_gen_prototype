@@ -26,7 +26,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no
     chmod -R a+rwX /usr/local/cargo /usr/local/rustup
 
 # Install Cargo / Colcon ROS 2 Rust integration tools via pip
-RUN pip3 install -U --break-system-packages colcon-cargo colcon-ros-cargo
+RUN apt install python3-colcon-cargo
 
 # Initialize Underlay Workspace
 WORKDIR /opt/ros2_rust_ws
