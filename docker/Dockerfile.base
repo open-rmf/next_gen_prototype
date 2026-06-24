@@ -4,19 +4,20 @@ FROM ros:jazzy-ros-base
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install core build dependencies, Rust prerequisites, and ROS 2 build tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    git \
-    python3-pip \
-    python3-vcstool \
-    clang \
-    libclang-dev \
-    build-essential \
-    python3-colcon-common-extensions \
-    python3-colcon-cargo\
-    libssl-dev \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get upgrade && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        python3-pip \
+        python3-vcstool \
+        clang \
+        libclang-dev \
+        build-essential \
+        python3-colcon-common-extensions \
+        python3-colcon-cargo\
+        libssl-dev \
+        pkg-config \
+        && rm -rf /var/lib/apt/lists/*
 
 # Install colcon extensions for Rust
 RUN pip3 install --no-cache-dir --break-system-packages colcon-ros-cargo
@@ -40,7 +41,7 @@ COPY . /tmp/next_gen_prototype
 RUN apt-get update && \
     rosdep init || true && \
     rosdep update && \
-    rosdep install --from-paths /tmp/next_gen_prototype --ignore-src -y --skip-keys="rclrs ament_cargo ament_python" && \
+    rosdep install --from-paths /tmp/next_gen_prototype --ignore-src -yr --skip-keys="rclrs ament_cargo ament_python" && \
     rm -rf /var/lib/apt/lists/* && \
     rm -rf /tmp/next_gen_prototype
 
