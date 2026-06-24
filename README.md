@@ -44,7 +44,7 @@ on discourse.
    distrobox enter ros2_rust_base
    ```
 
-2. **Import Workspace Dependencies (via `.repos` file)**  
+2. **Import Workspace Dependencies**  
    Create a workspace and clone the repo:
    ```bash
    mkdir -p rmf_ws/src
