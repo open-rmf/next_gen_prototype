@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libclang-dev \
     build-essential \
     python3-colcon-common-extensions \
+    python3-colcon-cargo\
     libssl-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -25,8 +26,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no
     cargo install cargo-ament-build && \
     chmod -R a+rwX /usr/local/cargo /usr/local/rustup
 
-# Install Cargo / Colcon ROS 2 Rust integration tools via pip
-RUN apt install python3-colcon-cargo
 
 # Initialize Underlay Workspace
 WORKDIR /opt/ros2_rust_ws
