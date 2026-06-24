@@ -30,7 +30,7 @@ on discourse.
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
    # Install required system packages
-   sudo apt install -y git libclang-dev python3-pip python3-vcstool
+   sudo apt install -y git libclang-dev python3-pip
 
    # Install colcon plugins for Rust
    sudo apt install python3-colcon-cargo 
