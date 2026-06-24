@@ -14,12 +14,17 @@
 
 use hetpibt::external_tracks_pibt::PiBTWithExternalTracks;
 use mapf_post::na::Isometry2;
-use nav_msgs::msg::Odometry;
+use nav_msgs::msg::{Odometry, OccupancyGrid};
 use rmf_prototype_msgs::msg::Destination;
 use std::collections::HashMap;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+#[derive(Clone, Debug, Default)]
+pub struct Map {
+    pub grid: OccupancyGrid,
+}
 
 /// Implement this trait to use your own custom MAPF
 /// planner. The planner in this scenario will take in
@@ -31,6 +36,7 @@ pub trait MapfPlanner: Send + Sync + 'static {
         goals: &HashMap<String, Destination>,
         footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
+        map: &Map,
         cancellation: Arc<AtomicBool>,
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>>;
 }
@@ -45,6 +51,7 @@ impl MapfPlanner for MockPlanner {
         _goals: &HashMap<String, Destination>,
         _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
+        _map: &Map,
         _cancellation: Arc<AtomicBool>,
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
         let mut plan = Vec::new();
@@ -79,6 +86,7 @@ impl MapfPlanner for PibtPlanner {
         goals: &HashMap<String, Destination>,
         _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
+        _map: &Map,
         _cancellation: Arc<AtomicBool>,
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
         if robot_ids.is_empty() {
