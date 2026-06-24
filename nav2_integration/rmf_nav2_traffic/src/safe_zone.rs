@@ -3,7 +3,7 @@ use crate::{
     Nav2Agent, RclrsNode, RosPublisher, RosSubscription,
 };
 use bevy::prelude::*;
-use ros_env::{
+use {
     nav2_msgs::msg::Costmap,
     rmf_prototype_msgs::msg::{Progress, Region, SafeZone},
 };

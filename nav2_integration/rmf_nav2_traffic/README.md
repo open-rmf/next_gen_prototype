@@ -101,7 +101,7 @@ Clone this repository to the workspace and import the relevant repositories
 cd ~/nav2_traffic_ws/src
 git clone https://github.com/open-rmf/next_gen_prototype.git -b xiyu/nav2
 cd ~/nav2_traffic_ws
-vcs import src < src/next_gen_prototype/rmf_nav2_traffic/nav2_traffic.repos
+vcs import src < src/next_gen_prototype/nav2_integration/rmf_nav2_traffic/nav2_traffic.repos
 ```
 
 Deps

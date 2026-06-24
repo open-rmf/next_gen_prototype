@@ -5,7 +5,7 @@ use crate::{
 use bevy::prelude::*;
 use crossflow::{prelude::*, service::Service};
 use reqwest::blocking::Client;
-use ros_env::{
+use {
     nav2_msgs::msg::Costmap,
     rmf_prototype_msgs::msg::{
         DestinationConstraints, PlanId, Region, SafeZone, SafeZoneId, TargetOrientation,

@@ -3,22 +3,22 @@ repositories:
     type: git
     url: https://github.com/open-rmf/rmf_building_map_msgs.git
     version: main
-  ros2-rust/examples:
-    type: git
-    url: https://github.com/ros2-rust/examples.git
-    version: main
-  ros2-rust/ros-env:
-    type: git
-    url: https://github.com/ros2-rust/ros-env.git
-    version: main
-  ros2-rust/rosidl_runtime_rs:
-    type: git
-    url: https://github.com/ros2-rust/rosidl_runtime_rs.git
-    version: main
-  ros2-rust/rosidl_rust:
-    type: git
-    url: https://github.com/ros2-rust/rosidl_rust.git
-    version: main
+#  ros2-rust/examples:
+#    type: git
+#    url: https://github.com/ros2-rust/examples.git
+#    version: main
+#  ros2-rust/ros-env:
+#    type: git
+#    url: https://github.com/ros2-rust/ros-env.git
+#    version: main
+#  ros2-rust/rosidl_runtime_rs:
+#    type: git
+#    url: https://github.com/ros2-rust/rosidl_runtime_rs.git
+#    version: main
+#  ros2-rust/rosidl_rust:
+#    type: git
+#    url: https://github.com/ros2-rust/rosidl_rust.git
+#    version: main
   ros2/common_interfaces:
     type: git
     url: https://github.com/ros2/common_interfaces.git
@@ -39,14 +39,14 @@ repositories:
     type: git
     url: https://github.com/ros2/rcl_interfaces.git
     version: jazzy
-  ros2/rosidl_core:
-    type: git
-    url: https://github.com/ros2/rosidl_core.git
-    version: jazzy
-  ros2/rosidl_defaults:
-    type: git
-    url: https://github.com/ros2/rosidl_defaults.git
-    version: jazzy
+#  ros2/rosidl_core:
+#    type: git
+#    url: https://github.com/ros2/rosidl_core.git
+#    version: jazzy
+#  ros2/rosidl_defaults:
+#    type: git
+#    url: https://github.com/ros2/rosidl_defaults.git
+#    version: jazzy
   ros2/test_interface_files:
     type: git
     url: https://github.com/ros2/test_interface_files.git
@@ -55,7 +55,7 @@ repositories:
     type: git
     url: https://github.com/ros2/unique_identifier_msgs.git
     version: jazzy
-  ros2_rust:
-    type: git
-    url: https://github.com/ros2-rust/ros2_rust.git
-    version: main
+#  ros2_rust:
+#    type: git
+#    url: https://github.com/ros2-rust/ros2_rust.git
+#    version: main

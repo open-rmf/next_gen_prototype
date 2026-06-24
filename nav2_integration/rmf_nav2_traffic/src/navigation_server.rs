@@ -10,7 +10,7 @@ use bevy::prelude::*;
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use crossflow::{prelude::*, service::Service};
 use rclrs::*;
-use ros_env::{
+use {
     geometry_msgs::msg::PoseStamped,
     nav2_msgs::action::{NavigateToPose, NavigateToPose_Feedback, NavigateToPose_Result},
     rmf_prototype_msgs::msg::{
