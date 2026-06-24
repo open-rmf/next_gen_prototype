@@ -18,6 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# Install colcon extensions for Rust
+RUN pip3 install --no-cache-dir --break-system-packages colcon-ros-cargo
+
 # Install Rust toolchain (Stable) and global Cargo tools accessible to all users
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
