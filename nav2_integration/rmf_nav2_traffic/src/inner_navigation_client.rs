@@ -440,23 +440,23 @@ fn async_cancel_goal(
     executor_commands
         .run(async move {
             let mut cancellation = request.cancel_client.cancellation.cancel().await;
+            // If this is an external cancellation attempt, persist until it is accepted
+            while !cancellation.is_accepted() {
+                info!(
+                    "[{}] Cancellation request rejected for inner navigation, retrying...",
+                    request.agent.index()
+                );
+                cancellation = request.cancel_client.cancellation.cancel().await;
+            }
+            info!(
+                "[{}] Cancellation request accepted for inner navigation, requesting new goal",
+                request.agent.index()
+            );
             if let Some(new_request) = request.new_request {
                 // If this a replan attempt with a new navigation request,
                 // regardless of whether cancellation was successful, mark as Ok()
                 return Ok(new_request);
             } else {
-                // If this is an external cancellation attempt, persist until it is accepted
-                while !cancellation.is_accepted() {
-                    info!(
-                        "[{}] Cancellation request rejected for inner navigation, retrying...",
-                        request.agent.index()
-                    );
-                    cancellation = request.cancel_client.cancellation.cancel().await;
-                }
-                info!(
-                    "[{}] Cancellation request rejected for inner navigation, requesting new goal",
-                    request.agent.index()
-                );
                 return Err(InnerNavigationError {
                     handle: None,
                     kind: InnerNavigationErrorKind::CancelGoalError,
