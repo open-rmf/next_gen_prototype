@@ -21,7 +21,7 @@ on discourse.
 ## Build Instructions
 
 
-1. Install `rust`, `colcon-cargo` and `colcon-cargo-ros`.
+1. Install `rust` and `colcon-cargo`.
 
    **Method 1: Using a machine with ros2-jazzy installed**
    
@@ -33,12 +33,12 @@ on discourse.
    sudo apt install -y git libclang-dev python3-pip python3-vcstool
 
    # Install colcon plugins for Rust
-   pip install --break-system-packages colcon-cargo colcon-ros-cargo
+   sudo apt install python3-colcon-cargo 
    ```
 
    **Method 2: Using a container**
    We pre-build base containers with all the dependencies you can use `rocker`, `distrobox`, `podman` or
-   anyother oci compliant tool to get a base dev environment. For the purposes of this set of instructions we use distrobox:
+   any other oci compliant tool to get a base dev environment. For the purposes of this set of instructions we use distrobox:
    ```
    distrobox create --image ghcr.io/open-rmf/ros2_rust_base:jazzy -n ros2_rust_base
    distrobox enter ros2_rust_base
