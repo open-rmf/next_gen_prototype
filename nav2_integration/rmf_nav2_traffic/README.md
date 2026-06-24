@@ -94,19 +94,13 @@ sudo apt update && sudo apt upgrade -y
 Set up a fresh workspace
 ```
 mkdir ~/nav2_traffic_ws/src -p
-```
-
-Clone this repository to the workspace and import the relevant repositories
-```
 cd ~/nav2_traffic_ws/src
-git clone https://github.com/open-rmf/next_gen_prototype.git -b xiyu/nav2
-cd ~/nav2_traffic_ws
-vcs import src < src/next_gen_prototype/rmf_nav2_traffic/nav2_traffic.repos
+git clone https://github.com/open-rmf/next_gen_prototype.git
 ```
 
 Deps
 ```
-rosdep install --from-paths src --ignore-src --rosdistro $ROS_DISTRO -y
+rosdep install --from-paths src --ignore-src --rosdistro $ROS_DISTRO -yr
 ```
 
 Build
