@@ -283,8 +283,13 @@ impl ReservationConfig {
                 "RMF site has no levels".to_string(),
             ));
         }
+        if site.levels.len() > 1 {
+            return Err(ConfigError::Validation(format!(
+                "multi-level RMF sites are not supported yet, got {} levels",
+                site.levels.len()
+            )));
+        }
 
-        let multi_level = site.levels.len() > 1;
         let mut safe_sets = Vec::new();
         for level in site.levels.values() {
             let level_name = &level.properties.name.0;
@@ -304,7 +309,7 @@ impl ReservationConfig {
                     points.extend([rounded(x), rounded(y)]);
                 }
 
-                let name = if !multi_level && floor_index == 0 {
+                let name = if floor_index == 0 {
                     format!("{level_name}_floor")
                 } else {
                     format!("{level_name}_floor_{floor_index}")
