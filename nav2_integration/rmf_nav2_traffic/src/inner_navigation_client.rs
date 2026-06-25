@@ -177,6 +177,8 @@ enum InnerNavigationErrorKind {
     GoalAbortedError,
     #[error("Goal was cancelled!")]
     GoalCancelledError,
+    #[error("Incoming request has an older plan or safe zone version!")]
+    DuplicateOrOutdatedRequestError,
     #[error("Unknown error!")]
     UnknownError,
 }
@@ -199,6 +201,7 @@ impl InnerNavigationServices {
         let await_external_cancellation_service =
             app.spawn_continuous_service(Update, await_external_cancellation);
         let check_existing_goal_service = app.spawn_service(check_existing_goal);
+        let handle_existing_goal_result_service = app.spawn_service(handle_existing_goal_result);
         let async_cancel_goal_service = app.spawn_service(async_cancel_goal);
         let async_request_new_goal_service = app.spawn_service(async_request_new_goal);
         let update_goal_client_service = app.spawn_service(update_goal_client);
@@ -219,6 +222,8 @@ impl InnerNavigationServices {
 
             // Create nodes
             let check_existing_goal = builder.create_node(check_existing_goal_service);
+            let handle_existing_goal_result =
+                builder.create_node(handle_existing_goal_result_service);
             let async_cancel_goal = builder.create_node(async_cancel_goal_service);
             let async_request_new_goal = builder.create_node(async_request_new_goal_service);
             let update_goal_client = builder.create_node(update_goal_client_service);
@@ -234,13 +239,29 @@ impl InnerNavigationServices {
             // Stream out external cancellation requests to downstream nodes
             builder.connect(await_external_cancellation.streams, async_cancel_goal.input);
 
-            // Check if there is an existing goal client; if so, connect to
-            // cancellation node, else request new goal
+            // Check if there is an existing goal client, and compare whether the new
+            // request is duplicate or outdated. If so, discard (err branch).
             let (check_existing_fork_result_input, check_existing_fork_result) =
                 builder.create_fork_result();
             builder.connect(check_existing_goal.output, check_existing_fork_result_input);
-            builder.connect(check_existing_fork_result.ok, async_cancel_goal.input);
-            builder.connect(check_existing_fork_result.err, async_request_new_goal.input);
+            builder.connect(
+                check_existing_fork_result.ok,
+                handle_existing_goal_result.input,
+            );
+
+            // After discarding invalid new requests, check if there is an existing
+            // goal client; if so, connect to cancellation node, else request new goal
+            let (handle_existing_fork_result_input, handle_existing_fork_result) =
+                builder.create_fork_result();
+            builder.connect(
+                handle_existing_goal_result.output,
+                handle_existing_fork_result_input,
+            );
+            builder.connect(handle_existing_fork_result.ok, async_cancel_goal.input);
+            builder.connect(
+                handle_existing_fork_result.err,
+                async_request_new_goal.input,
+            );
 
             // Handles incoming inner/navigate_to_pose requests - cancels ongoing
             // action goals and sends new action goal.
@@ -382,10 +403,22 @@ fn await_external_cancellation(
     }
 }
 
+enum CheckExistingGoalResult {
+    ReplanAndCancel(CancelInnerNavigation),
+    NoExistingGoal(InnerNavigationRequest),
+}
+
+/// Checks if there is an existing goal for the requested agent.
+/// If yes, check if the existing goal is outdated, i.e. it has a lower plan or
+/// safe zone version than the new request. If so, cancel the existing goal and
+/// request a new goal. If the new request is duplicate or outdated, return
+/// Err(None) to indicate that no new goal should be requested.
+/// If there isn't an existing goal, return Err(Some(request)) so that the
+/// workflow can proceed to request a new goal without cancellation.
 fn check_existing_goal(
     Blocking { request, .. }: Blocking<InnerNavigationRequest>,
     inner_nav_clients: Query<&InnerNavigationClient>,
-) -> Result<CancelInnerNavigation, InnerNavigationRequest> {
+) -> Result<CheckExistingGoalResult, InnerNavigationError> {
     // TODO(@xiyuoh) Create a replan mechanism instead of cancelling goal on every
     // new request
     let mut replan_and_cancel = false;
@@ -394,7 +427,8 @@ fn check_existing_goal(
         .ok()
         .and_then(|inner_client| inner_client.goal().as_ref())
     else {
-        return Err(request);
+        // No existing goal, proceed to request for new goal
+        return Ok(CheckExistingGoalResult::NoExistingGoal(request));
     };
 
     // If plan or safe zone version is later, then replan/cancel
@@ -412,14 +446,32 @@ fn check_existing_goal(
     let client = existing_goal.client();
 
     if replan_and_cancel {
-        return Ok(CancelInnerNavigation {
-            agent: request.agent,
-            new_request: Some(request),
-            cancel_client: client.clone(),
-        });
+        return Ok(CheckExistingGoalResult::ReplanAndCancel(
+            CancelInnerNavigation {
+                agent: request.agent,
+                new_request: Some(request),
+                cancel_client: client.clone(),
+            },
+        ));
     }
 
-    return Err(request);
+    // There is an existing goal but the new request is duplicate or outdated,
+    // so do not request a new goal
+    return Err(InnerNavigationError {
+        handle: None,
+        kind: InnerNavigationErrorKind::DuplicateOrOutdatedRequestError,
+    });
+}
+
+fn handle_existing_goal_result(
+    Blocking {
+        request: result, ..
+    }: Blocking<CheckExistingGoalResult>,
+) -> Result<CancelInnerNavigation, InnerNavigationRequest> {
+    match result {
+        CheckExistingGoalResult::ReplanAndCancel(cancel_request) => Ok(cancel_request),
+        CheckExistingGoalResult::NoExistingGoal(new_request) => Err(new_request),
+    }
 }
 
 #[derive(Clone, Debug, Component)]
@@ -550,12 +602,17 @@ fn log_inner_navigation_error(Blocking { request: err, .. }: Blocking<InnerNavig
 #[derive(Clone, Event)]
 pub struct InnerNavigationFeedback {
     pub agent: Entity,
+    pub safe_zone_id: SafeZoneId,
     pub feedback: NavigateToPose_Feedback,
 }
 
 impl InnerNavigationFeedback {
-    pub fn new(agent: Entity, feedback: NavigateToPose_Feedback) -> Self {
-        Self { agent, feedback }
+    pub fn new(agent: Entity, safe_zone_id: SafeZoneId, feedback: NavigateToPose_Feedback) -> Self {
+        Self {
+            agent,
+            safe_zone_id,
+            feedback,
+        }
     }
 }
 
@@ -576,9 +633,14 @@ fn async_monitor_ongoing_navigation(
             while let Some(event) = goal_client_stream.next().await {
                 match event {
                     GoalEvent::Feedback(feedback) => {
+                        let safe_zone_id = handle.request.safe_zone_id.clone();
                         // Publish feedback via observer triggers
                         channel.commands(move |cmds| {
-                            cmds.trigger(InnerNavigationFeedback::new(agent, feedback.clone()));
+                            cmds.trigger(InnerNavigationFeedback::new(
+                                agent,
+                                safe_zone_id.clone(),
+                                feedback.clone(),
+                            ));
                         });
                     }
                     GoalEvent::Status(s) => {
@@ -636,6 +698,7 @@ fn process_navigation_result(
     }: Blocking<InnerNavigationResult>,
     mut commands: Commands,
     mut cancelling_inner: Query<&mut CancellingInnerNavigation>,
+    inner_nav_clients: Query<&InnerNavigationClient>,
 ) -> Result<InnerNavigationRequest, InnerNavigationResult> {
     match result {
         Ok(_) => return Err(result),
@@ -646,6 +709,18 @@ fn process_navigation_result(
                 };
                 let target = &handle.request;
                 let target_pose = target.target_pose.clone();
+
+                if let Ok(inner_nav_client) = inner_nav_clients.get(target.agent) {
+                    if let Some(active_goal) = inner_nav_client.goal() {
+                        if active_goal.id() != &target.safe_zone_id {
+                            debug!(
+                                "[{:?}] Aborted goal is stale, not retrying",
+                                target.agent.index()
+                            );
+                            return Err(result);
+                        }
+                    }
+                }
 
                 debug!("[{:?}] Goal aborted. Retrying", target.agent.index());
                 return Ok(InnerNavigationRequest {
@@ -691,7 +766,21 @@ fn cleanup_goal_client(
 
     // Clear inner goal client
     if let Ok(mut inner_nav_client) = inner_nav_clients.get_mut(handle.request.agent) {
-        inner_nav_client.reset_goal();
+        let is_current = if let Some(active_goal) = inner_nav_client.goal() {
+            active_goal.id() == &handle.request.safe_zone_id
+        } else {
+            false
+        };
+        if is_current {
+            inner_nav_client.reset_goal();
+        } else {
+            warn!(
+                "[{:?}] Found an incompatible SafeZoneId {:?} while attempting
+                to cleanup goal client!",
+                handle.request.agent.index(),
+                handle.request.safe_zone_id,
+            );
+        }
     } else {
         warn!(
             "[{:?}] InnerNavigationClient not found!",

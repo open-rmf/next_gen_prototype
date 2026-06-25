@@ -343,12 +343,17 @@ pub struct NavigationCompleted {
 fn on_inner_navigation_feedback(
     trigger: Trigger<InnerNavigationFeedback>,
     mut inner_nav_feedback: EventWriter<InnerNavigationFeedback>,
+    inner_nav_clients: Query<&InnerNavigationClient>,
 ) {
     let event = trigger.event();
-    inner_nav_feedback.write(InnerNavigationFeedback::new(
-        event.agent,
-        event.feedback.clone(),
-    ));
+    if let Ok(inner_nav_client) = inner_nav_clients.get(event.agent) {
+        if let Some(active_goal) = inner_nav_client.goal() {
+            if active_goal.id() != &event.safe_zone_id {
+                return;
+            }
+        }
+    }
+    inner_nav_feedback.write(event.clone());
 }
 
 fn monitor_inner_navigation_feedback(
