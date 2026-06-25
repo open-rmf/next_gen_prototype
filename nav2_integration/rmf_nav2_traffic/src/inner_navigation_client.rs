@@ -309,6 +309,9 @@ impl InnerNavigationServices {
     }
 }
 
+/// This continuous service listens for incoming InnerNavigationTarget via
+/// events, converts them into PoseStamped, and streams them out as navigation
+/// requests to downstream nodes.
 fn await_new_requests(
     srv: ContinuousService<(), (), StreamOf<InnerNavigationRequest>>,
     mut orders: ContinuousQuery<(), (), StreamOf<InnerNavigationRequest>>,
@@ -367,6 +370,9 @@ fn await_new_requests(
     }
 }
 
+/// This continuous services listens for external navigation cancellation requests
+/// and creates corresponding requests to cancel the relevant inner navigation
+/// action.
 fn await_external_cancellation(
     srv: ContinuousService<(), (), StreamOf<CancelInnerNavigation>>,
     mut orders: ContinuousQuery<(), (), StreamOf<CancelInnerNavigation>>,
@@ -463,6 +469,8 @@ fn check_existing_goal(
     });
 }
 
+/// Routes CheckExistingGoalResult members into Result to facilitate workflow
+/// branching
 fn handle_existing_goal_result(
     Blocking {
         request: result, ..
@@ -479,6 +487,9 @@ pub struct CancellingInnerNavigation {
     pub success: bool,
 }
 
+/// Executes the cancellation of an ongoing inner navigation goal asynchronously
+/// Persists until the cancellation is accepted. If there is a pending new request,
+/// output the new request to downstream nodes via Ok, otherwise discard via Err.
 fn async_cancel_goal(
     Async { request, .. }: Async<CancelInnerNavigation>,
     mut commands: Commands,
@@ -500,15 +511,19 @@ fn async_cancel_goal(
                 );
                 cancellation = request.cancel_client.cancellation.cancel().await;
             }
-            info!(
-                "[{}] Cancellation request accepted for inner navigation, requesting new goal",
-                request.agent.index()
-            );
             if let Some(new_request) = request.new_request {
+                info!(
+                    "[{}] Cancellation request accepted for inner navigation, requesting new goal",
+                    request.agent.index()
+                );
                 // If this a replan attempt with a new navigation request,
                 // regardless of whether cancellation was successful, mark as Ok()
                 return Ok(new_request);
             } else {
+                info!(
+                    "[{}] Cancellation request accepted for inner navigation",
+                    request.agent.index()
+                );
                 return Err(InnerNavigationError {
                     handle: None,
                     kind: InnerNavigationErrorKind::CancelGoalError,
@@ -523,6 +538,8 @@ fn async_cancel_goal(
         })
 }
 
+/// Submits a new NavigateToPose goal asynchronously to the Nav2 action server
+/// and returns a handle containing the goal client.
 fn async_request_new_goal(
     Async { request, .. }: Async<InnerNavigationRequest>,
     mut inner_nav_clients: Query<&mut InnerNavigationClient>,
@@ -575,6 +592,7 @@ fn async_request_new_goal(
         .right_future()
 }
 
+/// Updates the stored goal client with the newly accepted navigation goal.
 fn update_goal_client(
     Blocking {
         request: handle, ..
@@ -595,6 +613,7 @@ fn update_goal_client(
     handle
 }
 
+/// Logs any errors that occur during the inner navigation workflow.
 fn log_inner_navigation_error(Blocking { request: err, .. }: Blocking<InnerNavigationError>) {
     error!("InnerNavigationError occurred: {}", err.kind);
 }
@@ -616,6 +635,10 @@ impl InnerNavigationFeedback {
     }
 }
 
+/// Monitors the feedback of an ongoing navigation goal, and publish it back
+/// to the external navigation request. When the goal is completed (success,
+/// aborted or cancelled), output the navigation result to downstream nodes for
+/// processing.
 fn async_monitor_ongoing_navigation(
     Async {
         request: handle,
@@ -690,8 +713,10 @@ fn async_monitor_ongoing_navigation(
         })
 }
 
-// If navigation was aborted, retry
-// If navigation was cancelled (not cancelling), publish cancellation to outer workflow
+/// Evaluates the outcome of a completed or failed navigation goal.
+/// If a goal is aborted (and is not stale), it retries the goal.
+/// If a goal is cancelled via external request, it marks the cancellation as
+/// successful and publish to external navigation workflow.
 fn process_navigation_result(
     Blocking {
         request: result, ..
@@ -748,6 +773,9 @@ fn process_navigation_result(
     return Err(result);
 }
 
+/// Clears existing goal clients for this agent after verifying that the
+/// completed goal matches the currently tracked active goal, to avoid
+/// accidentally clearing a newly requested goal.
 fn cleanup_goal_client(
     Blocking {
         request: result, ..

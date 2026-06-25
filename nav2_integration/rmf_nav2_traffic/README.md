@@ -17,10 +17,13 @@ graph TD
     AwaitExtCancel -->|stream| CancelGoal[Cancel Goal]
     AwaitReq -->|stream| CheckGoal[Check Goal]
     
-    CheckGoal -->|Ok| CancelGoal
+    CheckGoal -->|Ok| HandleExisting[Handle Existing Goal Result]
+    CheckGoal -->|Err| Drop[Drop Outdated Request]
+    
+    HandleExisting -->|Ok| CancelGoal
     CancelGoal -->|Ok| RequestGoal[Request Goal]
     
-    CheckGoal -->|Err| RequestGoal
+    HandleExisting -->|Err| RequestGoal
     
     RequestGoal -->|Ok| UpdateGoal[Update Goal Client]
     UpdateGoal --> MonitorGoal[Monitor Navigation]
@@ -39,7 +42,8 @@ graph TD
 
 - **`await_new_requests`**: A continuous service that listens for `InnerNavigationTarget` events and streams `InnerNavigationRequest` objects.
 - **`await_external_cancellation`**: A continuous service that listens for `CancelInnerForAgent` events and streams cancellation requests.
-- **`check_existing_goal`**: Checks if the agent already has an active goal. If so, it proceeds to cancel it; otherwise, it requests a new goal.
+- **`check_existing_goal`**: Checks if the agent already has an active goal. If the incoming request is outdated/duplicate, it returns an error and gets dropped. Otherwise it returns ok.
+- **`handle_existing_goal_result`**: Routes the valid checked result into either a cancellation of the current goal or a direct request for a new goal.
 - **`async_cancel_goal`**: An asynchronous service that cancels the existing Nav2 goal.
 - **`async_request_new_goal`**: An asynchronous service that sends a new `NavigateToPose` goal to Nav2.
 - **`update_goal_client`**: Updates the `InnerNavigationClient` component with the new goal handle.

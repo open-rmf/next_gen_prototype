@@ -356,6 +356,8 @@ fn on_inner_navigation_feedback(
     inner_nav_feedback.write(event.clone());
 }
 
+/// This continuous service listens for InnerNavigationFeedback via events and
+/// re-publishes them as feedback for the external navigation action.
 fn monitor_inner_navigation_feedback(
     srv: ContinuousService<NavigationRequest, (), StreamOf<InnerNavigationFeedback>>,
     mut orders: ContinuousQuery<NavigationRequest, (), StreamOf<InnerNavigationFeedback>>,
@@ -377,6 +379,9 @@ fn monitor_inner_navigation_feedback(
     }
 }
 
+/// Monitors the state of the inner navigation clients to determine if a requested navigation
+/// goal is completed. It handles completion conditions (like reaching the destination) and
+/// propagates external cancellation requests downstream.
 fn monitor_inner_navigation_clients(
     srv: ContinuousService<NavigationRequest, (), StreamOf<NavigationRequest>>,
     mut orders: ContinuousQuery<NavigationRequest, (), StreamOf<NavigationRequest>>,
@@ -438,6 +443,7 @@ fn monitor_inner_navigation_clients(
     });
 }
 
+/// Forwards the inner navigation feedback to the outer navigation request tracking channels.
 fn publish_navigation_feedback(
     Blocking {
         request: (_, key),
