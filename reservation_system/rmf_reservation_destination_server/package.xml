@@ -11,7 +11,7 @@
 
   <depend>rclrs</depend>
   <depend>rmf_prototype_msgs</depend>
-  <depend>rmf_reservation_msgs</depend>
+  <depend>rmf_next_gen_reservation_msgs</depend>
   <depend>rmf_participant_discovery</depend>
   <depend>unique_identifier_msgs</depend>
 

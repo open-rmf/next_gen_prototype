@@ -18,11 +18,13 @@ mod reservation;
 use config::ReservationConfig;
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use reservation::{Outcome, ReservationState};
+use ros_env::rmf_next_gen_reservation_msgs::msg::{
+    NamedRegion, ReservationConfig as ReservationConfigMsg,
+};
 use ros_env::rmf_prototype_msgs::msg::{
     Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, Region,
     TargetRegion,
 };
-use ros_env::rmf_reservation_msgs::msg::{NamedRegion, ReservationConfig as ReservationConfigMsg};
 use ros_env::unique_identifier_msgs::msg::UUID;
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -40,7 +40,7 @@ from rmf_prototype_msgs.msg import (
     Region,
     TargetRegion,
 )
-from rmf_reservation_msgs.msg import ReservationConfig
+from rmf_next_gen_reservation_msgs.msg import ReservationConfig
 
 
 # Global node reference for the HTTP request handler to access
