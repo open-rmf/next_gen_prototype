@@ -1,0 +1,50 @@
+[workspace]
+name = "next-gen-prototype"
+version = "0.1.0"
+description = "Next-Generation RMF Prototype"
+channels = ["https://prefix.dev/robostack-jazzy", "conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.11"
+cmake = "*"
+ninja = "*"
+gcc_linux-64 = "*"
+gxx_linux-64 = "*"
+make = "*"
+pkg-config = "*"
+openssl = "*"
+libclang = "*"
+rust = "*"
+git = "*"
+ros-jazzy-ros-base = "*"
+ros-jazzy-unique-identifier-msgs = "*"
+ros-jazzy-example-interfaces = "*"
+ros-jazzy-test-msgs = "*"
+ros-jazzy-nav-msgs = "*"
+ros-jazzy-nav2-msgs = "*"
+ros-jazzy-geometry-msgs = "*"
+ros-jazzy-std-msgs = "*"
+ros-jazzy-ament-cmake = "*"
+ros-jazzy-rosidl-default-generators = "*"
+ros-jazzy-builtin-interfaces = "*"
+ros-jazzy-rosidl-default-runtime = "*"
+ros-jazzy-ament-lint-common = "*"
+ros-jazzy-rclpy = "*"
+ros-jazzy-launch-testing = "*"
+ros-jazzy-launch-testing-ros = "*"
+pytest = "<8"
+
+[pypi-dependencies]
+colcon-common-extensions = "*"
+colcon-cargo = "*"
+colcon-ros-cargo = "*"
+
+[tasks]
+# Install cargo-ament-build into the pixi environment's bin folder
+setup-cargo = "test -f $CONDA_PREFIX/bin/cargo-ament-build || cargo install cargo-ament-build --root $CONDA_PREFIX"
+# Build the workspace using colcon
+build = { cmd = "colcon build", depends-on = ["setup-cargo"], env = { LIBCLANG_PATH = "$CONDA_PREFIX/lib" } }
+# Run tests
+test = { cmd = "colcon test --packages-select rmf_path_server_test --python-testing pytest --event-handlers console_direct+", depends-on = ["build"], env = { LIBCLANG_PATH = "$CONDA_PREFIX/lib" } }
+
