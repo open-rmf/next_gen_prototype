@@ -200,10 +200,6 @@ def generate_launch_description():
     ld.add_action(declare_rviz_config_file_cmd)
     ld.add_action(declare_use_robot_state_pub_cmd)
 
-    #ld.add_action(Node(
-    #                  package='spatio_temporal_partition_server',
-    #                  executable='server'
-    #              ));
     # initial localization node
     for robot_name in robots_list:
         init_pose = robots_list[robot_name]
@@ -214,16 +210,6 @@ def generate_launch_description():
                       arguments=[str(init_pose['x']), str(init_pose['y']), str(init_pose['yaw'])],
                       namespace=namespace
                   ))
-        # ld.add_action(Node(
-        #                   package="demo_world",
-        #                   executable="robot_client",
-        #                   namespace=namespace
-        #               ))
-        ld.add_action(Node(
-                          package="demo_world",
-                          executable="path_vis",
-                          namespace=namespace
-                      ))
 
     # Add the actions to start gazebo, robots and simulations
     ld.add_action(world_sdf_xacro)

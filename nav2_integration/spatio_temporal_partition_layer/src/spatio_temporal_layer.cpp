@@ -159,69 +159,6 @@ size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* use
     return size * nmemb;
 }
 
-std::string get_base_uri()
-{
-  const char* env = std::getenv("SP_SERVER_BASE");
-
-  if (env == nullptr) {
-    return "http://127.0.0.1:3000";
-  }
-
-  return env;
-}
-
-// Function to perform a CURL POST request with a JSON body
-std::string curl_post_request(const std::string& url, const json& jsonData) {
-    CURL* curl;
-    CURLcode res;
-    std::string readBuffer;
-    struct curl_slist* headers = NULL;
-
-    std::string jsonStr = jsonData.dump();
-
-    curl = curl_easy_init();
-    if (curl) {
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonStr.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        res = curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
-        curl_slist_free_all(headers);
-
-        if (res != CURLE_OK) {
-            fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
-        }
-    }
-    return readBuffer;
-}
-
-std::optional<json> retrieve_currently_allocated_space(const std::string base_server, float x, float y, std::size_t agent_id)
-{
-    
-    std::string url = base_server + "/update_pose";
-    
-    // Create a JSON object to send
-    json postData;
-    postData["agent_id"] = agent_id;
-    postData["x"] = x;
-    postData["y"] = y;
-    postData["angle"] = 0.0;
-
-    std::string response = curl_post_request(url, postData);
-
-    if (!response.empty()) {
-        return json::parse(response);
-    } else {
-        std::cout << "Response from " << url << " was empty." << std::endl;
-        return std::nullopt;
-    }
-}
-
-
 // The method is called when footprint was changed.
 // Here it just resets need_recalculation_ variable.
 void

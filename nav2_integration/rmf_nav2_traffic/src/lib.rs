@@ -46,9 +46,6 @@ pub use navigation_server::*;
 pub mod safe_zone;
 pub use safe_zone::*;
 
-pub mod testing;
-pub use testing::*;
-
 #[derive(Default)]
 pub struct Nav2TrafficPlugin {}
 
@@ -151,7 +148,9 @@ impl<T: MessageIDL + Debug> RosPublisher<T> {
     }
 
     pub fn new_transient_local(node: &Arc<NodeState>, topic: String) -> Self {
-        let publisher = node.create_publisher(topic.reliable().transient_local().keep_all()).unwrap();
+        let publisher = node
+            .create_publisher(topic.reliable().transient_local().keep_all())
+            .unwrap();
 
         Self { publisher }
     }
