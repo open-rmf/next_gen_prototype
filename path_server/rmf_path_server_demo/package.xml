@@ -10,13 +10,17 @@
   <buildtool_depend>ament_python</buildtool_depend>
 
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
   <exec_depend>rmf_prototype_msgs</exec_depend>
+  <exec_depend>rmf_reservation_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>rosbridge_server</exec_depend>
   <exec_depend>rmf_mock_robot_sim</exec_depend>
   <exec_depend>rmf_path_server</exec_depend>
   <exec_depend>rmf_plan_executor</exec_depend>
+  <exec_depend>rmf_simple_destination_server</exec_depend>
+  <exec_depend>rmf_reservation_destination_server</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>
