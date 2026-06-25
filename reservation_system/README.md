@@ -1,4 +1,4 @@
-# Destination server implementations
+# Destination servers
 
 This directory contains two interchangeable destination servers. Both listen
 for `DestinationGoal` messages on `<robot>/destination/goal` and publish the
@@ -37,27 +37,11 @@ ros2 run rmf_reservation_destination_server \
   --ros-args -p config_file:=/path/to/map.site.json
 ```
 
-## Selecting an implementation in the demo
+## Demo usage
 
-The path server demo defaults to the reservation implementation:
-
-```bash
-ros2 launch rmf_path_server_demo demo_destination_server.launch.py
-```
-
-Select the stateless implementation with:
-
-```bash
-ros2 launch rmf_path_server_demo demo_destination_server.launch.py \
-  destination_server:=simple
-```
-
-Select the reservation implementation and provide a map with:
-
-```bash
-ros2 launch rmf_path_server_demo demo_destination_server.launch.py \
-  destination_server:=reservation \
-  config_file:=/path/to/map.site.json
-```
+The path server demo can launch either destination server with
+`destination_server:=simple` or `destination_server:=reservation`. See
+[`rmf_path_server_demo`](../path_server/rmf_path_server_demo/README.md) for
+the demo workflow and launch examples.
 
 Only one destination server should run for a topic namespace at a time.
