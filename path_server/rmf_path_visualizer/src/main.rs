@@ -1,17 +1,17 @@
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
-use rmf_prototype_msgs::msg::{Plan, SafeZone};
-use visualization_msgs::msg::{Marker, MarkerArray};
-use geometry_msgs::msg::Point;
+use ros_env::geometry_msgs::msg::Point;
+use ros_env::rmf_prototype_msgs::msg::{Plan, SafeZone};
+use ros_env::visualization_msgs::msg::{Marker, MarkerArray};
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = Context::default_from_env()?;
     let mut executor = context.create_basic_executor();
     let node = Arc::new(executor.create_node("rmf_path_visualizer")?);
-    
+
     let args: Vec<String> = std::env::args().collect();
     let mut robot_name = "robot0".to_string();
-    
+
     // Simple arg parsing to get robot_name
     for arg in args.iter().skip(1) {
         if !arg.starts_with("--ros-args") && !arg.starts_with("-") {
@@ -24,8 +24,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let safe_zone_topic = format!("{}/plan/safe_zone", robot_name);
     let marker_topic = format!("{}/path_markers", robot_name);
 
-    let publisher = node.create_publisher::<MarkerArray>(marker_topic.as_str().transient_local().reliable())?;
-    
+    let publisher =
+        node.create_publisher::<MarkerArray>(marker_topic.as_str().transient_local().reliable())?;
+
     let publisher_plan = publisher.clone();
     let robot_name_clone = robot_name.clone();
 
@@ -39,15 +40,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             marker.header.stamp = msg.start_time;
             marker.ns = robot_name_clone.clone();
             marker.id = 0;
-            marker.type_ = visualization_msgs::msg::Marker::LINE_STRIP as i32;
-            marker.action = visualization_msgs::msg::Marker::ADD as i32;
-            
+            marker.type_ = ros_env::visualization_msgs::msg::Marker::LINE_STRIP as i32;
+            marker.action = ros_env::visualization_msgs::msg::Marker::ADD as i32;
+
             // Set color (e.g., green)
             marker.color.r = 0.0;
             marker.color.g = 1.0;
             marker.color.b = 0.0;
             marker.color.a = 1.0;
-            
+
             // Set line width
             marker.scale.x = 0.05;
 
@@ -77,21 +78,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if region.points.len() >= 2 {
                 let x = region.points[0] as f64;
                 let y = region.points[1] as f64;
-                
+
                 let mut marker_array = MarkerArray { markers: vec![] };
                 let mut marker = Marker::default();
                 marker.header.frame_id = "map".to_string();
                 marker.ns = format!("{}_safe_zone", robot_name_clone2);
                 marker.id = 1;
-                marker.type_ = visualization_msgs::msg::Marker::SPHERE as i32;
-                marker.action = visualization_msgs::msg::Marker::ADD as i32;
-                
+                marker.type_ = ros_env::visualization_msgs::msg::Marker::SPHERE as i32;
+                marker.action = ros_env::visualization_msgs::msg::Marker::ADD as i32;
+
                 // Set color (e.g., red dot)
                 marker.color.r = 1.0;
                 marker.color.g = 0.0;
                 marker.color.b = 0.0;
                 marker.color.a = 1.0;
-                
+
                 // Set scale (size of the dot)
                 marker.scale.x = 0.25;
                 marker.scale.y = 0.25;
@@ -100,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 marker.pose.position.x = x;
                 marker.pose.position.y = y;
                 marker.pose.position.z = 0.0;
-                
+
                 marker.pose.orientation.w = 1.0; // valid quaternion
 
                 marker_array.markers.push(marker);
@@ -109,7 +110,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    rclrs::log!(node.logger(), "Starting rmf_path_visualizer for robot: {}", robot_name);
+    rclrs::log!(
+        node.logger(),
+        "Starting rmf_path_visualizer for robot: {}",
+        robot_name
+    );
     executor.spin(SpinOptions::default());
     Ok(())
 }
