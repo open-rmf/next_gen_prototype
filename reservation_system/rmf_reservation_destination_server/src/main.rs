@@ -587,10 +587,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     robot_id
                 );
 
-                let goal_publisher = match server
-                    .node
-                    .create_publisher::<Destination>(&(robot_id.to_string() + "/destination"))
-                {
+                let goal_publisher = match server.node.create_publisher::<Destination>(
+                    (&(robot_id.to_string() + "/destination"))
+                        .transient_local()
+                        .reliable(),
+                ) {
                     Ok(pub_) => pub_,
                     Err(err) => {
                         rclrs::log_error!(
@@ -604,7 +605,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let error_publisher = match server.node.create_publisher::<DestinationError>(
-                    &(robot_id.to_string() + "/destination/error"),
+                    (&(robot_id.to_string() + "/destination/error"))
+                        .transient_local()
+                        .reliable(),
                 ) {
                     Ok(pub_) => pub_,
                     Err(err) => {
@@ -633,7 +636,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let subscription = match server
                     .destinations_worker
                     .create_subscription::<DestinationGoal, _>(
-                        &(robot_id.to_string() + "/destination/goal"),
+                        (&(robot_id.to_string() + "/destination/goal"))
+                            .transient_local()
+                            .reliable(),
                         move |dest_server: &mut DestinationsServer, goal_msg: DestinationGoal| {
                             dest_server.handle_goal(&robot_id_clone, goal_msg);
                         },

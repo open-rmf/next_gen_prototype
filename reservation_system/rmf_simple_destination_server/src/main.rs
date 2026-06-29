@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rclrs::{Context, CreateBasicExecutor, SpinOptions};
+use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use ros_env::rmf_prototype_msgs::msg::{
     Destination, DestinationConstraints, DestinationError, DestinationGoal, Error,
 };
@@ -152,10 +152,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 robot_id
             );
 
-            let destination = match server
-                .node
-                .create_publisher::<Destination>(&(robot_id.to_string() + "/destination"))
-            {
+            let destination = match server.node.create_publisher::<Destination>(
+                (&(robot_id.to_string() + "/destination"))
+                    .transient_local()
+                    .reliable(),
+            ) {
                 Ok(publisher) => publisher,
                 Err(error) => {
                     rclrs::log_error!(
@@ -168,7 +169,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let error = match server.node.create_publisher::<DestinationError>(
-                &(robot_id.to_string() + "/destination/error"),
+                (&(robot_id.to_string() + "/destination/error"))
+                    .transient_local()
+                    .reliable(),
             ) {
                 Ok(publisher) => publisher,
                 Err(error) => {
@@ -193,7 +196,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let subscription = match server
                 .destinations_worker
                 .create_subscription::<DestinationGoal, _>(
-                    &(robot_id.to_string() + "/destination/goal"),
+                    (&(robot_id.to_string() + "/destination/goal"))
+                        .transient_local()
+                        .reliable(),
                     move |destinations: &mut DestinationsServer, goal: DestinationGoal| {
                         destinations.handle_goal(&callback_id, goal);
                     },
