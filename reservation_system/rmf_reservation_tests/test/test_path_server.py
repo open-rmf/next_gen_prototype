@@ -21,6 +21,7 @@ import launch_testing
 from nav_msgs.msg import Odometry
 import pytest
 import rclpy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
@@ -94,22 +95,32 @@ class TestPathServer(unittest.TestCase):
             10
         )
 
+        input_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         dest_pub = self.node.create_publisher(
             Destination,
             f'{robot_name}/destination',
-            10
+            qos_profile=input_qos
         )
 
         odom_pub = self.node.create_publisher(
             Odometry,
             f'{robot_name}/odom',
-            10
+            qos_profile=input_qos
         )
 
+        discovery_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         discovery_pub = self.node.create_publisher(
             ParticipantList,
             '/destination/discovery',
-            10
+            qos_profile=discovery_qos
         )
 
         # Wait for discovery and server to be ready

@@ -24,6 +24,7 @@ import launch_ros
 import launch_testing
 import pytest
 import rclpy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
@@ -67,6 +68,17 @@ class TestQueue(unittest.TestCase):
         rclpy.init()
         cls.node = rclpy.create_node('test_queue_node')
 
+        cls.goal_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        discovery_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+
         cls.destinations = {name: [] for name in ROBOT_NAMES}
         cls.goal_pubs = {}
         for name in ROBOT_NAMES:
@@ -76,12 +88,9 @@ class TestQueue(unittest.TestCase):
                 lambda msg, n=name: cls.destinations[n].append(msg),
                 10,
             )
-            cls.goal_pubs[name] = cls.node.create_publisher(
-                DestinationGoal, f'{name}/destination/goal', 10
-            )
 
         cls.discovery_pub = cls.node.create_publisher(
-            ParticipantList, '/destination/discovery', 10
+            ParticipantList, '/destination/discovery', qos_profile=discovery_qos
         )
 
     @classmethod
@@ -92,6 +101,11 @@ class TestQueue(unittest.TestCase):
     def setUp(self):
         # Reset the shared server so tests are order-independent: deregister
         # every robot, re-register them, and drop any leftover messages.
+
+        # Destroy any goal publishers left over from a previous test before,
+        # otherwise the server's TRANSIENT_LOCAL goal subscription would
+        # replay the retained goals from that publisher.
+        self._destroy_goal_pubs()
 
         self.assertTrue(
             self._drive_discovery_until(
@@ -105,8 +119,22 @@ class TestQueue(unittest.TestCase):
             ),
             'server never matched all per-robot topics',
         )
+
+        for name in ROBOT_NAMES:
+            self.goal_pubs[name] = self.node.create_publisher(
+                DestinationGoal, f'{name}/destination/goal', qos_profile=self.goal_qos
+            )
+
         for buffer in self.destinations.values():
             buffer.clear()
+
+    def tearDown(self):
+        self._destroy_goal_pubs()
+
+    def _destroy_goal_pubs(self):
+        for pub in self.goal_pubs.values():
+            self.node.destroy_publisher(pub)
+        self.goal_pubs.clear()
 
     @classmethod
     def _robot_matched(cls, name):

@@ -27,6 +27,7 @@ import launch_ros
 import launch_testing
 import pytest
 import rclpy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
@@ -76,6 +77,17 @@ class TestSafeSets(unittest.TestCase):
         rclpy.init()
         cls.node = rclpy.create_node('test_safe_sets_node')
 
+        goal_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        discovery_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+
         # Per-robot message buffers and publishers.
         cls.destinations = {name: [] for name in ROBOT_NAMES}
         cls.errors = {name: [] for name in ROBOT_NAMES}
@@ -95,11 +107,11 @@ class TestSafeSets(unittest.TestCase):
                 10,
             )
             cls.goal_pubs[name] = cls.node.create_publisher(
-                DestinationGoal, f'{name}/destination/goal', 10
+                DestinationGoal, f'{name}/destination/goal', qos_profile=goal_qos
             )
 
         cls.discovery_pub = cls.node.create_publisher(
-            ParticipantList, '/destination/discovery', 10
+            ParticipantList, '/destination/discovery', qos_profile=discovery_qos
         )
 
         # Advertise every robot in a single discovery message and keep

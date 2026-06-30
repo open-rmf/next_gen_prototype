@@ -20,6 +20,7 @@ import launch_ros
 import launch_testing
 import pytest
 import rclpy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
@@ -98,17 +99,27 @@ class TestOverlap(unittest.TestCase):
             10,
         )
 
+        goal_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         pub1 = self.node.create_publisher(
-            DestinationGoal, f'{r1_name}/destination/goal', 10
+            DestinationGoal, f'{r1_name}/destination/goal', qos_profile=goal_qos
         )
         pub2 = self.node.create_publisher(
-            DestinationGoal, f'{r2_name}/destination/goal', 10
+            DestinationGoal, f'{r2_name}/destination/goal', qos_profile=goal_qos
         )
 
+        discovery_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         discovery_pub = self.node.create_publisher(
             ParticipantList,
             '/destination/discovery',
-            10
+            qos_profile=discovery_qos
         )
 
         time.sleep(2.0)
