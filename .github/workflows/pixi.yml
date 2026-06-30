@@ -21,7 +21,13 @@ jobs:
           run-install: true
           cache-key: pixi-env-cache
 
+      - name: Dump Pixi Env
+        run: |
+          pixi run env
+        shell: bash
+
       - name: Run Pixi Test Suite
         run: |
           pixi run test
         shell: bash
+
