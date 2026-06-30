@@ -43,8 +43,11 @@ colcon-ros-cargo = "*"
 [tasks]
 # Install cargo-ament-build into the pixi environment's bin folder
 setup-cargo = "test -f $CONDA_PREFIX/bin/cargo-ament-build || cargo install cargo-ament-build --root $CONDA_PREFIX"
-# Build the workspace using colcon
-build = { cmd = "colcon build", depends-on = ["setup-cargo"], env = { LIBCLANG_PATH = "$CONDA_PREFIX/lib" } }
+# Build messages first
+build-msgs = { cmd = "colcon build --packages-select rmf_prototype_msgs", depends-on = ["setup-cargo"], env = { LIBCLANG_PATH = "$CONDA_PREFIX/lib" } }
+# Build the workspace using colcon (skipping messages which were built in build-msgs)
+build = { cmd = "colcon build --packages-skip rmf_prototype_msgs", depends-on = ["build-msgs"], env = { LIBCLANG_PATH = "$CONDA_PREFIX/lib", AMENT_PREFIX_PATH = "$PIXI_PROJECT_ROOT/install/rmf_prototype_msgs:$CONDA_PREFIX" } }
+
 # Run tests
 test = { cmd = "colcon test --packages-select rmf_path_server_test --python-testing pytest --event-handlers console_direct+", depends-on = ["build"], env = { LIBCLANG_PATH = "$CONDA_PREFIX/lib" } }
 
