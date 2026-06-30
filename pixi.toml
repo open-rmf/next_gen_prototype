@@ -49,5 +49,7 @@ build-msgs = { cmd = "colcon build --packages-select rmf_prototype_msgs", depend
 build = { cmd = "colcon build --packages-skip rmf_prototype_msgs", depends-on = ["build-msgs"], env = { LIBCLANG_PATH = "$CONDA_PREFIX/lib", AMENT_PREFIX_PATH = "$PIXI_PROJECT_ROOT/install/rmf_prototype_msgs:$CONDA_PREFIX" } }
 
 # Run tests
-test = { cmd = "source install/setup.bash && colcon test --packages-select rmf_path_server_test --python-testing pytest --event-handlers console_direct+", depends-on = ["build"], env = { LIBCLANG_PATH = "$CONDA_PREFIX/lib" } }
+test = { cmd = "colcon test --packages-select rmf_path_server_test --python-testing pytest --event-handlers console_direct+", depends-on = ["build"], env = { LIBCLANG_PATH = "$CONDA_PREFIX/lib" } }
 
+[activation]
+scripts = ["install/setup.sh"]
