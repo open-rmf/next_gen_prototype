@@ -33,6 +33,6 @@ jobs:
         run: |
           source /opt/ros/jazzy/setup.bash
           source install/setup.bash
-          colcon test --packages-select rmf_path_server_test --event-handlers console_direct+
+          colcon test --packages-select rmf_path_server_test rmf_reservation_tests --event-handlers console_direct+
           colcon test-result --all
         shell: bash

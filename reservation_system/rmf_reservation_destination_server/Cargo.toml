@@ -1,0 +1,12 @@
+[package]
+name = "rmf_reservation_destination_server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rclrs = "*"
+ros-env = "0.2.0"
+rmf_participant_discovery = { path = "../../rmf_participant_discovery" }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+rmf_site_format = { git = "https://github.com/open-rmf/rmf_site", rev = "2f661c2e917bf0093496e1945d50cf25a3c872da", default-features = false }

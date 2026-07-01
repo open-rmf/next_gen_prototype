@@ -21,9 +21,11 @@ let config = {
   use_destination_server: false
 };
 let robots = [];
+let reservationConfig = null;
 let selectedRobotName = null;
 let interactionMode = 'normal'; // 'normal', 'add-robot', 'set-goal'
 let systemMode = 'setup'; // 'setup', 'live'
+let pendingGoalReset = false;
 let eventSource = null;
 let mouseX = 0;
 let mouseY = 0;
@@ -31,9 +33,16 @@ let mouseY = 0;
 // Canvas config
 const canvas = document.getElementById('grid-canvas');
 const ctx = canvas.getContext('2d');
-const scale = 25; // pixels per meter
-const centerX = canvas.width / 2;
-const centerY = canvas.height / 2;
+// View transform: `scale` px per meter, and (centerX, centerY) the pixel
+// location of world origin (0, 0). These start at a sensible default and are
+// recomputed by fitViewToConfig() so a loaded reservation config fills the view.
+const DEFAULT_SCALE = 25; // pixels per meter
+const SNAP_M = 1; // robot placement resolution, in meters (see toGrid)
+let scale = DEFAULT_SCALE;
+let centerX = canvas.width / 2;
+let centerY = canvas.height / 2;
+const REGION_HINT_POINT = 1;
+const REGION_HINT_AXIS_ALIGNED_RECTANGLE = 2;
 
 // Color palette for robots
 const robotColors = [
@@ -74,7 +83,11 @@ function initSSE() {
   eventSource.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
-      if (msg.type === 'odom') {
+      if (msg.type === 'reservation_config') {
+        reservationConfig = msg;
+        fitViewToConfig();
+        console.log(`Received reservation config: ${msg.safe_sets.length} safe set(s), ${msg.parking_spots.length} parking spot(s).`);
+      } else if (msg.type === 'odom') {
         const r = robots.find(robot => robot.name === msg.name);
         if (r) {
           r.current_x = msg.x;
@@ -109,6 +122,19 @@ function initSSE() {
           r.active_goal_y = msg.y;
           r.goal_x = msg.x;
           r.goal_y = msg.y;
+          // A destination was granted; clear any prior rejection.
+          if (r.status === 'Unreachable') r.status = 'Planning';
+          r.errorMessage = null;
+          updateRobotListUI();
+        }
+      } else if (msg.type === 'destination_error') {
+        const r = robots.find(robot => robot.name === msg.name);
+        if (r) {
+          // The destination server rejected this robot's goal (e.g. outside the
+          // safe sets), so it would otherwise sit in "Planning" forever.
+          r.status = 'Unreachable';
+          r.errorMessage = msg.message;
+          console.warn(`Destination rejected for ${msg.name}: ${msg.message}`);
           updateRobotListUI();
         }
       }
@@ -121,8 +147,8 @@ function initSSE() {
 // Coordinate mapping helpers
 function toGrid(px, py) {
   return {
-    x: Math.round((px - centerX) / scale),
-    y: Math.round((centerY - py) / scale)
+    x: Math.round((px - centerX) / scale / SNAP_M) * SNAP_M,
+    y: Math.round((centerY - py) / scale / SNAP_M) * SNAP_M
   };
 }
 
@@ -131,6 +157,61 @@ function toPixel(gx, gy) {
     x: centerX + gx * scale,
     y: centerY - gy * scale
   };
+}
+
+// Pick a nice grid spacing (1/2/5 x 10^n meters) so the visible range is
+// divided into roughly `divisions` cells regardless of zoom level.
+function niceGridStep(metersVisible, divisions = 12) {
+  if (!(metersVisible > 0)) return 1;
+  const target = metersVisible / divisions;
+  const pow = Math.pow(10, Math.floor(Math.log10(target)));
+  return ([1, 2, 5, 10].find(m => m * pow >= target) || 10) * pow;
+}
+
+// Collect the world-space bounding box of every safe set and parking spot.
+function reservationConfigBounds() {
+  if (!reservationConfig) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const regions = [
+    ...(reservationConfig.safe_sets || []),
+    ...(reservationConfig.parking_spots || [])
+  ];
+  for (const item of regions) {
+    const bounds = regionBounds(item.region);
+    if (!bounds) continue;
+    minX = Math.min(minX, bounds.minX);
+    minY = Math.min(minY, bounds.minY);
+    maxX = Math.max(maxX, bounds.maxX);
+    maxY = Math.max(maxY, bounds.maxY);
+  }
+  return Number.isFinite(minX) ? { minX, minY, maxX, maxY } : null;
+}
+
+// Rescale and recenter the view so the loaded reservation config fits the
+// canvas with a margin. Falls back to the default view when there is no config.
+function fitViewToConfig() {
+  const bounds = reservationConfigBounds();
+  if (!bounds) {
+    scale = DEFAULT_SCALE;
+    centerX = canvas.width / 2;
+    centerY = canvas.height / 2;
+    return;
+  }
+
+  const margin = 1.15; // ~15% padding around the config
+  const worldW = Math.max(bounds.maxX - bounds.minX, 1e-3);
+  const worldH = Math.max(bounds.maxY - bounds.minY, 1e-3);
+  const fitScale = Math.min(
+    canvas.width / (worldW * margin),
+    canvas.height / (worldH * margin)
+  );
+  // Cap zoom-in so a tiny config doesn't blow up to absurd magnification.
+  scale = Math.min(fitScale, 80);
+
+  const worldCenterX = (bounds.minX + bounds.maxX) / 2;
+  const worldCenterY = (bounds.minY + bounds.maxY) / 2;
+  centerX = canvas.width / 2 - worldCenterX * scale;
+  centerY = canvas.height / 2 + worldCenterY * scale;
 }
 
 // Helper to show instructions
@@ -211,9 +292,14 @@ function updateRobotListUI() {
     let statusClass = '';
     if (r.status === 'Moving') statusClass = 'moving';
     else if (r.status === 'Reached') statusClass = 'reached';
+    else if (r.status === 'Unreachable') statusClass = 'unreachable';
+
+    const errorRow = r.errorMessage
+      ? `<div class="robot-item-error"><i class="fa-solid fa-triangle-exclamation"></i> ${r.errorMessage}</div>`
+      : '';
 
     html += `
-      <div class="robot-item ${isSelected}" onclick="selectRobot('${r.name}')">
+      <div class="robot-item ${isSelected}" data-robot-name="${r.name}">
         <div class="robot-item-top">
           <span class="robot-item-name">
             <span class="robot-dot-color" style="background-color: ${r.color}; box-shadow: 0 0 6px ${r.color}"></span>
@@ -225,12 +311,21 @@ function updateRobotListUI() {
           <span><span class="coord-label">Pos:</span> (${r.current_x.toFixed(1)}, ${r.current_y.toFixed(1)})</span>
           <span><span class="coord-label">Goal:</span> ${goalStr}</span>
         </div>
+        ${errorRow}
       </div>
     `;
   });
 
   listDiv.innerHTML = html;
 }
+
+// Delegate selection because robot rows are redrawn as state changes.
+document.getElementById('robot-list').addEventListener('pointerdown', event => {
+  const item = event.target.closest('.robot-item');
+  if (!item) return;
+  event.preventDefault();
+  selectRobot(item.dataset.robotName);
+});
 
 function selectRobot(name) {
   if (selectedRobotName === name) {
@@ -242,9 +337,10 @@ function selectRobot(name) {
   }
   selectedRobotName = name;
   interactionMode = 'set-goal';
+  pendingGoalReset = systemMode === 'live' && config.use_destination_server;
   const verb = systemMode === 'live' ? 'NEW Goal' : 'Goal';
   if (config.use_destination_server) {
-    showInstruction(`Click on the grid to add alternative goals for ${name}. Click the robot name in the list again to finish.`);
+    showInstruction(`Click the grid to add alternative goals for ${name}. Use the robot list to switch, or select ${name} again in the list to finish.`);
   } else {
     showInstruction(`Click on the grid to place the ${verb} for ${name}.`);
   }
@@ -254,9 +350,12 @@ function selectRobot(name) {
 // Interactive canvas click/hover bindings
 canvas.addEventListener('mousemove', (e) => {
   const rect = canvas.getBoundingClientRect();
-  mouseX = e.clientX - rect.left;
-  mouseY = e.clientY - rect.top;
-  
+  // Map display coordinates to the canvas drawing buffer.
+  const sx = canvas.width / rect.width;
+  const sy = canvas.height / rect.height;
+  mouseX = (e.clientX - rect.left) * sx;
+  mouseY = (e.clientY - rect.top) * sy;
+
   const gridPos = toGrid(mouseX, mouseY);
   document.getElementById('coords-display').textContent = `X: ${gridPos.x} | Y: ${gridPos.y}`;
 });
@@ -268,8 +367,10 @@ canvas.addEventListener('click', (e) => {
   }
 
   const rect = canvas.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
+  const sx = canvas.width / rect.width;
+  const sy = canvas.height / rect.height;
+  const mx = (e.clientX - rect.left) * sx;
+  const my = (e.clientY - rect.top) * sy;
   const gridPos = toGrid(mx, my);
 
   if (interactionMode === 'add-robot') {
@@ -325,6 +426,13 @@ canvas.addEventListener('click', (e) => {
       if (config.use_destination_server) {
         if (!robot.goals) {
           robot.goals = [];
+        }
+        // A live re-selection starts a new set of goal alternatives.
+        if (pendingGoalReset) {
+          robot.goals = [];
+          robot.active_goal_x = undefined;
+          robot.active_goal_y = undefined;
+          pendingGoalReset = false;
         }
         if (robot.goals.some(g => g.x === gridPos.x && g.y === gridPos.y)) {
           alert('This goal is already added for this robot!');
@@ -424,6 +532,7 @@ document.getElementById('btn-reset').addEventListener('click', () => {
   // Re-init SSE stream connection
   initSSE();
   fetchConfig();
+  fetchReservationConfig();
 });
 
 // Helper to draw dependency arrow with optional dash animation
@@ -465,25 +574,165 @@ function drawDependencyArrow(ctx, fromX, fromY, toX, toY, isBlocking) {
   ctx.restore();
 }
 
+function regionBounds(region) {
+  const points = region.points || [];
+  if (points.length < 2) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i + 1 < points.length; i += 2) {
+    minX = Math.min(minX, points[i]);
+    maxX = Math.max(maxX, points[i]);
+    minY = Math.min(minY, points[i + 1]);
+    maxY = Math.max(maxY, points[i + 1]);
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function addRegionPath(region) {
+  const points = region.points || [];
+  if (points.length < 2) return false;
+
+  if (region.hint === REGION_HINT_POINT) {
+    const position = toPixel(points[0], points[1]);
+    ctx.arc(position.x, position.y, 3, 0, 2 * Math.PI);
+    return true;
+  }
+
+  if (region.hint === REGION_HINT_AXIS_ALIGNED_RECTANGLE) {
+    const bounds = regionBounds(region);
+    if (!bounds) return false;
+    const topLeft = toPixel(bounds.minX, bounds.maxY);
+    ctx.rect(
+      topLeft.x,
+      topLeft.y,
+      (bounds.maxX - bounds.minX) * scale,
+      (bounds.maxY - bounds.minY) * scale
+    );
+    return true;
+  }
+
+  if (points.length < 6) return false;
+  const first = toPixel(points[0], points[1]);
+  ctx.moveTo(first.x, first.y);
+  for (let i = 2; i + 1 < points.length; i += 2) {
+    const position = toPixel(points[i], points[i + 1]);
+    ctx.lineTo(position.x, position.y);
+  }
+  ctx.closePath();
+  return true;
+}
+
+function drawReservationConfig() {
+  if (!reservationConfig) return;
+
+  (reservationConfig.safe_sets || []).forEach(set => {
+    const bounds = regionBounds(set.region);
+    if (!bounds) return;
+    const labelPosition = toPixel(bounds.minX, bounds.maxY);
+
+    ctx.save();
+    ctx.shadowBlur = 0;
+    ctx.beginPath();
+    if (!addRegionPath(set.region)) {
+      ctx.restore();
+      return;
+    }
+    ctx.fillStyle = 'rgba(0, 255, 135, 0.06)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0, 255, 135, 0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.stroke();
+
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(0, 255, 135, 0.8)';
+    ctx.font = '600 11px Outfit';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(
+      `safe: ${set.name}`,
+      labelPosition.x + 4,
+      labelPosition.y + 4
+    );
+    ctx.restore();
+  });
+
+  (reservationConfig.parking_spots || []).forEach(spot => {
+    const bounds = regionBounds(spot.region);
+    if (!bounds) return;
+    const position = toPixel(
+      (bounds.minX + bounds.maxX) / 2,
+      (bounds.minY + bounds.maxY) / 2
+    );
+
+    ctx.save();
+    ctx.shadowBlur = 0;
+
+    ctx.beginPath();
+    if (addRegionPath(spot.region)) {
+      ctx.fillStyle = 'rgba(255, 153, 0, 0.10)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255, 153, 0, 0.6)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = '#ff9900';
+    ctx.font = 'bold 12px Outfit';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('P', position.x, position.y);
+
+    ctx.fillStyle = 'rgba(255, 153, 0, 0.85)';
+    ctx.font = '600 10px Outfit';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(spot.name, position.x + 8, position.y - 4);
+    ctx.restore();
+  });
+}
+
 // Rendering grid background and actors
 function drawGrid() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  // 1. Draw fine grid
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.03)';
-  ctx.lineWidth = 1;
-  for (let x = 0; x < canvas.width; x += scale) {
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, canvas.height);
-    ctx.stroke();
+  // 1. Draw grid, aligned to the world origin.
+  const worldLeft = (0 - centerX) / scale;
+  const worldRight = (canvas.width - centerX) / scale;
+  const worldBottom = (centerY - canvas.height) / scale;
+  const worldTop = (centerY - 0) / scale;
+  // Major lines fall on a "nice" interval for orientation/labels; never finer
+  // than the snap resolution so every labelled line is a placeable position.
+  const majorStep = Math.max(
+    niceGridStep(Math.max(worldRight - worldLeft, worldTop - worldBottom)),
+    SNAP_M
+  );
+
+  const drawLines = (step, style) => {
+    ctx.strokeStyle = style;
+    ctx.lineWidth = 1;
+    for (let gx = Math.ceil(worldLeft / step) * step; gx <= worldRight; gx += step) {
+      const px = centerX + gx * scale;
+      ctx.beginPath();
+      ctx.moveTo(px, 0);
+      ctx.lineTo(px, canvas.height);
+      ctx.stroke();
+    }
+    for (let gy = Math.ceil(worldBottom / step) * step; gy <= worldTop; gy += step) {
+      const py = centerY - gy * scale;
+      ctx.beginPath();
+      ctx.moveTo(0, py);
+      ctx.lineTo(canvas.width, py);
+      ctx.stroke();
+    }
+  };
+
+  // Minor grid: one line at every robot-placement snap position, so the user
+  // can see every spot a robot can be placed at.
+  if (scale * SNAP_M >= 5) {
+    drawLines(SNAP_M, 'rgba(255, 255, 255, 0.04)');
   }
-  for (let y = 0; y < canvas.height; y += scale) {
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(canvas.width, y);
-    ctx.stroke();
-  }
+  // Major grid: brighter lines on the nice interval.
+  drawLines(majorStep, 'rgba(255, 255, 255, 0.10)');
 
   // 2. Draw axis lines
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.12)';
@@ -507,19 +756,22 @@ function drawGrid() {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'top';
 
-  for (let x = -10; x <= 10; x += 2) {
-    if (x === 0) continue;
-    const pix = toPixel(x, 0);
-    ctx.fillText(x.toString(), pix.x, centerY + 6);
+  const labelY = Math.min(Math.max(centerY + 6, 2), canvas.height - 12);
+  for (let gx = Math.ceil(worldLeft / majorStep) * majorStep; gx <= worldRight; gx += majorStep) {
+    if (Math.abs(gx) < majorStep / 2) continue; // skip the origin
+    ctx.fillText(String(Math.round(gx * 1000) / 1000), centerX + gx * scale, labelY);
   }
 
   ctx.textAlign = 'right';
   ctx.textBaseline = 'middle';
-  for (let y = -10; y <= 10; y += 2) {
-    if (y === 0) continue;
-    const pix = toPixel(0, y);
-    ctx.fillText(y.toString(), centerX - 8, pix.y);
+  const labelX = Math.min(Math.max(centerX - 8, 24), canvas.width - 2);
+  for (let gy = Math.ceil(worldBottom / majorStep) * majorStep; gy <= worldTop; gy += majorStep) {
+    if (Math.abs(gy) < majorStep / 2) continue;
+    ctx.fillText(String(Math.round(gy * 1000) / 1000), labelX, centerY - gy * scale);
   }
+
+  // Draw the reservation config behind plans and robots.
+  drawReservationConfig();
 
   // 4. Draw plans, actual routes, and dependencies
   robots.forEach(r => {
@@ -754,8 +1006,27 @@ function drawGrid() {
   });
 }
 
+let lastCanvasDisplaySize = -1;
+function resizeCanvasDisplay() {
+  const container = canvas.parentElement;
+  const style = getComputedStyle(container);
+  const padX = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+  const padY = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+  const availW = container.clientWidth - padX;
+  const availH = container.clientHeight - padY;
+  const size = Math.max(0, Math.floor(Math.min(availW, availH)));
+  if (size !== lastCanvasDisplaySize) {
+    lastCanvasDisplaySize = size;
+    canvas.style.width = size + 'px';
+    canvas.style.height = size + 'px';
+  }
+}
+
+window.addEventListener('resize', resizeCanvasDisplay);
+
 // Periodic loop for canvas redraw
 function animationLoop() {
+  resizeCanvasDisplay();
   drawGrid();
   requestAnimationFrame(animationLoop);
 }
@@ -771,7 +1042,22 @@ function fetchConfig() {
     .catch(err => console.error('Failed to load config:', err));
 }
 
+function fetchReservationConfig() {
+  fetch('/reservation_config')
+    .then(res => res.json())
+    .then(data => {
+      if (data && data.safe_sets) {
+        reservationConfig = data;
+        fitViewToConfig();
+        console.log('Loaded reservation config:', reservationConfig);
+      }
+    })
+    .catch(err => console.error('Failed to load reservation config:', err));
+}
+
 // Boot application
+resizeCanvasDisplay();
 fetchConfig();
+fetchReservationConfig();
 initSSE();
 animationLoop();
