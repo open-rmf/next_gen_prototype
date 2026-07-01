@@ -1,8 +1,9 @@
 use crate::{
     inner_navigation_client::InnerNavigationTarget, navigation_server::CurrentNavigationRequest,
-    Nav2Agent, RclrsNode, RosPublisher, RosSubscription,
+    Nav2Agent,
 };
 use bevy::prelude::*;
+use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
 use ros_env::{
     nav2_msgs::msg::Costmap,
     rmf_prototype_msgs::msg::{Progress, Region, SafeZone},
@@ -273,8 +274,8 @@ fn next_target(safe_zone: &SafeZone) -> Option<(f32, f32, f32)> {
             // TODO(@xiyuoh) some processing using spread and tolerance
         }
     }
-    for target_node in constraints.nodes.iter() {
-        //
+    for _target_node in constraints.nodes.iter() {
+        // TODO(@xiyuoh)
     }
 
     xy.zip(yaw).map(|((x, y), yaw)| (x, y, yaw))

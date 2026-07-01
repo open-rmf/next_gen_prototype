@@ -4,9 +4,10 @@ use crate::{
         CancelInnerForAgent, CancellingInnerNavigation, InnerNavigationClient,
         InnerNavigationFeedback,
     },
-    Nav2Agent, RclrsNode, RosActionServer, RosPublisher,
+    Nav2Agent,
 };
 use bevy::prelude::*;
+use bevy_ros2::{RclrsNode, RosActionServer, RosPublisher};
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use crossflow::{prelude::*, service::Service};
 use rclrs::*;
@@ -18,11 +19,8 @@ use ros_env::{
     },
     unique_identifier_msgs::msg::UUID as RosUuid,
 };
-use std::{sync::Arc, time::Duration};
-use tokio::sync::{
-    mpsc::{error::SendError, unbounded_channel, UnboundedReceiver, UnboundedSender},
-    Mutex,
-};
+use std::sync::Arc;
+use tokio::sync::mpsc::{error::SendError, unbounded_channel, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
 #[derive(Component)]
@@ -91,7 +89,6 @@ fn create_navigation_server(
             feedback_receiver,
             send_cancel,
             publisher_for_closure.clone(),
-            NavigateToPoseActionSettings::default(),
         )
     });
 
@@ -181,11 +178,6 @@ async fn nav_to_pose_action(
     mut receiver: UnboundedReceiver<NavigateToPose_Feedback>,
     send_cancel: impl Fn() -> Result<(), SendError<CancelInnerForAgent>>,
     destination_publisher: Arc<RosPublisher<DestinationGoal>>,
-    NavigateToPoseActionSettings {
-        period,
-        cancel_refusal_limit,
-        continue_after_cancelling,
-    }: NavigateToPoseActionSettings,
 ) -> TerminatedGoal {
     let goal_order = &handle.goal().pose;
     let destination_goal = pose_stamped_to_destination_goal(goal_order);
@@ -200,7 +192,6 @@ async fn nav_to_pose_action(
         BeginAcceptedGoal::Cancel(cancelling) => return cancelling.cancelled_with(result),
     };
 
-    let mut cancel_requests = 0;
     let cancelling = loop {
         match executing.unless_cancel_requested(receiver.recv()).await {
             Ok(Some(next)) => {
@@ -488,22 +479,6 @@ fn cleanup_navigation(
                 .entity(event.agent)
                 .remove::<CurrentNavigationRequest>()
                 .remove::<CancellingInnerNavigation>();
-        }
-    }
-}
-
-struct NavigateToPoseActionSettings {
-    period: Duration,
-    cancel_refusal_limit: usize,
-    continue_after_cancelling: bool,
-}
-
-impl Default for NavigateToPoseActionSettings {
-    fn default() -> Self {
-        Self {
-            period: Duration::from_micros(10),
-            cancel_refusal_limit: 1,
-            continue_after_cancelling: false,
         }
     }
 }

@@ -55,14 +55,23 @@ def generate_launch_description():
         output='both'
     )
 
-    # 2. Start the web dashboard and REST/SSE bridge in destination mode.
-    robot_spawner = Node(
-        package='rmf_path_server_demo',
-        executable='robot_spawner',
-        name='robot_spawner',
-        output='both',
-        parameters=[{'use_destination_server': True}]
-    )
+    # 2. Start the visualizer nodes
+    def generate_visualizers(context, *args, **kwargs):
+        robots_str = LaunchConfiguration('robots').perform(context)
+        robot_names = robots_str.split() if robots_str else []
+        
+        visualizers = []
+        for robot in robot_names:
+            visualizers.append(Node(
+                package='rmf_path_visualizer',
+                executable='rmf_path_visualizer',
+                name=f'rmf_path_visualizer_{robot}',
+                output='both',
+                arguments=[robot]
+            ))
+        return visualizers
+
+    visualizers_launcher = OpaqueFunction(function=generate_visualizers)
 
     # 3. Start exactly one selectable destination implementation.
     simple_destination_server = Node(
@@ -93,31 +102,12 @@ def generate_launch_description():
         output='both'
     )
 
-    # 5. Start the visualizer nodes
-    def generate_visualizers(context, *args, **kwargs):
-        robots_str = LaunchConfiguration('robots').perform(context)
-        robot_names = robots_str.split() if robots_str else []
-        
-        visualizers = []
-        for robot in robot_names:
-            visualizers.append(Node(
-                package='rmf_path_visualizer',
-                executable='rmf_path_visualizer',
-                name=f'rmf_path_visualizer_{robot}',
-                output='both',
-                arguments=[robot]
-            ))
-        return visualizers
-
-    visualizers_launcher = OpaqueFunction(function=generate_visualizers)
-
     return LaunchDescription([
         declare_destination_server,
         declare_config_file,
         path_server,
-        robot_spawner,
+        visualizers_launcher,
         simple_destination_server,
         reservation_destination_server,
         plan_executor,
-        visualizers_launcher
     ])

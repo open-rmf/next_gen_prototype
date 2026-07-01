@@ -1,5 +1,6 @@
-use crate::{Nav2Agent, RclrsNode, RosPublisher};
+use crate::Nav2Agent;
 use bevy::prelude::*;
+use bevy_ros2::{RclrsNode, RosPublisher};
 use ros_env::rmf_prototype_msgs::msg::DestinationGoal;
 use std::sync::Arc;
 

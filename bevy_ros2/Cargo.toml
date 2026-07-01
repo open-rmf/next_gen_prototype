@@ -1,0 +1,12 @@
+[package]
+name = "bevy_ros2"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "bevy_ros2"
+
+[dependencies]
+bevy = "0.16"
+futures = "0.3"
+rclrs = "0.7"

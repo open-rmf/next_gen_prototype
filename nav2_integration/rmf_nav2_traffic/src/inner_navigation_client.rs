@@ -1,8 +1,8 @@
-use crate::{Nav2Agent, NavigateToPoseServer, RclrsExecutorCommands, RclrsNode, RosActionClient};
+use crate::Nav2Agent;
 use bevy::prelude::*;
+use bevy_ros2::{RclrsExecutorCommands, RclrsNode, RosActionClient};
 use crossflow::{prelude::*, service::Service};
 use futures::StreamExt;
-use mapf_post::na::DualQuaternion;
 use nalgebra::UnitQuaternion;
 use rclrs::*;
 use ros_env::{
@@ -721,7 +721,6 @@ fn process_navigation_result(
     Blocking {
         request: result, ..
     }: Blocking<InnerNavigationResult>,
-    mut commands: Commands,
     mut cancelling_inner: Query<&mut CancellingInnerNavigation>,
     inner_nav_clients: Query<&InnerNavigationClient>,
 ) -> Result<InnerNavigationRequest, InnerNavigationResult> {
