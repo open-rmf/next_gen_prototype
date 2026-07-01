@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use mapf_post::{na::Isometry2, MapfResult, SemanticPlan, SemanticWaypoint};
-use nav_msgs::msg::Odometry;
 use rclrs::{IntoPrimitiveOptions, Node};
-use rmf_prototype_msgs::msg::{Destination, Plan, PlanId, TrafficDependency, Waypoint};
+use ros_env::builtin_interfaces;
+use ros_env::nav_msgs::msg::Odometry;
+use ros_env::rmf_prototype_msgs;
+use ros_env::rmf_prototype_msgs::msg::{Destination, Plan, PlanId, TrafficDependency, Waypoint};
 use std::collections::{hash_map::Entry, HashMap};
 use std::sync::Arc;
 

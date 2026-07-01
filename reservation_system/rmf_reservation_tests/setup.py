@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from setuptools import find_packages, setup
-import os
 from glob import glob
+import os
 
-package_name = 'rmf_path_server_demo'
+from setuptools import find_packages
+from setuptools import setup
+
+package_name = 'rmf_reservation_tests'
 
 setup(
     name=package_name,
@@ -26,23 +28,18 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
-        (os.path.join('share', package_name, 'www'), glob('www/*')),
-        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
-        (os.path.join('share', package_name, 'maps'),
-            glob('maps/*.building.yaml')
-            + glob('maps/*.site.json')),
+        (os.path.join('share', package_name, 'config'),
+            glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='Arjo Chakravarty',
-    maintainer_email='arjoc@intrinsic.ai',
-    description='Web dashboard and launch tools for RMF path server demo.',
+    maintainer='Arjoc',
+    maintainer_email='arjoc@google.com',
+    description='Launch tests for RMF reservation system.',
     license='Apache License 2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'robot_spawner = rmf_path_server_demo.robot_spawner:main',
         ],
     },
 )

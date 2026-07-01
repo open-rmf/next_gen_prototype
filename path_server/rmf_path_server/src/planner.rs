@@ -14,8 +14,8 @@
 
 use hetpibt::external_tracks_pibt::PiBTWithExternalTracks;
 use mapf_post::na::Isometry2;
-use nav_msgs::msg::Odometry;
-use rmf_prototype_msgs::msg::Destination;
+use ros_env::nav_msgs::msg::Odometry;
+use ros_env::rmf_prototype_msgs::msg::Destination;
 use std::collections::HashMap;
 
 use std::sync::atomic::AtomicBool;

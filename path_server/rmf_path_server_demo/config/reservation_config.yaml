@@ -1,0 +1,23 @@
+# Demo reservation configuration for the rmf_path_server_demo dashboard.
+#
+# The destination server loads this file, validates it, and republishes it on
+# the transient-local topic /destination/reservation_config. The web dashboard
+# renders the safe sets and parking spots below as a background layer.
+
+grid_size: 0.5
+
+safe_sets:
+  - name: main_floor
+    region:
+      hint: axis_aligned_rectangle
+      points: [-10.0, -10.0, 10.0, 10.0]
+
+parking_spots:
+  - name: parking_a
+    region:
+      hint: axis_aligned_rectangle
+      points: [-8.5, -8.5, -7.5, -7.5]
+  - name: parking_b
+    region:
+      hint: axis_aligned_rectangle
+      points: [7.5, 7.5, 8.5, 8.5]

@@ -12,18 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use geometry_msgs::msg::Pose;
 use mapf_post::{
     na::{Isometry2, Vector2},
     spatial_allocation::{CurrentPosition, Grid2D},
     MapfResult, WaypointFollower,
 };
-use nav2_msgs::msg::Costmap;
-use nav_msgs::msg::Odometry;
 use rclrs::{IntoPrimitiveOptions, Node};
-use rmf_prototype_msgs::msg::{
+use ros_env::builtin_interfaces;
+use ros_env::geometry_msgs::msg::Pose;
+use ros_env::nav2_msgs;
+use ros_env::nav2_msgs::msg::Costmap;
+use ros_env::nav_msgs::msg::Odometry;
+use ros_env::rmf_prototype_msgs;
+use ros_env::rmf_prototype_msgs::msg::{
     DestinationConstraints, Plan, PlanRelease, SafeZone, SafeZoneId, TargetOrientation,
 };
+use ros_env::std_msgs;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
@@ -525,7 +529,6 @@ impl PlanExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use mapf_post::na::{Isometry2, Vector2};
     use mapf_post::{Trajectory, WaypointFollower};
 
