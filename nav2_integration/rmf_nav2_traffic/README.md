@@ -104,6 +104,18 @@ git clone https://github.com/open-rmf/next_gen_prototype.git
 
 Deps
 ```
+# Install Rust (see https://rustup.rs/)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Install required system packages
+sudo apt install -y git libclang-dev python3-pip
+
+# Install colcon plugins for Rust
+sudo apt install python3-colcon-cargo
+pip3 install --break-system-packages colcon-ros-cargo
+```
+
+```
 rosdep install --from-paths src --ignore-src --rosdistro $ROS_DISTRO -yr
 ```
 
@@ -146,7 +158,6 @@ ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
     }
   }
 }"
-
 ```
 
 ```
@@ -162,7 +173,6 @@ ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
     }
   }
 }"
-
 ```
 
 Alternate navigation goals:
@@ -179,7 +189,7 @@ ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
       orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
     }
   }
-}" --feedback
+}"
 ```
 
 ```
@@ -194,5 +204,5 @@ ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
       orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
     }
   }
-}" --feedback
+}"
 ```
