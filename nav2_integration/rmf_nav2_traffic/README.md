@@ -128,7 +128,7 @@ ros2 run rmf_nav2_traffic nav2_traffic --ros-args -p use_sim_time:=true
 
 Run the demo launch file containing the path server, plan executor, destination server, and path visualizer nodes:
 ```
-ros2 launch rmf_path_server_demo demo.launch.py robots:="robot0 robot1"
+ros2 launch rmf_path_server_demo demo_viz.launch.py robots:="robot0 robot1"
 ```
 
 Send action goals to the robots:

@@ -5,7 +5,6 @@
   <maintainer email="ohxiyu@gmail.com">Xiyu Oh</maintainer>
   <license>TODO</license>
 
-  <depend>bevy_ros2</depend>
   <depend>geometry_msgs</depend>
   <depend>nav2_msgs</depend>
   <depend>navigation2</depend>

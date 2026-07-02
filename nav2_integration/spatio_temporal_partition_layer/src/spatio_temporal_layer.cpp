@@ -200,6 +200,7 @@ SpatioTemporalPartitionLayer::updateCosts(
     return;
   }
 
+  // NOTE(@xiyuoh) may need transformation if robot TF is different from server
   const auto & costmap = costmap_msg_->metadata;
   for (int j = min_j; j < max_j; ++j) {
     for (int i = min_i; i < max_i; ++i) {

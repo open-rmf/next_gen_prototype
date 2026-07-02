@@ -441,7 +441,9 @@ fn check_existing_goal(
     let curr_safe_zone_id = existing_goal.id();
     let next_safe_zone_id = &request.safe_zone_id;
 
-    if next_safe_zone_id.plan_id.destination_session.uuid != curr_safe_zone_id.plan_id.destination_session.uuid {
+    if next_safe_zone_id.plan_id.destination_session.uuid
+        != curr_safe_zone_id.plan_id.destination_session.uuid
+    {
         replan_and_cancel = true;
     } else if next_safe_zone_id.plan_id.plan_version > curr_safe_zone_id.plan_id.plan_version {
         replan_and_cancel = true;
