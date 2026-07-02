@@ -201,6 +201,10 @@ fn update_incremental_target(
         if current_safe_zone.distancesq_to_target(&safe_zone) < 0.5 {
             continue;
         }
+        debug!(
+            "[{:?}] Updating SafeZone to target: ({:.2}, {:.2}, {:.2})",
+            agent.name, target_x, target_y, target_yaw
+        );
 
         *current_safe_zone = CurrentSafeZone(Some(safe_zone.clone()));
 
