@@ -441,7 +441,9 @@ fn check_existing_goal(
     let curr_safe_zone_id = existing_goal.id();
     let next_safe_zone_id = &request.safe_zone_id;
 
-    if next_safe_zone_id.plan_id.plan_version > curr_safe_zone_id.plan_id.plan_version {
+    if next_safe_zone_id.plan_id.destination_session.uuid != curr_safe_zone_id.plan_id.destination_session.uuid {
+        replan_and_cancel = true;
+    } else if next_safe_zone_id.plan_id.plan_version > curr_safe_zone_id.plan_id.plan_version {
         replan_and_cancel = true;
     } else if next_safe_zone_id.plan_id.plan_version == curr_safe_zone_id.plan_id.plan_version
         && next_safe_zone_id.safe_zone_version > curr_safe_zone_id.safe_zone_version
@@ -502,18 +504,16 @@ fn async_cancel_goal(
     }
     executor_commands
         .run(async move {
-            let mut cancellation = request.cancel_client.cancellation.cancel().await;
-            // If this is an external cancellation attempt, persist until it is accepted
-            while !cancellation.is_accepted() {
-                info!(
-                    "[{}] Cancellation request rejected for inner navigation, retrying...",
+            let cancellation = request.cancel_client.cancellation.cancel().await;
+            if !cancellation.is_accepted() {
+                warn!(
+                    "[{}] Cancellation request rejected for inner navigation, it may have already completed.",
                     request.agent.index()
                 );
-                cancellation = request.cancel_client.cancellation.cancel().await;
             }
             if let Some(new_request) = request.new_request {
                 info!(
-                    "[{}] Cancellation request accepted for inner navigation, requesting new goal",
+                    "[{}] Cancellation logic finished for inner navigation, requesting new goal",
                     request.agent.index()
                 );
                 // If this a replan attempt with a new navigation request,
@@ -521,7 +521,7 @@ fn async_cancel_goal(
                 return Ok(new_request);
             } else {
                 info!(
-                    "[{}] Cancellation request accepted for inner navigation",
+                    "[{}] Cancellation request finished for inner navigation",
                     request.agent.index()
                 );
                 return Err(InnerNavigationError {
