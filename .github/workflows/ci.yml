@@ -24,8 +24,8 @@ jobs:
         run: |
           source /opt/ros/jazzy/setup.bash
           rosdep update
-          rosdep install --from-paths . --ignore-src -y --skip-keys="rclrs ament_cargo ament_python"
-          colcon build
+          rosdep install --from-paths . --ignore-src -yr --skip-keys="rclrs ament_cargo ament_python"
+          colcon build --packages-up-to sp_demo_nav2_bringup rmf_nav2_traffic rmf_path_server_demo rmf_path_server_test
         shell: bash
 
       - name: Run Automated Verification Tests

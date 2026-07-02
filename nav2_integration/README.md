@@ -1,175 +1,211 @@
-# Spatio-Temporal Partitioning Demo
+# Nav2 Integration for Next-Gen RMF
 
-A demonstration system for multi-robot path planning and navigation using spatio-temporal space partitioning. This repository contains the client-side simulation and navigation stack for coordinating multiple robots in shared environments.
+![image](./docs/images/nav2_traffic_demo.gif)
 
-> **Note:** This repository contains the *client implementation* for the spatio-temporal partitioning algorithm. The core algorithm lives in the [mapf_post](https://github.com/arjo129/mapf_post) repository.
+This folder contains the various packages required for Nav2 integration and demonstrates how Next Gen prototype messages and traffic management design is used for multi-robot coordination. The core `rmf_nav2_traffic` plugin manages incoming navigation requests and plans produced by the path server, and publishes action goals to the Nav2 server accordingly. We also incorporate [spatio_temporal_partition_layer](https://github.com/arjo129/spatio_temporal_partitioning) into the `rmf_nav2_traffic` plugin, where safe zone data is used to update the Nav2 costmap and provide partitions to facilitate path-planning.
 
-## Overview
+## InnerNavigationServices Workflow Diagram
 
-This demo showcases how multiple robots can safely and efficiently navigate in shared environments by dividing space-time into partitions. Each robot reserves specific regions of space during specific time intervals, enabling collision-free multi-agent path planning.
+This document describes the workflow in `InnerNavigationServices`, specifically the `await_and_send_goal` workflow, implemented using Crossflow.
 
-> **Status:** This is exploratory research work investigating spatio-temporal partitioning as a foundational approach for next-generation Open-RMF multi-robot coordination systems.
+### Workflow Diagram
 
-### Key Features
+```mermaid
+graph TD
+    Start([scope.start]) --> ForkClone{Fork Clone}
+    
+    ForkClone --> AwaitReq[Await Requests]
+    ForkClone --> AwaitExtCancel[Await External Cancellation]
+    
+    AwaitExtCancel -->|stream| CancelGoal[Cancel Goal]
+    AwaitReq -->|stream| CheckGoal[Check Goal]
+    
+    CheckGoal -->|Ok| HandleExisting[Handle Existing Goal Result]
+    CheckGoal -->|Err| Drop[Drop Outdated Request]
+    
+    HandleExisting -->|Ok| CancelGoal
+    CancelGoal -->|Ok| RequestGoal[Request Goal]
+    
+    HandleExisting -->|Err| RequestGoal
+    
+    RequestGoal -->|Ok| UpdateGoal[Update Goal Client]
+    UpdateGoal --> MonitorGoal[Monitor Navigation]
+    MonitorGoal --> ProcessNav[Process Navigation Result]
 
-- **Multi-robot coordination** using spatio-temporal resource allocation
-- **ROS 2 integration** with Nav2 for autonomous navigation
-- **Gazebo simulation** support for testing in realistic environments
-- **Flexible robot configuration** for various numbers of robots and starting positions
-- **Dynamic scene modification** with collision-aware obstacles
+    ProcessNav -->|Ok| RequestGoal
+    ProcessNav -->|Err| CleanupGoal[Cleanup Goal Client]
+    
+    CancelGoal -->|Err| LogError[Log Error]
+    RequestGoal -->|Err| LogError
 
-### Demo Scenarios
-
-The following GIFs show multi-robot navigation demonstrations:
-
-![Multi-robot coordination without obstacles](docs/images/no_obs.gif)
-
-*Figure 1: Multiple robots navigating efficiently using spatio-temporal partitioning.*
-
-![Dynamic rerouting with obstacles](docs/images/reroute.gif)
-
-*Figure 2: Robot trajectory replanning when obstacles are introduced (dynamic rerouting).*
-
-Notice how there is no need to trigger a replan despite the introduction of new obstacle directly in the path. The spatio-temporal allocation ensures that any detour remains safe.
-
-## Requirements
-
-- ROS 2 (Jazzy or later recommended)
-- Nav2 stack
-- Gazebo for simulation
-- Turtlebot3 simulation packages
-- Python 3.8+
-- Cargo/Rust (for running the backend allocation server)
-
-## Architecture
-
-This demo consists of three main components:
-
-1. **Client Demo** (this repository)
-   - ROS 2 launch files and navigation configuration
-   - Multi-robot simulation setup
-   - Nav2 integration for path execution
-
-2. **Allocation Server** ([mapf_post](https://github.com/arjo129/mapf_post))
-   - Core spatio-temporal partitioning algorithm
-   - REST API for space allocation requests
-   - Trajectory validation
-
-3. **MAPF Planner** (external)
-   - Generates initial multi-robot trajectories
-   - Examples: [mapf](https://github.com/open-rmf/mapf), [pibt_rs](https://github.com/arjo129/pibt_rs)
-
-## Getting Started
-
-### 1. Set Up the Allocation Server
-
-The allocation server handles the space partitioning logic. Clone and run the mapf_post repository:
-
-```bash
-git clone git@github.com:arjo129/mapf_post.git
-cd mapf_post
+    AwaitReq -->|output| Terminate([scope.terminate])
 ```
 
-Generate or obtain a trajectory file (CSV format):
+### Node Descriptions
 
-```bash
-# Using pre-built example trajectories:
-# See: https://github.com/arjo129/mapf_post/tree/main/example_trajectories
+- **`await_new_requests`**: A continuous service that listens for `InnerNavigationTarget` events and streams `InnerNavigationRequest` objects.
+- **`await_external_cancellation`**: A continuous service that listens for `CancelInnerForAgent` events and streams cancellation requests.
+- **`check_existing_goal`**: Checks if the agent already has an active goal. If the incoming request is outdated/duplicate, it returns an error and gets dropped. Otherwise it returns ok.
+- **`handle_existing_goal_result`**: Routes the valid checked result into either a cancellation of the current goal or a direct request for a new goal.
+- **`async_cancel_goal`**: An asynchronous service that cancels the existing Nav2 goal.
+- **`async_request_new_goal`**: An asynchronous service that sends a new `NavigateToPose` goal to Nav2.
+- **`update_goal_client`**: Updates the `InnerNavigationClient` component with the new goal handle.
+- **`async_monitor_ongoing_navigation`**: Monitors the progress of the navigation goal, handling feedback and final results (Succeeded, Aborted, Cancelled).
+- **`process_navigation_result`**: Processes the final result of the navigation request. If aborted, it prepares to retry by requesting a new goal; otherwise, it passes the result for cleanup.
+- **`cleanup_goal_client`**: Cleans up the goal client state in the component upon completion or failure.
+- **`log_inner_navigation_error`**: Logs any errors encountered during goal cancellation or request.
 
-# Or generate trajectories using a MAPF planner:
-# - https://github.com/open-rmf/mapf
-# - https://github.com/arjo129/pibt_rs
+
+## NavigationServices Workflow Diagram
+
+This document describes the workflow in `NavigationServices`, implemented using Crossflow.
+
+### Workflow Diagram
+
+```mermaid
+graph TD
+    Start([scope.start]) --> ForkClone{Fork Clone}
+    
+    ForkClone --> MonitorClients[Monitor Clients]
+    ForkClone --> MonitorFeedback[Monitor Feedback]
+    
+    MonitorFeedback -- streams --> FeedbackBuffer[(Feedback Buffer)]
+    
+    MonitorClients -- streams --> BufferAccess[Buffer Access]
+    FeedbackBuffer -.-> BufferAccess
+    
+    BufferAccess --> PublishFeedback[Publish Feedback]
+    
+    MonitorClients -- output --> Terminate([scope.terminate])
 ```
 
-Launch the REST API server:
+### Node Descriptions
 
-```bash
-cargo run --example rest_api -- -p <trajectory.csv>
+- **`monitor_inner_navigation_clients`**: A continuous service that manages incoming navigation requests and responds to orders when the entire navigation is completed.
+- **`monitor_inner_navigation_feedback`**: A continuous service that monitors feedback from inner navigation clients.
+- **`FeedbackBuffer`**: A buffer that keeps the last 10 `InnerNavigationFeedback` items.
+- **`Buffer Access`**: Accesses the `FeedbackBuffer` to retrieve feedback for requests coming from `monitor_inner_navigation_clients`.
+- **`publish_navigation_feedback`**: A service that publishes the navigation feedback.
+
+
+## Try out the demo
+
+
+### Setup
+
+Do a fresh update & upgrade:
+```
+sudo apt update && sudo apt upgrade -y
 ```
 
-> **Important:** Ensure your robots have appropriate safety buffers in the trajectory file to prevent collisions.
-
-### 2. Start the Simulation
-
-In a separate terminal, launch the multi-robot simulation:
-
-```bash
-ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py \
-  robots:="robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};"
+Set up a fresh workspace
+```
+mkdir ~/nav2_traffic_ws/src -p
+cd ~/nav2_traffic_ws/src
+git clone https://github.com/open-rmf/next_gen_prototype.git
 ```
 
-The robot poses should correspond to the starting positions in your trajectory CSV file.
+Deps
+```
+# Install Rust (see https://rustup.rs/)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-> **Tip:** Start the simulation before launching the REST server to avoid initialization issues.
+# Install required system packages
+sudo apt install -y git libclang-dev python3-pip
 
-### 3. Add Dynamic Obstacles (Optional)
-
-To test dynamic replanning with obstacles, add models to the scene:
-
-```bash
-gz service -s /world/warehouse/create \
-  --reqtype gz.msgs.EntityFactory \
-  --reptype gz.msgs.Boolean \
-  --timeout 300 \
-  --req 'sdf: "<sdf version=\"1.6\"><model name=\"inline_cube\"><pose>1.6 5.6 0 0 0 0</pose><static>true</static><link name=\"link\"><visual name=\"v\"><geometry><box><size>0.2 0.2 1</size></box></geometry></visual><collision name=\"c\"><geometry><box><size>1 1 1</size></box></geometry></collision></link></model></sdf>"'
+# Install colcon plugins for Rust
+sudo apt install python3-colcon-cargo
+pip3 install --break-system-packages colcon-ros-cargo
 ```
 
-Alternatively, use the provided script to generate multiple obstacles:
-
-```bash
-./clutter_gen.sh
+```
+rosdep install --from-paths src --ignore-src --rosdistro $ROS_DISTRO -yr
 ```
 
-## Deploying on real robots
-
-By default the rest server runs on port 3000 on localhost. If youd like to change this you can use the environment variable
-```bash
-export SP_SERVER_BASE="www.your-fleet-server.com:8443" # Note do not terminate with "/"
+Build
 ```
-This will allow you to deploy this to nav2 robots without a problem.
-
-
-## Project Structure
-
-```
-nav2_integration/
-├── sp_demo_nav2_bringup/           # Nav2 launch files and robot configurations
-├── spatio_temporal_partition_layer/  # ROS 2 costmap layer plugin
-├── demo_world/             # Custom demo world and utilities
-├── docs/                   # Documentation and images
-└── clutter_gen.sh         # Script for generating test obstacles
+colcon build --packages-up-to sp_demo_nav2_bringup rmf_nav2_traffic rmf_path_server_demo rmf_path_server_test
 ```
 
-## Configuration
+### Run
 
-Modify the following files to customize the demo:
+With the workspace built and sourced, run the following nodes:
 
-- **Robot parameters**: `sp_demo_nav2_bringup/params/nav2_params.yaml`
-- **Multi-robot configuration**: `sp_demo_nav2_bringup/params/nav2_multirobot_params_*.yaml`
-- **Available maps**: `sp_demo_nav2_bringup/maps/` (depot, warehouse, sandbox)
+Spin up the Nav2 simulation:
+```
+ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py   robots:="robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};"
+```
 
-## Version Notes
+In a separate terminal, spin up the Nav2 traffic node:
+```
+ros2 run rmf_nav2_traffic nav2_traffic --ros-args -p use_sim_time:=true
+```
 
-- ROS 2 Jazzy is recommended for this demo
-- If using ROS 2 Rolling with the `simple_nav` API, compatibility issues may arise with earlier implementations
+Run the demo launch file containing the path server, plan executor, destination server, and path visualizer nodes:
+```
+ros2 launch rmf_path_server_demo demo_viz.launch.py robots:="robot0 robot1"
+```
 
-## Citation
+Send action goals to the robots:
 
-The associated research paper is currently under peer review. Citation information will be provided once the paper has been accepted and published.
+```
+ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
+  pose: {
+    header: {
+      stamp: {sec: 0, nanosec: 0},
+      frame_id: 'map'
+    },
+    pose: {
+      position: {x: 5.0, y: 5.0, z: 0.0},
+      orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+    }
+  }
+}"
+```
 
-## License
+```
+ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
+  pose: {
+    header: {
+      stamp: {sec: 0, nanosec: 0},
+      frame_id: 'map'
+    },
+    pose: {
+      position: {x: 0.0, y: 3.0, z: 0.0},
+      orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+    }
+  }
+}"
+```
 
-See [LICENSE](LICENSE) for licensing information.
+Alternate navigation goals:
 
-## Contributing
+```
+ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
+  pose: {
+    header: {
+      stamp: {sec: 0, nanosec: 0},
+      frame_id: 'map'
+    },
+    pose: {
+      position: {x: 9.0, y: 3.0, z: 0.0},
+      orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+    }
+  }
+}"
+```
 
-Contributions and feedback are welcome. Please open an issue or submit a pull request.
-
-## References
-
-- [Nav2 Documentation](https://docs.nav2.org/)
-- [mapf_post Repository](https://github.com/arjo129/mapf_post)
-- [ROS 2 Documentation](https://docs.ros.org/)
-
-
-
+```
+ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
+  pose: {
+    header: {
+      stamp: {sec: 0, nanosec: 0},
+      frame_id: 'map'
+    },
+    pose: {
+      position: {x: 9.0, y: 6.0, z: 0.0},
+      orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+    }
+  }
+}"
+```
