@@ -24,6 +24,7 @@ jobs:
         run: |
           source /opt/ros/jazzy/setup.bash
           rosdep update
+          apt update
           rosdep install --from-paths . --ignore-src -y --skip-keys="rclrs ament_cargo ament_python"
           colcon build
         shell: bash
