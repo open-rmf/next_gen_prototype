@@ -21,7 +21,7 @@ import launch_testing
 from nav_msgs.msg import Odometry
 import pytest
 import rclpy
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
@@ -88,28 +88,30 @@ class TestPathServer(unittest.TestCase):
         robot_name = 'robot_1'
         received_plans = []
 
+        reliable_transient_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
         self.node.create_subscription(
             Plan,
             f'{robot_name}/plan',
             lambda msg: received_plans.append(msg),
-            10
+            qos_profile=reliable_transient_qos
         )
 
-        input_qos = QoSProfile(
-            depth=10,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            history=HistoryPolicy.KEEP_LAST,
-        )
         dest_pub = self.node.create_publisher(
             Destination,
             f'{robot_name}/destination',
-            qos_profile=input_qos
+            qos_profile=reliable_transient_qos
         )
 
         odom_pub = self.node.create_publisher(
             Odometry,
             f'{robot_name}/odom',
-            qos_profile=input_qos
+            qos_profile=reliable_transient_qos
         )
 
         discovery_qos = QoSProfile(

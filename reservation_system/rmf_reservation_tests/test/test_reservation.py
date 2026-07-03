@@ -20,7 +20,7 @@ import launch_ros
 import launch_testing
 import pytest
 import rclpy
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
@@ -81,22 +81,24 @@ class TestReservation(unittest.TestCase):
         robot_name = 'robot_1'
         received_dest = []
 
+        reliable_transient_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
         self.node.create_subscription(
             Destination,
             f'{robot_name}/destination',
             lambda msg: received_dest.append(msg),
-            10
+            qos_profile=reliable_transient_qos
         )
 
-        goal_qos = QoSProfile(
-            depth=10,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            history=HistoryPolicy.KEEP_LAST,
-        )
         pub = self.node.create_publisher(
             DestinationGoal,
             f'{robot_name}/destination/goal',
-            qos_profile=goal_qos
+            qos_profile=reliable_transient_qos
         )
 
         discovery_qos = QoSProfile(

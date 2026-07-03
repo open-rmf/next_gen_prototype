@@ -20,7 +20,7 @@ import launch_ros
 import launch_testing
 import pytest
 import rclpy
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
@@ -86,29 +86,31 @@ class TestOverlap(unittest.TestCase):
         r1_received = []
         r2_errors = []
 
+        reliable_transient_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
         self.node.create_subscription(
             Destination,
             f'{r1_name}/destination',
             lambda msg: r1_received.append(msg),
-            10,
+            qos_profile=reliable_transient_qos,
         )
         self.node.create_subscription(
             DestinationError,
             f'{r2_name}/destination/error',
             lambda msg: r2_errors.append(msg),
-            10,
+            qos_profile=reliable_transient_qos,
         )
 
-        goal_qos = QoSProfile(
-            depth=10,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            history=HistoryPolicy.KEEP_LAST,
-        )
         pub1 = self.node.create_publisher(
-            DestinationGoal, f'{r1_name}/destination/goal', qos_profile=goal_qos
+            DestinationGoal, f'{r1_name}/destination/goal', qos_profile=reliable_transient_qos
         )
         pub2 = self.node.create_publisher(
-            DestinationGoal, f'{r2_name}/destination/goal', qos_profile=goal_qos
+            DestinationGoal, f'{r2_name}/destination/goal', qos_profile=reliable_transient_qos
         )
 
         discovery_qos = QoSProfile(
