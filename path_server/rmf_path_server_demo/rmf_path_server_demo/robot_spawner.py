@@ -24,7 +24,7 @@ import time
 
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import Point
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -113,6 +113,10 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_ok_response(config or {})
             return
 
+        elif self.path.startswith('/map'):
+            map_data = spawner_node.current_map if spawner_node else None
+            self.send_ok_response(map_data or {})
+            return
         elif self.path.startswith('/config'):
             use_dest = spawner_node.use_destination_server if spawner_node else False
             self.send_ok_response({"default_radius": 0.49, "use_destination_server": use_dest})
@@ -177,6 +181,7 @@ class RobotSpawnerNode(Node):
         self.declare_parameter('use_destination_server', False)
         self.use_destination_server = self.get_parameter('use_destination_server').value
 
+        self.current_map = None
         self.active_processes = {}
         self.active_log_files = {}
         self.sse_clients = []
@@ -226,6 +231,13 @@ class RobotSpawnerNode(Node):
             qos_profile=self.reliable_transient_qos
         )
 
+        # Subscribe to map topic
+        self.map_sub = self.create_subscription(
+            OccupancyGrid,
+            '/map',
+            self.map_callback,
+            qos_profile=self.reliable_transient_qos
+        )
         # Get the package share directory and resolve static files path
         try:
             share_dir = get_package_share_directory('rmf_path_server_demo')
@@ -307,6 +319,32 @@ class RobotSpawnerNode(Node):
         )
         self.broadcast(json.dumps(config))
 
+    def map_callback(self, msg):
+        data_list = list(msg.data)
+        map_dict = {
+            "type": "map",
+            "info": {
+                "resolution": float(msg.info.resolution),
+                "width": int(msg.info.width),
+                "height": int(msg.info.height),
+                "origin": {
+                    "position": {
+                        "x": float(msg.info.origin.position.x),
+                        "y": float(msg.info.origin.position.y),
+                        "z": float(msg.info.origin.position.z)
+                    },
+                    "orientation": {
+                        "x": float(msg.info.origin.orientation.x),
+                        "y": float(msg.info.origin.orientation.y),
+                        "z": float(msg.info.origin.orientation.z),
+                        "w": float(msg.info.origin.orientation.w)
+                    }
+                }
+            },
+            "data": data_list
+        }
+        self.current_map = map_dict
+        self.broadcast(json.dumps(map_dict))
     # Spawns a mock simulator node
     def spawn_robot(self, name, x, y):
         if name in self.active_processes:

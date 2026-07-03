@@ -31,7 +31,8 @@ setup(
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'maps'),
             glob('maps/*.building.yaml')
-            + glob('maps/*.site.json')),
+            + glob('maps/*.site.json')
+            + glob('maps/demo_grid.*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

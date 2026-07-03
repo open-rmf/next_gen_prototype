@@ -29,6 +29,8 @@ let pendingGoalReset = false;
 let eventSource = null;
 let mouseX = 0;
 let mouseY = 0;
+let mapData = null;
+let mapFitted = false;
 
 // Canvas config
 const canvas = document.getElementById('grid-canvas');
@@ -87,6 +89,14 @@ function initSSE() {
         reservationConfig = msg;
         fitViewToConfig();
         console.log(`Received reservation config: ${msg.safe_sets.length} safe set(s), ${msg.parking_spots.length} parking spot(s).`);
+      } else if (msg.type === 'map') {
+        const mapChanged = !mapData || mapData.info.width !== msg.info.width || mapData.info.height !== msg.info.height;
+        mapData = msg;
+        if (mapChanged || !mapFitted) {
+          fitViewToConfig();
+          mapFitted = true;
+        }
+        console.log(`Received map: ${msg.info.width}x${msg.info.height} @ ${msg.info.resolution}m/px`);
       } else if (msg.type === 'odom') {
         const r = robots.find(robot => robot.name === msg.name);
         if (r) {
@@ -187,10 +197,25 @@ function reservationConfigBounds() {
   return Number.isFinite(minX) ? { minX, minY, maxX, maxY } : null;
 }
 
-// Rescale and recenter the view so the loaded reservation config fits the
-// canvas with a margin. Falls back to the default view when there is no config.
+// Rescale and recenter the view so the loaded reservation config or map fits the
+// canvas with a margin. Falls back to the default view when there is neither.
 function fitViewToConfig() {
-  const bounds = reservationConfigBounds();
+  let bounds = reservationConfigBounds();
+  
+  if (!bounds && mapData) {
+    const width = mapData.info.width;
+    const height = mapData.info.height;
+    const res = mapData.info.resolution;
+    const originX = mapData.info.origin.position.x;
+    const originY = mapData.info.origin.position.y;
+    bounds = {
+      minX: originX,
+      minY: originY,
+      maxX: originX + width * res,
+      maxY: originY + height * res
+    };
+  }
+
   if (!bounds) {
     scale = DEFAULT_SCALE;
     centerX = canvas.width / 2;
@@ -198,7 +223,7 @@ function fitViewToConfig() {
     return;
   }
 
-  const margin = 1.15; // ~15% padding around the config
+  const margin = 1.15; // ~15% padding around the config/map
   const worldW = Math.max(bounds.maxX - bounds.minX, 1e-3);
   const worldH = Math.max(bounds.maxY - bounds.minY, 1e-3);
   const fitScale = Math.min(
@@ -213,7 +238,6 @@ function fitViewToConfig() {
   centerX = canvas.width / 2 - worldCenterX * scale;
   centerY = canvas.height / 2 + worldCenterY * scale;
 }
-
 // Helper to show instructions
 function showInstruction(text) {
   const banner = document.getElementById('instruction-banner');
@@ -691,10 +715,54 @@ function drawReservationConfig() {
   });
 }
 
+function drawMap() {
+  if (!mapData) return;
+
+  const width = mapData.info.width;
+  const height = mapData.info.height;
+  const res = mapData.info.resolution;
+  const originX = mapData.info.origin.position.x;
+  const originY = mapData.info.origin.position.y;
+
+  ctx.save();
+  ctx.shadowBlur = 0;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = x + y * width;
+      const val = mapData.data[idx];
+      
+      if (val === 0) {
+        continue;
+      }
+      
+      let color;
+      if (val === 100) {
+        color = 'rgba(255, 255, 255, 0.15)'; // Occupied
+      } else if (val === -1) {
+        color = 'rgba(128, 128, 128, 0.05)'; // Unknown
+      } else {
+        color = `rgba(255, 255, 255, ${val / 100 * 0.15})`;
+      }
+
+      const cellWorldX = originX + x * res;
+      const cellWorldY = originY + y * res;
+      const topLeftPix = toPixel(cellWorldX, cellWorldY + res);
+      const cellPixelSize = res * scale;
+
+      ctx.fillStyle = color;
+      ctx.fillRect(topLeftPix.x, topLeftPix.y, cellPixelSize, cellPixelSize);
+    }
+  }
+
+  ctx.restore();
+}
 // Rendering grid background and actors
 function drawGrid() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+  // Draw map first
+  drawMap();
   // 1. Draw grid, aligned to the world origin.
   const worldLeft = (0 - centerX) / scale;
   const worldRight = (canvas.width - centerX) / scale;
@@ -730,6 +798,7 @@ function drawGrid() {
   // can see every spot a robot can be placed at.
   if (scale * SNAP_M >= 5) {
     drawLines(SNAP_M, 'rgba(255, 255, 255, 0.04)');
+
   }
   // Major grid: brighter lines on the nice interval.
   drawLines(majorStep, 'rgba(255, 255, 255, 0.10)');
@@ -1055,9 +1124,22 @@ function fetchReservationConfig() {
     .catch(err => console.error('Failed to load reservation config:', err));
 }
 
+function fetchMap() {
+  fetch('/map')
+    .then(res => res.json())
+    .then(data => {
+      if (data && data.info) {
+        mapData = data;
+        fitViewToConfig();
+        console.log('Loaded map:', mapData);
+      }
+    })
+    .catch(err => console.error('Failed to load map:', err));
+}
 // Boot application
 resizeCanvasDisplay();
 fetchConfig();
 fetchReservationConfig();
+fetchMap();
 initSSE();
 animationLoop();
