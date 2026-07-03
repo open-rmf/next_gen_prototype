@@ -22,7 +22,7 @@ import launch_testing
 from nav_msgs.msg import Odometry
 import pytest
 import rclpy
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
@@ -131,6 +131,13 @@ class TestPathServerFollow(unittest.TestCase):
         r2_positions = []
         trajectory = []
 
+        reliable_transient_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
         def r1_odom_cb(msg):
             x = msg.pose.pose.position.x
             y = msg.pose.pose.position.y
@@ -167,26 +174,33 @@ class TestPathServerFollow(unittest.TestCase):
                     f'progress {wp.progress}, blockers: {blockers}'
                 )
 
-        self.node.create_subscription(Odometry, 'robot_1/odom', r1_odom_cb, 10)
-        self.node.create_subscription(Odometry, 'robot_2/odom', r2_odom_cb, 10)
-        self.node.create_subscription(Plan, 'robot_1/plan', r1_plan_cb, 10)
-        self.node.create_subscription(Plan, 'robot_2/plan', r2_plan_cb, 10)
+        self.node.create_subscription(
+            Odometry, 'robot_1/odom', r1_odom_cb,
+            qos_profile=reliable_transient_qos
+        )
+        self.node.create_subscription(
+            Odometry, 'robot_2/odom', r2_odom_cb,
+            qos_profile=reliable_transient_qos
+        )
+        self.node.create_subscription(
+            Plan, 'robot_1/plan', r1_plan_cb,
+            qos_profile=reliable_transient_qos
+        )
+        self.node.create_subscription(
+            Plan, 'robot_2/plan', r2_plan_cb,
+            qos_profile=reliable_transient_qos
+        )
 
         # Publishers for destinations
-        dest_qos = QoSProfile(
-            depth=10,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            history=HistoryPolicy.KEEP_LAST
-        )
         r1_dest_pub = self.node.create_publisher(
             Destination,
             'robot_1/destination',
-            qos_profile=dest_qos
+            qos_profile=reliable_transient_qos
         )
         r2_dest_pub = self.node.create_publisher(
             Destination,
             'robot_2/destination',
-            qos_profile=dest_qos
+            qos_profile=reliable_transient_qos
         )
 
         # Discovery publisher

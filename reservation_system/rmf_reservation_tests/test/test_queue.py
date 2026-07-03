@@ -24,7 +24,7 @@ import launch_ros
 import launch_testing
 import pytest
 import rclpy
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
@@ -68,10 +68,11 @@ class TestQueue(unittest.TestCase):
         rclpy.init()
         cls.node = rclpy.create_node('test_queue_node')
 
-        cls.goal_qos = QoSProfile(
+        cls.reliable_transient_qos = QoSProfile(
             depth=10,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
         )
         discovery_qos = QoSProfile(
             depth=1,
@@ -86,7 +87,7 @@ class TestQueue(unittest.TestCase):
                 Destination,
                 f'{name}/destination',
                 lambda msg, n=name: cls.destinations[n].append(msg),
-                10,
+                qos_profile=cls.reliable_transient_qos,
             )
 
         cls.discovery_pub = cls.node.create_publisher(
@@ -122,7 +123,7 @@ class TestQueue(unittest.TestCase):
 
         for name in ROBOT_NAMES:
             self.goal_pubs[name] = self.node.create_publisher(
-                DestinationGoal, f'{name}/destination/goal', qos_profile=self.goal_qos
+                DestinationGoal, f'{name}/destination/goal', qos_profile=self.reliable_transient_qos
             )
 
         for buffer in self.destinations.values():

@@ -27,7 +27,7 @@ import launch_ros
 import launch_testing
 import pytest
 import rclpy
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
@@ -77,10 +77,11 @@ class TestSafeSets(unittest.TestCase):
         rclpy.init()
         cls.node = rclpy.create_node('test_safe_sets_node')
 
-        goal_qos = QoSProfile(
+        reliable_transient_qos = QoSProfile(
             depth=10,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
         )
         discovery_qos = QoSProfile(
             depth=1,
@@ -98,16 +99,16 @@ class TestSafeSets(unittest.TestCase):
                 Destination,
                 f'{name}/destination',
                 lambda msg, n=name: cls.destinations[n].append(msg),
-                10,
+                qos_profile=reliable_transient_qos,
             )
             cls.node.create_subscription(
                 DestinationError,
                 f'{name}/destination/error',
                 lambda msg, n=name: cls.errors[n].append(msg),
-                10,
+                qos_profile=reliable_transient_qos,
             )
             cls.goal_pubs[name] = cls.node.create_publisher(
-                DestinationGoal, f'{name}/destination/goal', qos_profile=goal_qos
+                DestinationGoal, f'{name}/destination/goal', qos_profile=reliable_transient_qos
             )
 
         cls.discovery_pub = cls.node.create_publisher(
