@@ -1,0 +1,19 @@
+<package format="3">
+  <name>rmf_nav2_traffic</name>
+  <version>0.0.0</version>
+  <description>A traffic plugin for Next Gen RMF for Nav2 systems</description>
+  <maintainer email="ohxiyu@gmail.com">Xiyu Oh</maintainer>
+  <license>TODO</license>
+
+  <depend>geometry_msgs</depend>
+  <depend>nav2_msgs</depend>
+  <depend>navigation2</depend>
+  <depend>rclrs</depend>
+  <depend>rmf_prototype_msgs</depend>
+  <depend>spatio_temporal_partition_layer</depend>
+  <depend>std_msgs</depend>
+
+  <export>
+    <build_type>ament_cargo</build_type>
+  </export>
+</package>
