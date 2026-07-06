@@ -20,8 +20,10 @@ use ros_env::rmf_prototype_msgs::{
     self,
     msg::{Destination, Plan, PlanId, TrafficDependency, Waypoint},
 };
-use std::collections::{hash_map::Entry, HashMap};
-use std::sync::Arc;
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    sync::Arc,
+};
 
 pub mod planner;
 pub use planner::{Map, MapfPlanner, MockPlanner, PibtPlanner};
