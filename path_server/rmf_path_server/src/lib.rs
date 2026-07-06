@@ -11,18 +11,23 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 use mapf_post::{na::Isometry2, MapfResult, SemanticPlan, SemanticWaypoint};
 use rclrs::{IntoPrimitiveOptions, Node};
-use ros_env::builtin_interfaces;
-use ros_env::nav_msgs::msg::Odometry;
-use ros_env::rmf_prototype_msgs;
-use ros_env::rmf_prototype_msgs::msg::{Destination, Plan, PlanId, TrafficDependency, Waypoint};
-use std::collections::{hash_map::Entry, HashMap};
-use std::sync::Arc;
+use ros_env::{
+    builtin_interfaces,
+    nav_msgs::msg::{OccupancyGrid, Odometry},
+    rmf_prototype_msgs::{
+        self,
+        msg::{Destination, Plan, PlanId, TrafficDependency, Waypoint},
+    },
+};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    sync::Arc,
+};
 
 pub mod planner;
-pub use planner::{MapfPlanner, MockPlanner, PibtPlanner};
+pub use planner::{Map, MapfPlanner, MockPlanner, PibtPlanner};
 
 pub struct PlanSuccess {
     pub session_id: u64,
@@ -53,6 +58,7 @@ pub struct PlanServer<P: MapfPlanner> {
     pub current_planning_session: Option<u64>,
     pub footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
     pub active_plan_ids: HashMap<String, PlanId>,
+    pub map: Arc<Map>,
 }
 
 impl<P: MapfPlanner> PlanServer<P> {
@@ -77,6 +83,7 @@ impl<P: MapfPlanner> PlanServer<P> {
             current_planning_session: None,
             footprints,
             active_plan_ids: HashMap::new(),
+            map: Arc::new(Map::default()),
         }
     }
 
@@ -322,6 +329,7 @@ impl<P: MapfPlanner> PlanServer<P> {
         let planner_clone = Arc::clone(&self.planner);
         let footprints_clone = Arc::clone(&self.footprints);
         let sender_clone = self.plan_sender.clone();
+        let map_clone = self.map.clone();
 
         std::thread::spawn(move || {
             if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
@@ -351,6 +359,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                 &goals,
                 &footprints_map,
                 &robot_ids,
+                map_clone.as_ref(),
                 Arc::clone(&cancellation),
             ) {
                 Ok(plan) => plan,
@@ -489,6 +498,7 @@ pub struct PathServerRunning<P: MapfPlanner> {
         rclrs::WorkerSubscription<rmf_prototype_msgs::msg::ParticipantList, DiscoveryServer<P>>,
     pub discovery_subscription:
         rclrs::WorkerSubscription<rmf_prototype_msgs::msg::ParticipantList, DiscoveryServer<P>>,
+    pub map_subscription: rclrs::WorkerSubscription<OccupancyGrid, PlanServer<P>>,
 }
 
 pub fn start_path_server<P: MapfPlanner + 'static>(
@@ -501,6 +511,14 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
     // Create the Destinations worker
     let destinations_worker =
         node.create_worker(PlanServer::new(node.clone(), planner, footprints));
+
+    let map_subscription = destinations_worker.create_subscription::<OccupancyGrid, _>(
+        "/map".transient_local().reliable(),
+        move |server: &mut PlanServer<P>, msg: OccupancyGrid| {
+            rclrs::log!(server.node.logger(), "Received map message");
+            server.map = Arc::new(Map { grid: msg });
+        },
+    )?;
 
     // Create a periodic timer on the Destinations worker to trigger replans asynchronously.
     let replan_timer = destinations_worker.create_timer_repeating(
@@ -611,5 +629,6 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
         replan_timer: Box::new(replan_timer),
         list_subscription,
         discovery_subscription,
+        map_subscription,
     })
 }

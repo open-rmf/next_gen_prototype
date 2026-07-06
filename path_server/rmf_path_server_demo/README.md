@@ -44,6 +44,17 @@ full comparison.
 - **Send**: Click "Send Scenario" to submit goals for resolution and start planning.
 - The canvas will highlight the chosen goals in solid colors and fade out the unused alternatives.
 
+### 3. Map Server Mode (Grid Map Testing)
+In this mode, the launch file also spins up a ROS 2 `map_server` loaded with a custom 20x20 grid map (`demo_grid.png`) and activates it. The dashboard subscribes to `/map` and visualizes it as a background layer.
+
+Run the launch file:
+```bash
+ros2 launch rmf_path_server_demo demo_map.launch.py
+```
+- Open `http://localhost:8080` in your web browser.
+- The canvas will automatically fit to the 20x20 grid map.
+- You can add robots and set goals as in the default mode, and see the map obstacles (a box in the center) drawn on the canvas.
+
 ## Reservation Config Visualization
 
 When the reservation destination server loads a configuration, it republishes
