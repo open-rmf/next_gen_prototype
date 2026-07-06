@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 rclrs = "*"
 ros-env = "0.2.0"
+rmf_participant_discovery = { path = "../../rmf_participant_discovery" }
