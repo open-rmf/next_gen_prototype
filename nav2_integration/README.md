@@ -136,12 +136,7 @@ Spin up the Nav2 simulation:
 ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py   robots:="robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};"
 ```
 
-In a separate terminal, spin up the Nav2 traffic node:
-```
-ros2 run rmf_nav2_traffic nav2_traffic --ros-args -p use_sim_time:=true
-```
-
-Run the demo launch file containing the path server, plan executor, destination server, and path visualizer nodes:
+In a separate terminal, run the demo launch file containing the path server, plan executor, destination server, path visualizer and Nav2 traffic nodes:
 ```
 ros2 launch rmf_path_server_demo demo_viz.launch.py robots:="robot0 robot1"
 ```
