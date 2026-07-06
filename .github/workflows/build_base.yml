@@ -2,7 +2,7 @@ name: Build and Publish Base Container
 
 on:
   push:
-    branches: [ epic/next-gen-base ]
+    branches: [ main ]
     paths:
       - 'docker/Dockerfile.base'
       - 'docker/base.repos'
