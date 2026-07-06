@@ -1,7 +1,9 @@
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
-use ros_env::geometry_msgs::msg::Point;
-use ros_env::rmf_prototype_msgs::msg::{Plan, SafeZone};
-use ros_env::visualization_msgs::msg::{Marker, MarkerArray};
+use ros_env::{
+    geometry_msgs::msg::Point,
+    rmf_prototype_msgs::msg::{Plan, SafeZone},
+    visualization_msgs::msg::{Marker, MarkerArray},
+};
 use std::collections::HashMap;
 
 struct RobotConnections {
@@ -51,12 +53,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let robot_id_clone = robot_id.to_string();
                 let robot_id_clone2 = robot_id.to_string();
-                
+
                 let topic_name = format!("{}/plan", robot_id);
                 let safe_zone_topic = format!("{}/plan/safe_zone", robot_id);
                 let marker_topic = format!("{}/path_markers", robot_id);
 
-                let publisher = match server.node.create_publisher::<MarkerArray>(marker_topic.as_str().transient_local().reliable()) {
+                let publisher = match server.node.create_publisher::<MarkerArray>(
+                    marker_topic.as_str().transient_local().reliable(),
+                ) {
                     Ok(publ) => publ,
                     Err(err) => {
                         rclrs::log_error!(
@@ -114,56 +118,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let publisher_sz = publisher.clone();
-                let safe_zone_sub = match server.visualizer_worker.create_subscription::<SafeZone, _>(
-                    safe_zone_topic.as_str().transient_local().reliable(),
-                    move |_vs: &mut VisualizerServer, msg: SafeZone| {
-                        if msg.incremental_target.regions.is_empty() {
+                let safe_zone_sub =
+                    match server.visualizer_worker.create_subscription::<SafeZone, _>(
+                        safe_zone_topic.as_str().transient_local().reliable(),
+                        move |_vs: &mut VisualizerServer, msg: SafeZone| {
+                            if msg.incremental_target.regions.is_empty() {
+                                return;
+                            }
+                            let region = &msg.incremental_target.regions[0].region;
+                            if region.points.len() >= 2 {
+                                let x = region.points[0] as f64;
+                                let y = region.points[1] as f64;
+
+                                let mut marker_array = MarkerArray { markers: vec![] };
+                                let mut marker = Marker::default();
+                                marker.header.frame_id = "map".to_string();
+                                marker.ns = format!("{}_safe_zone", robot_id_clone2);
+                                marker.id = 1;
+                                marker.type_ =
+                                    ros_env::visualization_msgs::msg::Marker::SPHERE as i32;
+                                marker.action =
+                                    ros_env::visualization_msgs::msg::Marker::ADD as i32;
+
+                                marker.color.r = 1.0;
+                                marker.color.g = 0.0;
+                                marker.color.b = 0.0;
+                                marker.color.a = 1.0;
+
+                                marker.scale.x = 0.25;
+                                marker.scale.y = 0.25;
+                                marker.scale.z = 0.25;
+
+                                marker.pose.position.x = x;
+                                marker.pose.position.y = y;
+                                marker.pose.position.z = 0.0;
+
+                                marker.pose.orientation.w = 1.0; // valid quaternion
+
+                                marker_array.markers.push(marker);
+                                let _ = publisher_sz.publish(&marker_array);
+                            }
+                        },
+                    ) {
+                        Ok(sub) => sub,
+                        Err(err) => {
+                            rclrs::log_error!(
+                                server.node.logger(),
+                                "Failed to create safe_zone subscription for {}: {:?}",
+                                robot_id,
+                                err
+                            );
                             return;
                         }
-                        let region = &msg.incremental_target.regions[0].region;
-                        if region.points.len() >= 2 {
-                            let x = region.points[0] as f64;
-                            let y = region.points[1] as f64;
-
-                            let mut marker_array = MarkerArray { markers: vec![] };
-                            let mut marker = Marker::default();
-                            marker.header.frame_id = "map".to_string();
-                            marker.ns = format!("{}_safe_zone", robot_id_clone2);
-                            marker.id = 1;
-                            marker.type_ = ros_env::visualization_msgs::msg::Marker::SPHERE as i32;
-                            marker.action = ros_env::visualization_msgs::msg::Marker::ADD as i32;
-
-                            marker.color.r = 1.0;
-                            marker.color.g = 0.0;
-                            marker.color.b = 0.0;
-                            marker.color.a = 1.0;
-
-                            marker.scale.x = 0.25;
-                            marker.scale.y = 0.25;
-                            marker.scale.z = 0.25;
-
-                            marker.pose.position.x = x;
-                            marker.pose.position.y = y;
-                            marker.pose.position.z = 0.0;
-
-                            marker.pose.orientation.w = 1.0; // valid quaternion
-
-                            marker_array.markers.push(marker);
-                            let _ = publisher_sz.publish(&marker_array);
-                        }
-                    },
-                ) {
-                    Ok(sub) => sub,
-                    Err(err) => {
-                        rclrs::log_error!(
-                            server.node.logger(),
-                            "Failed to create safe_zone subscription for {}: {:?}",
-                            robot_id,
-                            err
-                        );
-                        return;
-                    }
-                };
+                    };
 
                 server.active_robots.insert(
                     robot_id.to_string(),
@@ -185,10 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    rclrs::log!(
-        node.logger(),
-        "Starting rmf_path_visualizer with discovery"
-    );
+    rclrs::log!(node.logger(), "Starting rmf_path_visualizer with discovery");
     executor.spin(SpinOptions::default());
     Ok(())
 }
