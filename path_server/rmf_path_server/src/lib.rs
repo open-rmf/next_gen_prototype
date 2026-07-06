@@ -11,14 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-use mapf_post::{na::Isometry2, MapfResult, SemanticPlan, SemanticWaypoint};
-use rclrs::{IntoPrimitiveOptions, Node};
-use ros_env::builtin_interfaces;
-use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
-use ros_env::rmf_prototype_msgs::{
-    self,
-    msg::{Destination, Plan, PlanId, TrafficDependency, Waypoint},
+use ros_env::{
+    builtin_interfaces,
+    nav_msgs::msg::{OccupancyGrid, Odometry},
+    rmf_prototype_msgs::{
+        self,
+        msg::{Destination, Plan, PlanId, TrafficDependency, Waypoint},
+    },
 };
 use std::{
     collections::{hash_map::Entry, HashMap},
