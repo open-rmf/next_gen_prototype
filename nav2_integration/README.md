@@ -138,7 +138,7 @@ ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py   robots:
 
 In a separate terminal, run the demo launch file containing the path server, plan executor, destination server, path visualizer and Nav2 traffic nodes:
 ```
-ros2 launch rmf_path_server_demo demo_viz.launch.py robots:="robot0 robot1"
+ros2 launch rmf_path_server_demo demo_nav2.launch.py robots:="robot0 robot1"
 ```
 
 Send action goals to the robots:
