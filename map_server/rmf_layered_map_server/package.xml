@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rmf_layered_map_server</name>
+  <version>0.0.1</version>
+  <description>A layered map server for RMF next generation prototype.</description>
+  <maintainer email="arjoc@intrinsic.ai">Arjo Chakravarty</maintainer>
+  <license>Apache License 2.0</license>
+
+  <buildtool_depend>ament_cargo</buildtool_depend>
+
+  <depend>rclrs</depend>
+  <depend>rmf_layered_map_msgs</depend>
+  <depend>rmf_prototype_msgs</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <export>
+    <build_type>ament_cargo</build_type>
+  </export>
+</package>
