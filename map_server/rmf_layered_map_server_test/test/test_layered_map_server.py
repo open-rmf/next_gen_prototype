@@ -22,7 +22,11 @@ from nav_msgs.msg import OccupancyGrid
 import pytest
 import rclpy
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from rmf_layered_map_msgs.msg import MapObservationSource, MapRegionUpdate
+from rmf_layered_map_msgs.msg import (
+    MapObservationSource,
+    MapRegionPatch,
+    MapRegionUpdate,
+)
 from rmf_prototype_msgs.msg import Region
 
 
@@ -174,31 +178,34 @@ def static_map():
 
 def map_source():
     msg = MapObservationSource()
+    msg.header.frame_id = 'map'
     msg.source_id = 'test/obstacle'
     msg.robot_name = 'test_robot'
     msg.map_name = 'test_map'
-    msg.frame_id = 'map'
-    msg.default_ttl.sec = 1
+    msg.default_ttl_sec = 1.0
     return msg
 
 
 def obstacle_update(ttl_sec=1):
     msg = MapRegionUpdate()
     msg.source = map_source()
-    msg.source.default_ttl.sec = ttl_sec
-    msg.update_type = MapRegionUpdate.UPDATE_OBSTACLE
-    msg.occupancy_value = 100
-    msg.ttl.sec = ttl_sec
+    msg.source.default_ttl_sec = float(ttl_sec)
+
+    patch = MapRegionPatch()
+    patch.update_type = MapRegionPatch.UPDATE_OBSTACLE
+    patch.occupancy_value = 100
+    patch.ttl_sec = float(ttl_sec)
 
     region = Region()
     region.hint = Region.HINT_AXIS_ALIGNED_RECTANGLE
     region.points = [2.0, 2.0, 3.0, 3.0]
-    msg.regions.append(region)
+    patch.regions.append(region)
+    msg.patches.append(patch)
     return msg
 
 
 def reset_update():
     msg = MapRegionUpdate()
     msg.source = map_source()
-    msg.update_type = MapRegionUpdate.UPDATE_RESET
+    msg.reset_source = True
     return msg

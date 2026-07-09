@@ -14,12 +14,11 @@
 
 use rclrs::{IntoPrimitiveOptions, Node, PrimitiveOptions};
 use ros_env::{
-    builtin_interfaces::msg::{Duration as RosDuration, Time as RosTime},
     nav_msgs::msg::OccupancyGrid,
-    rmf_layered_map_msgs::msg::MapRegionUpdate,
+    rmf_layered_map_msgs::msg::{MapRegionPatch, MapRegionUpdate},
     rmf_prototype_msgs::msg::Region,
 };
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 const MAP_QOS_DEPTH: u32 = 10;
@@ -40,10 +39,17 @@ struct DynamicObservation {
     expires_at_nsec: i128,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ObservationSourceKey {
+    source_id: String,
+    map_name: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct LayeredMap {
     static_grid: Option<OccupancyGrid>,
     dynamic_observations: Vec<DynamicObservation>,
+    latest_source_stamps: HashMap<ObservationSourceKey, i128>,
     default_ttl_nsec: i128,
     revision: u64,
 }
@@ -53,6 +59,7 @@ impl LayeredMap {
         Self {
             static_grid: None,
             dynamic_observations: Vec::new(),
+            latest_source_stamps: HashMap::new(),
             default_ttl_nsec: duration_to_nsec(default_ttl),
             revision: 0,
         }
@@ -73,62 +80,94 @@ impl LayeredMap {
     }
 
     pub fn ingest_region_update(&mut self, update: MapRegionUpdate, now_nsec: i128) -> bool {
-        if update.update_type == MapRegionUpdate::UPDATE_RESET {
-            let before = self.dynamic_observations.len();
-            self.dynamic_observations.retain(|obs| {
-                obs.source_id != update.source.source_id || obs.map_name != update.source.map_name
-            });
-            let changed = before != self.dynamic_observations.len();
-            if changed {
-                self.revision = self.revision.wrapping_add(1);
-            }
-            return changed;
-        }
-
-        let update_type = match update.update_type {
-            MapRegionUpdate::UPDATE_OBSTACLE => DynamicUpdateType::Obstacle,
-            MapRegionUpdate::UPDATE_CLEAR => DynamicUpdateType::Clear,
-            _ => return false,
+        let reset_source = update.reset_source;
+        let key = ObservationSourceKey {
+            source_id: update.source.source_id.clone(),
+            map_name: update.source.map_name.clone(),
         };
-
-        if update.regions.is_empty() {
-            return false;
-        }
-
-        let ttl_nsec = first_positive_duration_nsec(&update.ttl)
-            .or_else(|| first_positive_duration_nsec(&update.source.default_ttl))
-            .unwrap_or(self.default_ttl_nsec);
-        if ttl_nsec <= 0 {
-            return false;
-        }
-
-        let stamp_nsec = if is_zero_time(&update.source.stamp) {
+        let stamp_nsec = if update.source.header.stamp.sec == 0
+            && update.source.header.stamp.nanosec == 0
+        {
             now_nsec
         } else {
-            time_to_nsec(&update.source.stamp)
+            i128::from(update.source.header.stamp.sec) * NANOS_PER_SECOND
+                + i128::from(update.source.header.stamp.nanosec)
         };
-        let expires_at_nsec = stamp_nsec + ttl_nsec;
-        if expires_at_nsec <= now_nsec {
+
+        if self
+            .latest_source_stamps
+            .get(&key)
+            .is_some_and(|latest_stamp| stamp_nsec < *latest_stamp)
+        {
             return false;
         }
 
-        let occupancy_value = match update_type {
-            DynamicUpdateType::Obstacle if update.occupancy_value <= 0 => 100,
-            DynamicUpdateType::Obstacle => update.occupancy_value.clamp(1, 100),
-            DynamicUpdateType::Clear if update.occupancy_value < 0 => 0,
-            DynamicUpdateType::Clear => update.occupancy_value.clamp(0, 100),
-        };
+        let mut changed = false;
 
-        self.dynamic_observations.push(DynamicObservation {
-            source_id: update.source.source_id,
-            map_name: update.source.map_name,
-            update_type,
-            occupancy_value,
-            regions: update.regions,
-            expires_at_nsec,
+        if reset_source {
+            let before = self.dynamic_observations.len();
+            self.dynamic_observations
+                .retain(|obs| obs.source_id != key.source_id || obs.map_name != key.map_name);
+            changed |= before != self.dynamic_observations.len();
+        }
+
+        let default_ttl_sec = update.source.default_ttl_sec;
+        let mut patches = update.patches;
+        patches.sort_by_key(|patch| match patch.update_type {
+            MapRegionPatch::UPDATE_CLEAR => 0,
+            MapRegionPatch::UPDATE_OBSTACLE => 1,
+            _ => 2,
         });
-        self.revision = self.revision.wrapping_add(1);
-        true
+
+        for patch in patches {
+            let update_type = match patch.update_type {
+                MapRegionPatch::UPDATE_OBSTACLE => DynamicUpdateType::Obstacle,
+                MapRegionPatch::UPDATE_CLEAR => DynamicUpdateType::Clear,
+                _ => continue,
+            };
+
+            if patch.regions.is_empty() {
+                continue;
+            }
+
+            let ttl_nsec = positive_seconds_to_nsec(patch.ttl_sec)
+                .or_else(|| positive_seconds_to_nsec(default_ttl_sec))
+                .unwrap_or(self.default_ttl_nsec);
+            if ttl_nsec <= 0 {
+                continue;
+            }
+
+            let expires_at_nsec = stamp_nsec + ttl_nsec;
+            if expires_at_nsec <= now_nsec {
+                continue;
+            }
+
+            let occupancy_value = match update_type {
+                DynamicUpdateType::Obstacle if patch.occupancy_value <= 0 => 100,
+                DynamicUpdateType::Obstacle => patch.occupancy_value.clamp(1, 100),
+                DynamicUpdateType::Clear if patch.occupancy_value < 0 => 0,
+                DynamicUpdateType::Clear => patch.occupancy_value.clamp(0, 100),
+            };
+
+            self.dynamic_observations.push(DynamicObservation {
+                source_id: key.source_id.clone(),
+                map_name: key.map_name.clone(),
+                update_type,
+                occupancy_value,
+                regions: patch.regions,
+                expires_at_nsec,
+            });
+            changed = true;
+        }
+
+        if changed || reset_source {
+            self.latest_source_stamps.insert(key, stamp_nsec);
+        }
+
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        changed
     }
 
     pub fn prune_expired(&mut self, now_nsec: i128) -> bool {
@@ -541,36 +580,27 @@ fn point_in_polygon(x: f64, y: f64, polygon: &[(f64, f64)]) -> bool {
     inside
 }
 
-fn time_to_nsec(time: &RosTime) -> i128 {
-    i128::from(time.sec) * NANOS_PER_SECOND + i128::from(time.nanosec)
-}
-
-fn duration_msg_to_nsec(duration: &RosDuration) -> i128 {
-    i128::from(duration.sec) * NANOS_PER_SECOND + i128::from(duration.nanosec)
-}
-
 fn duration_to_nsec(duration: Duration) -> i128 {
     i128::from(duration.as_secs()) * NANOS_PER_SECOND + i128::from(duration.subsec_nanos())
 }
 
-fn first_positive_duration_nsec(duration: &RosDuration) -> Option<i128> {
-    let nsec = duration_msg_to_nsec(duration);
-    (nsec > 0).then_some(nsec)
-}
+fn positive_seconds_to_nsec(seconds: f64) -> Option<i128> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
 
-fn is_zero_time(time: &RosTime) -> bool {
-    time.sec == 0 && time.nanosec == 0
+    Some((seconds * NANOS_PER_SECOND as f64).round() as i128)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ros_env::{
-        builtin_interfaces::msg::Duration as RosDuration,
         geometry_msgs::msg::{Point, Pose, Quaternion},
         nav_msgs::msg::MapMetaData,
-        rmf_layered_map_msgs::msg::{MapObservationSource, MapRegionUpdate},
+        rmf_layered_map_msgs::msg::{MapObservationSource, MapRegionPatch, MapRegionUpdate},
         rmf_prototype_msgs::msg::Region,
+        std_msgs::msg::Header,
     };
 
     fn static_grid(width: u32, height: u32, value: i8) -> OccupancyGrid {
@@ -603,14 +633,14 @@ mod tests {
 
     fn source_with_id(source_id: &str) -> MapObservationSource {
         MapObservationSource {
+            header: Header {
+                frame_id: "map".to_string(),
+                ..Default::default()
+            },
             source_id: source_id.to_string(),
             robot_name: "robot_1".to_string(),
             map_name: "test_map".to_string(),
-            frame_id: "map".to_string(),
-            default_ttl: RosDuration {
-                sec: 10,
-                nanosec: 0,
-            },
+            default_ttl_sec: 10.0,
             ..Default::default()
         }
     }
@@ -636,11 +666,18 @@ mod tests {
         }
     }
 
+    fn patch(update_type: u8, regions: Vec<Region>) -> MapRegionPatch {
+        MapRegionPatch {
+            update_type,
+            regions,
+            ..Default::default()
+        }
+    }
+
     fn update(update_type: u8, regions: Vec<Region>) -> MapRegionUpdate {
         MapRegionUpdate {
             source: source(),
-            update_type,
-            regions,
+            patches: vec![patch(update_type, regions)],
             ..Default::default()
         }
     }
@@ -648,8 +685,7 @@ mod tests {
     fn update_from(source_id: &str, update_type: u8, regions: Vec<Region>) -> MapRegionUpdate {
         MapRegionUpdate {
             source: source_with_id(source_id),
-            update_type,
-            regions,
+            patches: vec![patch(update_type, regions)],
             ..Default::default()
         }
     }
@@ -661,7 +697,7 @@ mod tests {
 
         assert!(map.ingest_region_update(
             update(
-                MapRegionUpdate::UPDATE_OBSTACLE,
+                MapRegionPatch::UPDATE_OBSTACLE,
                 vec![rectangle(2.0, 1.0, 3.0, 3.0)]
             ),
             1_000,
@@ -684,7 +720,7 @@ mod tests {
         map.set_static_map(static_map);
 
         assert!(map.ingest_region_update(
-            update(MapRegionUpdate::UPDATE_OBSTACLE, vec![point(-0.25, 0.25)]),
+            update(MapRegionPatch::UPDATE_OBSTACLE, vec![point(-0.25, 0.25)]),
             0,
         ));
 
@@ -700,7 +736,7 @@ mod tests {
 
         assert!(map.ingest_region_update(
             update(
-                MapRegionUpdate::UPDATE_OBSTACLE,
+                MapRegionPatch::UPDATE_OBSTACLE,
                 vec![polygon(vec![1.0, 1.0, 3.0, 1.0, 3.0, 3.0, 1.0, 3.0])]
             ),
             0,
@@ -722,7 +758,7 @@ mod tests {
 
         assert!(map.ingest_region_update(
             update(
-                MapRegionUpdate::UPDATE_OBSTACLE,
+                MapRegionPatch::UPDATE_OBSTACLE,
                 vec![rectangle(10.0, 10.0, 11.0, 11.0)]
             ),
             0,
@@ -739,7 +775,7 @@ mod tests {
 
         assert!(map.ingest_region_update(
             update(
-                MapRegionUpdate::UPDATE_OBSTACLE,
+                MapRegionPatch::UPDATE_OBSTACLE,
                 vec![Region {
                     hint: Region::HINT_POLYGON,
                     points: vec![1.0, 1.0, 2.0],
@@ -759,7 +795,7 @@ mod tests {
 
         assert!(map.ingest_region_update(
             update(
-                MapRegionUpdate::UPDATE_OBSTACLE,
+                MapRegionPatch::UPDATE_OBSTACLE,
                 vec![rectangle(1.0, 1.0, 2.0, 2.0)]
             ),
             0,
@@ -779,22 +815,52 @@ mod tests {
         map.set_static_map(static_grid(5, 5, -1));
 
         assert!(map.ingest_region_update(
-            update(
-                MapRegionUpdate::UPDATE_CLEAR,
-                vec![rectangle(1.0, 1.0, 4.0, 4.0)]
-            ),
-            0,
-        ));
-        assert!(map.ingest_region_update(
-            update(
-                MapRegionUpdate::UPDATE_OBSTACLE,
-                vec![rectangle(2.0, 2.0, 3.0, 3.0)]
-            ),
+            MapRegionUpdate {
+                source: source(),
+                patches: vec![
+                    patch(
+                        MapRegionPatch::UPDATE_CLEAR,
+                        vec![rectangle(1.0, 1.0, 4.0, 4.0)]
+                    ),
+                    patch(
+                        MapRegionPatch::UPDATE_OBSTACLE,
+                        vec![rectangle(2.0, 2.0, 3.0, 3.0)]
+                    ),
+                ],
+                ..Default::default()
+            },
             0,
         ));
 
         let composed = map.compose().unwrap();
         assert_eq!(composed.data[1 * 5 + 1], 0);
+        assert_eq!(composed.data[2 * 5 + 2], 100);
+        assert_eq!(composed.data[0], -1);
+    }
+
+    #[test]
+    fn newer_obstacles_survive_older_clear_updates_received_late() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(5, 5, -1));
+
+        let mut obstacle = update(
+            MapRegionPatch::UPDATE_OBSTACLE,
+            vec![rectangle(2.0, 2.0, 3.0, 3.0)],
+        );
+        obstacle.source.header.stamp.sec = 2;
+
+        let mut clear = update(
+            MapRegionPatch::UPDATE_CLEAR,
+            vec![rectangle(1.0, 1.0, 4.0, 4.0)],
+        );
+        clear.reset_source = true;
+        clear.source.header.stamp.sec = 1;
+
+        assert!(map.ingest_region_update(obstacle, 3 * NANOS_PER_SECOND));
+        assert!(!map.ingest_region_update(clear, 3 * NANOS_PER_SECOND));
+
+        let composed = map.compose().unwrap();
+        assert_eq!(composed.data[1 * 5 + 1], -1);
         assert_eq!(composed.data[2 * 5 + 2], 100);
         assert_eq!(composed.data[0], -1);
     }
@@ -806,7 +872,7 @@ mod tests {
 
         assert!(map.ingest_region_update(
             update(
-                MapRegionUpdate::UPDATE_OBSTACLE,
+                MapRegionPatch::UPDATE_OBSTACLE,
                 vec![rectangle(1.0, 1.0, 2.0, 2.0)]
             ),
             0,
@@ -815,7 +881,7 @@ mod tests {
         assert!(map.ingest_region_update(
             MapRegionUpdate {
                 source: source(),
-                update_type: MapRegionUpdate::UPDATE_RESET,
+                reset_source: true,
                 ..Default::default()
             },
             0,
@@ -834,7 +900,7 @@ mod tests {
         assert!(map.ingest_region_update(
             update_from(
                 "robot_1/local_costmap",
-                MapRegionUpdate::UPDATE_OBSTACLE,
+                MapRegionPatch::UPDATE_OBSTACLE,
                 vec![rectangle(1.0, 1.0, 2.0, 2.0)]
             ),
             0,
@@ -842,7 +908,7 @@ mod tests {
         assert!(map.ingest_region_update(
             update_from(
                 "robot_2/local_costmap",
-                MapRegionUpdate::UPDATE_OBSTACLE,
+                MapRegionPatch::UPDATE_OBSTACLE,
                 vec![rectangle(3.0, 3.0, 4.0, 4.0)]
             ),
             0,
@@ -855,7 +921,7 @@ mod tests {
         assert!(map.ingest_region_update(
             MapRegionUpdate {
                 source: source_with_id("robot_1/local_costmap"),
-                update_type: MapRegionUpdate::UPDATE_RESET,
+                reset_source: true,
                 ..Default::default()
             },
             0,

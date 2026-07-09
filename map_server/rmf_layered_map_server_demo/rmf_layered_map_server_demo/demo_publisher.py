@@ -16,7 +16,11 @@ from nav_msgs.msg import OccupancyGrid
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from rmf_layered_map_msgs.msg import MapObservationSource, MapRegionUpdate
+from rmf_layered_map_msgs.msg import (
+    MapObservationSource,
+    MapRegionPatch,
+    MapRegionUpdate,
+)
 from rmf_prototype_msgs.msg import Region
 
 
@@ -81,19 +85,22 @@ def static_map():
 def obstacle_update():
     msg = MapRegionUpdate()
     msg.source = MapObservationSource()
+    msg.source.header.frame_id = 'map'
     msg.source.source_id = 'demo/temporary_obstacle'
     msg.source.robot_name = 'demo_robot'
     msg.source.map_name = 'demo_map'
-    msg.source.frame_id = 'map'
-    msg.source.default_ttl.sec = 5
-    msg.update_type = MapRegionUpdate.UPDATE_OBSTACLE
-    msg.occupancy_value = 100
-    msg.ttl.sec = 5
+    msg.source.default_ttl_sec = 5.0
+
+    patch = MapRegionPatch()
+    patch.update_type = MapRegionPatch.UPDATE_OBSTACLE
+    patch.occupancy_value = 100
+    patch.ttl_sec = 5.0
 
     region = Region()
     region.hint = Region.HINT_AXIS_ALIGNED_RECTANGLE
     region.points = [4.0, 4.0, 6.0, 6.0]
-    msg.regions.append(region)
+    patch.regions.append(region)
+    msg.patches.append(patch)
     return msg
 
 
