@@ -266,6 +266,7 @@ impl LayeredMapServer {
     }
 
     fn handle_region_update(&mut self, msg: MapRegionUpdate) {
+        log_region_update_errors(&self.node, &msg);
         let now_nsec = self.now_nsec();
         if self.map.ingest_region_update(msg, now_nsec) {
             rclrs::log!(
@@ -382,6 +383,56 @@ fn region_update_qos(topic: &str) -> PrimitiveOptions<'_> {
     topic.keep_last(MAP_QOS_DEPTH).reliable()
 }
 
+fn log_region_update_errors(node: &Node, update: &MapRegionUpdate) {
+    for patch in &update.patches {
+        if !matches!(
+            patch.update_type,
+            MapRegionPatch::UPDATE_OBSTACLE | MapRegionPatch::UPDATE_CLEAR
+        ) {
+            rclrs::log_error!(
+                node.logger(),
+                "Ignoring map region patch with unsupported update_type {}",
+                patch.update_type
+            );
+            continue;
+        }
+
+        for region in &patch.regions {
+            if let Some(error) = region_validation_error(region) {
+                rclrs::log_error!(node.logger(), "Ignoring map region: {}", error);
+            }
+        }
+    }
+}
+
+fn region_validation_error(region: &Region) -> Option<&'static str> {
+    if region.points.len() < 2 {
+        return Some("region must contain at least one x/y point pair");
+    }
+
+    if region.points.len() % 2 != 0 {
+        return Some("region points must contain complete x/y pairs");
+    }
+
+    if !is_supported_region_hint(region.hint) {
+        return Some("unsupported region hint");
+    }
+
+    None
+}
+
+fn is_supported_region_hint(hint: u8) -> bool {
+    matches!(
+        hint,
+        Region::HINT_UNSPECIFIED
+            | Region::HINT_POINT
+            | Region::HINT_AXIS_ALIGNED_RECTANGLE
+            | Region::HINT_RECTANGLE
+            | Region::HINT_CONVEX_POLYGON
+            | Region::HINT_POLYGON
+    )
+}
+
 fn normalize_grid_data(grid: &mut OccupancyGrid) {
     let Some(expected_len) = grid_len(grid) else {
         grid.data.clear();
@@ -417,6 +468,10 @@ fn rasterized_indices(grid: &OccupancyGrid, region: &Region) -> Vec<usize> {
     };
 
     if region.points.len() < 2 || region.points.len() % 2 != 0 {
+        return Vec::new();
+    }
+
+    if !is_supported_region_hint(region.hint) {
         return Vec::new();
     }
 
