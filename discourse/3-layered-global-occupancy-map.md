@@ -68,7 +68,7 @@ Important fields:
 * `source`: metadata for the observation source
 * `reset_source`: remove active observations from the same `source_id` and
   `map_name` before applying the new patches
-* `patches`: ordered clear-space and occupied-space patches from this snapshot
+* `patches`: clear-space and occupied-space patches from this snapshot
 
 `reset_source` is useful when a source publishes replacement snapshots, changes
 maps, shuts down, or knows its previous observation state is no longer valid. It
