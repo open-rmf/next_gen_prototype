@@ -12,6 +12,14 @@ Default topics:
 
 Dynamic observations expire according to their TTL, so transient local obstacles do not remain in the global planning map forever. A LiDAR or local costmap observer can keep refreshing an obstacle while it is still seen, then let the server decay it after the TTL.
 
+`MapRegionUpdate` messages contain an ordered list of `MapRegionPatch` entries.
+A sensor snapshot that clears freespace and marks obstacles should publish clear
+patches before obstacle patches in the same message. If the snapshot replaces
+the source's previous observation state, set `reset_source` so the server removes
+old observations from that `source_id` and `map_name` before adding the new
+patches. Resetting has no TTL; clear and obstacle patches both use TTLs in
+seconds.
+
 ## Visualization Smoke Test
 
 Build and source the workspace:
