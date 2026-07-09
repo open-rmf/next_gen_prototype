@@ -25,6 +25,9 @@ pub use agent::*;
 pub mod destination;
 pub use destination::*;
 
+pub mod discovery;
+pub use discovery::*;
+
 pub mod inner_navigation_client;
 pub use inner_navigation_client::*;
 
@@ -46,12 +49,7 @@ impl Plugin for Nav2TrafficPlugin {
                 InnerNavigationClientPlugin::default(),
                 NavigationServerPlugin::default(),
                 Nav2AgentPlugin::default(),
+                AgentDiscoveryPlugin::default(),
             ));
-
-        // Spawn agents last
-        let agent_names = vec!["robot0".to_string(), "robot1".to_string()];
-        for name in agent_names {
-            app.world_mut().spawn(Nav2Agent::new(name));
-        }
     }
 }
