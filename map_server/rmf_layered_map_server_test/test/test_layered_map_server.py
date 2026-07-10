@@ -182,6 +182,7 @@ def static_map():
 def map_source():
     msg = MapObservationSource()
     msg.header.frame_id = 'map'
+    msg.robot_pose.orientation.w = 1.0
     msg.source_id = 'test/obstacle'
     msg.robot_name = 'test_robot'
     msg.map_name = 'test_map'

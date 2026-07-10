@@ -22,6 +22,8 @@ int8 occupancy_value
 # observations.
 float64 ttl_sec
 
-# 2D geometric observation patches. The first prototype supports point and
-# axis-aligned rectangle regions.
+# 2D geometric observation patches in the robot-local observation frame. The
+# map service transforms them into source.header.frame_id using
+# source.robot_pose. The first prototype supports point and axis-aligned
+# rectangle regions.
 rmf_prototype_msgs/Region[] regions

@@ -1,6 +1,6 @@
 # MapObservationSource.msg
 
-# Frame and time for this observation snapshot. The timestamp is required.
+# Global frame and time for this observation snapshot. The timestamp is required.
 # Consumers should reject updates with a zero timestamp.
 std_msgs/Header header
 
@@ -15,9 +15,10 @@ string robot_name
 # Map or level that the observations belong to.
 string map_name
 
-# Pose of the robot when this observation was produced. Fixed sensors or
-# synthetic map layers may leave this at its default value.
-geometry_msgs/PoseStamped robot_pose
+# Pose of the robot-local observation frame in header.frame_id when this
+# snapshot was produced. Fixed sensors can use their sensor pose. Sources whose
+# regions are already in header.frame_id should use the identity pose.
+geometry_msgs/Pose robot_pose
 
 # Fallback time-to-live in seconds for patches from this source.
 float64 default_ttl_sec

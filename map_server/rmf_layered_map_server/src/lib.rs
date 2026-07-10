@@ -14,6 +14,7 @@
 
 use rclrs::{IntoPrimitiveOptions, Node, PrimitiveOptions};
 use ros_env::{
+    geometry_msgs::msg::Pose,
     nav_msgs::msg::OccupancyGrid,
     rmf_layered_map_msgs::msg::{MapRegionPatch, MapRegionUpdate},
     rmf_prototype_msgs::msg::Region,
@@ -33,6 +34,7 @@ enum DynamicUpdateType {
 struct DynamicObservation {
     source_id: String,
     map_name: String,
+    frame_id: String,
     update_type: DynamicUpdateType,
     occupancy_value: i8,
     regions: Vec<Region>,
@@ -80,7 +82,7 @@ impl LayeredMap {
     }
 
     pub fn ingest_region_update(&mut self, update: MapRegionUpdate, now_nsec: i128) -> bool {
-        if update.source.header.stamp.sec == 0 && update.source.header.stamp.nanosec == 0 {
+        if source_validation_error(&update, self.static_frame_id()).is_some() {
             return false;
         }
 
@@ -110,6 +112,8 @@ impl LayeredMap {
         }
 
         let default_ttl_sec = update.source.default_ttl_sec;
+        let frame_id = update.source.header.frame_id;
+        let robot_pose = update.source.robot_pose;
         let mut patches = update.patches;
         patches.sort_by_key(|patch| match patch.update_type {
             MapRegionPatch::UPDATE_CLEAR => 0,
@@ -128,6 +132,7 @@ impl LayeredMap {
                 .regions
                 .into_iter()
                 .filter(|region| region_validation_error(region).is_none())
+                .map(|region| transform_region(region, &robot_pose))
                 .collect();
             if regions.is_empty() {
                 continue;
@@ -155,6 +160,7 @@ impl LayeredMap {
             self.dynamic_observations.push(DynamicObservation {
                 source_id: key.source_id.clone(),
                 map_name: key.map_name.clone(),
+                frame_id: frame_id.clone(),
                 update_type,
                 occupancy_value,
                 regions,
@@ -187,24 +193,29 @@ impl LayeredMap {
     pub fn compose(&self) -> Option<OccupancyGrid> {
         let mut composed = self.static_grid.clone()?;
         normalize_grid_data(&mut composed);
+        let frame_id = composed.header.frame_id.clone();
 
         for observation in self
             .dynamic_observations
             .iter()
-            .filter(|obs| obs.update_type == DynamicUpdateType::Clear)
+            .filter(|obs| obs.frame_id == frame_id && obs.update_type == DynamicUpdateType::Clear)
         {
             rasterize_observation(&mut composed, observation);
         }
 
-        for observation in self
-            .dynamic_observations
-            .iter()
-            .filter(|obs| obs.update_type == DynamicUpdateType::Obstacle)
-        {
+        for observation in self.dynamic_observations.iter().filter(|obs| {
+            obs.frame_id == frame_id && obs.update_type == DynamicUpdateType::Obstacle
+        }) {
             rasterize_observation(&mut composed, observation);
         }
 
         Some(composed)
+    }
+
+    fn static_frame_id(&self) -> Option<&str> {
+        self.static_grid
+            .as_ref()
+            .map(|grid| grid.header.frame_id.as_str())
     }
 }
 
@@ -269,7 +280,7 @@ impl LayeredMapServer {
     }
 
     fn handle_region_update(&mut self, msg: MapRegionUpdate) {
-        log_region_update_errors(&self.node, &msg);
+        log_region_update_errors(&self.node, &msg, self.map.static_frame_id());
         let now_nsec = self.now_nsec();
         if self.map.ingest_region_update(msg, now_nsec) {
             rclrs::log!(
@@ -386,7 +397,16 @@ fn region_update_qos(topic: &str) -> PrimitiveOptions<'_> {
     topic.keep_last(MAP_QOS_DEPTH).reliable()
 }
 
-fn log_region_update_errors(node: &Node, update: &MapRegionUpdate) {
+fn log_region_update_errors(node: &Node, update: &MapRegionUpdate, expected_frame: Option<&str>) {
+    if let Some(error) = source_validation_error(update, expected_frame) {
+        rclrs::log_error!(
+            node.logger(),
+            "Ignoring map region update from '{}': {}",
+            update.source.source_id,
+            error
+        );
+    }
+
     for patch in &update.patches {
         if !matches!(
             patch.update_type,
@@ -406,6 +426,56 @@ fn log_region_update_errors(node: &Node, update: &MapRegionUpdate) {
             }
         }
     }
+}
+
+fn source_validation_error(
+    update: &MapRegionUpdate,
+    expected_frame: Option<&str>,
+) -> Option<String> {
+    let stamp = &update.source.header.stamp;
+    if stamp.sec == 0 && stamp.nanosec == 0 {
+        return Some("source timestamp must be non-zero".to_string());
+    }
+
+    let frame_id = update.source.header.frame_id.as_str();
+    if frame_id.is_empty() {
+        return Some("source frame must not be empty".to_string());
+    }
+
+    if let Some(expected) = expected_frame {
+        if !expected.is_empty() && expected != frame_id {
+            return Some(format!(
+                "source frame '{}' does not match map frame '{}'",
+                frame_id, expected
+            ));
+        }
+    }
+
+    let pose = &update.source.robot_pose;
+    if ![
+        pose.position.x,
+        pose.position.y,
+        pose.position.z,
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z,
+        pose.orientation.w,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+    {
+        return Some("source pose must contain finite values".to_string());
+    }
+
+    let orientation_norm = pose.orientation.x * pose.orientation.x
+        + pose.orientation.y * pose.orientation.y
+        + pose.orientation.z * pose.orientation.z
+        + pose.orientation.w * pose.orientation.w;
+    if orientation_norm <= f64::EPSILON {
+        return Some("source pose must contain a valid orientation".to_string());
+    }
+
+    None
 }
 
 fn region_validation_error(region: &Region) -> Option<String> {
@@ -432,11 +502,47 @@ fn region_validation_error(region: &Region) -> Option<String> {
     }
 }
 
-fn is_supported_region_hint(hint: u8) -> bool {
+fn is_rasterizable_region_hint(hint: u8) -> bool {
     matches!(
         hint,
-        Region::HINT_POINT | Region::HINT_AXIS_ALIGNED_RECTANGLE
+        Region::HINT_POINT | Region::HINT_AXIS_ALIGNED_RECTANGLE | Region::HINT_CONVEX_POLYGON
     )
+}
+
+fn transform_region(mut region: Region, pose: &Pose) -> Region {
+    let points = point_pairs(&region);
+    let points = if region.hint == Region::HINT_AXIS_ALIGNED_RECTANGLE {
+        let (min_x, min_y, max_x, max_y) = bounds(&points);
+        region.hint = Region::HINT_CONVEX_POLYGON;
+        vec![
+            (min_x, min_y),
+            (max_x, min_y),
+            (max_x, max_y),
+            (min_x, max_y),
+        ]
+    } else {
+        points
+    };
+
+    let (cos_yaw, sin_yaw) = planar_rotation(pose);
+    region.points = points
+        .into_iter()
+        .flat_map(|(x, y)| {
+            let map_x = pose.position.x + cos_yaw * x - sin_yaw * y;
+            let map_y = pose.position.y + sin_yaw * x + cos_yaw * y;
+            [map_x as f32, map_y as f32]
+        })
+        .collect();
+    region
+}
+
+fn planar_rotation(pose: &Pose) -> (f64, f64) {
+    let q = &pose.orientation;
+    let norm = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    let sin_yaw = 2.0 * (q.w * q.z + q.x * q.y) / norm;
+    let cos_yaw = 1.0 - 2.0 * (q.y * q.y + q.z * q.z) / norm;
+    let yaw = sin_yaw.atan2(cos_yaw);
+    (yaw.cos(), yaw.sin())
 }
 
 fn normalize_grid_data(grid: &mut OccupancyGrid) {
@@ -477,7 +583,7 @@ fn rasterized_indices(grid: &OccupancyGrid, region: &Region) -> Vec<usize> {
         return Vec::new();
     }
 
-    if !is_supported_region_hint(region.hint) {
+    if !is_rasterizable_region_hint(region.hint) {
         return Vec::new();
     }
 
@@ -666,6 +772,10 @@ mod tests {
 
     fn static_grid(width: u32, height: u32, value: i8) -> OccupancyGrid {
         OccupancyGrid {
+            header: Header {
+                frame_id: "map".to_string(),
+                ..Default::default()
+            },
             info: MapMetaData {
                 resolution: 1.0,
                 width,
@@ -705,6 +815,7 @@ mod tests {
             ..Default::default()
         };
         source.header.stamp.sec = 1;
+        source.robot_pose.orientation.w = 1.0;
         source
     }
 
@@ -786,6 +897,24 @@ mod tests {
     }
 
     #[test]
+    fn robot_local_regions_are_transformed_into_the_map_frame() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(5, 5, 0));
+
+        let mut update = update(MapRegionPatch::UPDATE_OBSTACLE, vec![point(1.0, 0.0)]);
+        update.source.robot_pose.position.x = 2.25;
+        update.source.robot_pose.position.y = 1.25;
+        update.source.robot_pose.orientation.z = std::f64::consts::FRAC_1_SQRT_2;
+        update.source.robot_pose.orientation.w = std::f64::consts::FRAC_1_SQRT_2;
+
+        assert!(map.ingest_region_update(update, 0));
+
+        let composed = map.compose().unwrap();
+        assert_eq!(composed.data[2 * 5 + 2], 100);
+        assert_eq!(composed.data[0], 0);
+    }
+
+    #[test]
     fn out_of_bounds_regions_do_not_touch_the_grid() {
         let mut map = LayeredMap::default();
         map.set_static_map(static_grid(3, 3, 0));
@@ -849,6 +978,18 @@ mod tests {
         unstamped.source.header.stamp = Default::default();
 
         assert!(!map.ingest_region_update(unstamped, NANOS_PER_SECOND));
+        assert_eq!(map.dynamic_observation_count(), 0);
+    }
+
+    #[test]
+    fn updates_in_a_different_global_frame_are_rejected() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(3, 3, 0));
+
+        let mut update = update(MapRegionPatch::UPDATE_OBSTACLE, vec![point(1.0, 1.0)]);
+        update.source.header.frame_id = "odom".to_string();
+
+        assert!(!map.ingest_region_update(update, NANOS_PER_SECOND));
         assert_eq!(map.dynamic_observation_count(), 0);
     }
 

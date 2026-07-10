@@ -48,14 +48,16 @@ describes where an observation came from.
 
 Important fields:
 
-* `header`: frame for the observation and its required, non-zero timestamp
+* `header`: global frame for the observation and its required, non-zero
+  timestamp
 * `source_id`: stable source identifier, usually the robot namespace plus the
   local source name
 * `robot_name`: robot that produced this observation, if the source is mounted
   on a robot. This can be empty for fixed sensors or synthetic map layers
 * `map_name`: map or level that the observations belong to
-* `robot_pose`: robot pose when the observation was produced, so consumers do
-  not need to reconstruct this from a separate TF-like lookup
+* `robot_pose`: pose of the robot-local observation frame in `header.frame_id`
+  when the observation was produced, so consumers do not need to reconstruct
+  it from a separate TF-like lookup
 * `default_ttl_sec`: fallback TTL in seconds for patches from this source
 
 ## `MapRegionUpdate`
@@ -96,15 +98,19 @@ obstacle patches, which gives deterministic "clear then mark" behavior without
 relying on the arrival order of separate ROS messages.
 
 The first prototype uses `rmf_prototype_msgs/Region` for sparse 2D geometry so
-robots can publish compact patches. The central map service is responsible for
-rasterizing those regions into its internal representation. The first
-implementation accepts point and axis-aligned rectangle regions.
+robots can publish compact patches. Region coordinates are robot-local. The map
+service transforms them through `source.robot_pose` into
+`source.header.frame_id` before rasterizing them. Fixed sensors can publish
+sensor-local regions with their sensor pose, while synthetic sources whose
+regions are already global can use the identity pose. The first implementation
+accepts point and axis-aligned rectangle regions.
 
 # Example Flow
 
 A local costmap or LiDAR observation node can publish a replacement snapshot by:
 
-1. Stamping the observation source with the sensor frame and observation time.
+1. Stamping the observation source with the global frame and observation time,
+   and including the pose of the robot-local observation frame.
 2. Setting `reset_source` if the new snapshot replaces the source's previous
    temporary observations.
 3. Adding one or more clear patches for free space seen by the sensor.
@@ -123,8 +129,9 @@ The first server tests cover:
 
 * composing obstacle regions over a static planning grid
 * point regions with non-zero map origins and non-1.0 resolutions
-* rejecting updates without a timestamp
+* transforming robot-local regions into the global map frame
 * out-of-bounds regions, malformed point arrays, and unsupported region types
+* rejecting updates without a timestamp
 * pruning expired observations by TTL
 * clear and obstacle patches in the same update
 * late older snapshots being ignored

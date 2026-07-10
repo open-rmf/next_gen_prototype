@@ -20,10 +20,11 @@ patches. If the snapshot replaces the source's previous observation state, set
 `map_name` before adding the new patches. Resetting has no TTL. Clear and
 obstacle patches both use TTLs in seconds.
 
-Updates with a zero source timestamp are rejected.
-
-The current implementation accepts point and axis-aligned rectangle regions;
-it logs and ignores other region types.
+Patch regions are expressed in the robot-local observation frame. The server
+uses `source.robot_pose` to transform them into `source.header.frame_id`, which
+must match the static occupancy grid frame. Updates need a non-zero source
+timestamp. The current implementation accepts point and axis-aligned rectangle
+regions. It logs and ignores other region types.
 
 ## Visualization Smoke Test
 

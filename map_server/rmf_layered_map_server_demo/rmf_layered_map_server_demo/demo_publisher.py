@@ -88,6 +88,7 @@ def obstacle_update():
     msg = MapRegionUpdate()
     msg.source = MapObservationSource()
     msg.source.header.frame_id = 'map'
+    msg.source.robot_pose.orientation.w = 1.0
     msg.source.source_id = 'demo/temporary_obstacle'
     msg.source.robot_name = 'demo_robot'
     msg.source.map_name = 'demo_map'
