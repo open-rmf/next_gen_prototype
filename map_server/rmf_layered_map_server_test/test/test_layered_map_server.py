@@ -131,6 +131,7 @@ class TestLayeredMapServer(unittest.TestCase):
         self.assertEqual(self.last_cell(2, 2), 0)
 
         update = obstacle_update(ttl_sec=30)
+        update.source.header.stamp = self.node.get_clock().now().to_msg()
         self.assertTrue(
             self.publish_until(
                 self.region_update_publisher,
@@ -141,6 +142,7 @@ class TestLayeredMapServer(unittest.TestCase):
         )
 
         reset = reset_update()
+        reset.source.header.stamp = self.node.get_clock().now().to_msg()
         self.assertTrue(
             self.publish_until(
                 self.region_update_publisher,
@@ -151,6 +153,7 @@ class TestLayeredMapServer(unittest.TestCase):
         )
 
         update = obstacle_update()
+        update.source.header.stamp = self.node.get_clock().now().to_msg()
         self.assertTrue(
             self.publish_until(
                 self.region_update_publisher,

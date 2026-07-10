@@ -80,19 +80,17 @@ impl LayeredMap {
     }
 
     pub fn ingest_region_update(&mut self, update: MapRegionUpdate, now_nsec: i128) -> bool {
+        if update.source.header.stamp.sec == 0 && update.source.header.stamp.nanosec == 0 {
+            return false;
+        }
+
         let reset_source = update.reset_source;
         let key = ObservationSourceKey {
             source_id: update.source.source_id.clone(),
             map_name: update.source.map_name.clone(),
         };
-        let stamp_nsec = if update.source.header.stamp.sec == 0
-            && update.source.header.stamp.nanosec == 0
-        {
-            now_nsec
-        } else {
-            i128::from(update.source.header.stamp.sec) * NANOS_PER_SECOND
-                + i128::from(update.source.header.stamp.nanosec)
-        };
+        let stamp_nsec = i128::from(update.source.header.stamp.sec) * NANOS_PER_SECOND
+            + i128::from(update.source.header.stamp.nanosec);
 
         if self
             .latest_source_stamps
@@ -687,7 +685,7 @@ mod tests {
     }
 
     fn source_with_id(source_id: &str) -> MapObservationSource {
-        MapObservationSource {
+        let mut source = MapObservationSource {
             header: Header {
                 frame_id: "map".to_string(),
                 ..Default::default()
@@ -697,7 +695,9 @@ mod tests {
             map_name: "test_map".to_string(),
             default_ttl_sec: 10.0,
             ..Default::default()
-        }
+        };
+        source.header.stamp.sec = 1;
+        source
     }
 
     fn rectangle(min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> Region {
@@ -841,6 +841,18 @@ mod tests {
 
         let composed = map.compose().unwrap();
         assert!(composed.data.iter().all(|cell| *cell == 0));
+    }
+
+    #[test]
+    fn updates_without_a_timestamp_are_rejected() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(3, 3, 0));
+
+        let mut unstamped = update(MapRegionPatch::UPDATE_OBSTACLE, vec![point(1.0, 1.0)]);
+        unstamped.source.header.stamp = Default::default();
+
+        assert!(!map.ingest_region_update(unstamped, NANOS_PER_SECOND));
+        assert_eq!(map.dynamic_observation_count(), 0);
     }
 
     #[test]

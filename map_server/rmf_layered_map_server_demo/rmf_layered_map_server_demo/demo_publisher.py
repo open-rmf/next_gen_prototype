@@ -55,7 +55,9 @@ class LayeredMapDemoPublisher(Node):
 
     def publish_demo(self):
         self.static_map_publisher.publish(static_map())
-        self.region_update_publisher.publish(obstacle_update())
+        update = obstacle_update()
+        update.source.header.stamp = self.get_clock().now().to_msg()
+        self.region_update_publisher.publish(update)
         self.get_logger().info('Published demo obstacle with a 5 second TTL')
 
 

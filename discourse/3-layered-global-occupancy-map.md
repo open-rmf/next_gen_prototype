@@ -48,7 +48,7 @@ describes where an observation came from.
 
 Important fields:
 
-* `header`: frame and timestamp for the observed regions
+* `header`: frame for the observation and its required, non-zero timestamp
 * `source_id`: stable source identifier, usually the robot namespace plus the
   local source name
 * `robot_name`: robot that produced this observation, if the source is mounted
@@ -122,6 +122,7 @@ The first server tests cover:
 
 * composing obstacle regions over a static planning grid
 * point regions with non-zero map origins and non-1.0 resolutions
+* rejecting updates without a timestamp
 * polygon regions, out-of-bounds regions, and malformed region point arrays
 * pruning expired observations by TTL
 * clear and obstacle patches in the same update

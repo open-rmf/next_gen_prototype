@@ -20,6 +20,8 @@ patches. If the snapshot replaces the source's previous observation state, set
 `map_name` before adding the new patches. Resetting has no TTL. Clear and
 obstacle patches both use TTLs in seconds.
 
+Updates with a zero source timestamp are rejected.
+
 ## Visualization Smoke Test
 
 Build and source the workspace:

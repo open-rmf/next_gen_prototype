@@ -1,6 +1,7 @@
 # MapObservationSource.msg
 
-# Frame and time for this observation snapshot.
+# Frame and time for this observation snapshot. The timestamp is required.
+# Consumers should reject updates with a zero timestamp.
 std_msgs/Header header
 
 # Unique source for this stream of observations. For a robot-local node this can
