@@ -332,7 +332,7 @@ pub struct LayeredMapServerRunning {
     // Keep the ROS handles alive for as long as the server is running.
     pub static_map_subscription: rclrs::WorkerSubscription<OccupancyGrid, LayeredMapServer>,
     pub region_update_subscription: rclrs::WorkerSubscription<MapRegionUpdate, LayeredMapServer>,
-    pub prune_timer: Box<dyn std::any::Any + Send + Sync>,
+    pub prune_timer: rclrs::WorkerTimer<LayeredMapServer>,
 }
 
 pub fn start_layered_map_server(
@@ -367,7 +367,7 @@ pub fn start_layered_map_server(
         worker,
         static_map_subscription,
         region_update_subscription,
-        prune_timer: Box::new(prune_timer),
+        prune_timer,
     })
 }
 
