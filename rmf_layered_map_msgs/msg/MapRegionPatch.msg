@@ -22,5 +22,6 @@ int8 occupancy_value
 # observations.
 float64 ttl_sec
 
-# 2D geometric observation patches.
+# 2D geometric observation patches. The first prototype supports point and
+# axis-aligned rectangle regions.
 rmf_prototype_msgs/Region[] regions

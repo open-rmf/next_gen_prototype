@@ -22,6 +22,9 @@ obstacle patches both use TTLs in seconds.
 
 Updates with a zero source timestamp are rejected.
 
+The current implementation accepts point and axis-aligned rectangle regions;
+it logs and ignores other region types.
+
 ## Visualization Smoke Test
 
 Build and source the workspace:

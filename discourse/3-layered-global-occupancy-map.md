@@ -97,7 +97,8 @@ relying on the arrival order of separate ROS messages.
 
 The first prototype uses `rmf_prototype_msgs/Region` for sparse 2D geometry so
 robots can publish compact patches. The central map service is responsible for
-rasterizing those regions into its internal representation.
+rasterizing those regions into its internal representation. The first
+implementation accepts point and axis-aligned rectangle regions.
 
 # Example Flow
 
@@ -123,7 +124,7 @@ The first server tests cover:
 * composing obstacle regions over a static planning grid
 * point regions with non-zero map origins and non-1.0 resolutions
 * rejecting updates without a timestamp
-* polygon regions, out-of-bounds regions, and malformed region point arrays
+* out-of-bounds regions, malformed point arrays, and unsupported region types
 * pruning expired observations by TTL
 * clear and obstacle patches in the same update
 * late older snapshots being ignored

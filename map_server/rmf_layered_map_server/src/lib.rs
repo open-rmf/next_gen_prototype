@@ -124,7 +124,12 @@ impl LayeredMap {
                 _ => continue,
             };
 
-            if patch.regions.is_empty() {
+            let regions: Vec<_> = patch
+                .regions
+                .into_iter()
+                .filter(|region| region_validation_error(region).is_none())
+                .collect();
+            if regions.is_empty() {
                 continue;
             }
 
@@ -152,7 +157,7 @@ impl LayeredMap {
                 map_name: key.map_name.clone(),
                 update_type,
                 occupancy_value,
-                regions: patch.regions,
+                regions,
                 expires_at_nsec,
             });
             changed = true;
@@ -403,31 +408,34 @@ fn log_region_update_errors(node: &Node, update: &MapRegionUpdate) {
     }
 }
 
-fn region_validation_error(region: &Region) -> Option<&'static str> {
+fn region_validation_error(region: &Region) -> Option<String> {
     if region.points.len() < 2 {
-        return Some("region must contain at least one x/y point pair");
+        return Some("region must contain at least one x/y point pair".to_string());
     }
 
     if region.points.len() % 2 != 0 {
-        return Some("region points must contain complete x/y pairs");
+        return Some("region points must contain complete x/y pairs".to_string());
     }
 
-    if !is_supported_region_hint(region.hint) {
-        return Some("unsupported region hint");
+    match region.hint {
+        Region::HINT_POINT if region.points.len() != 2 => {
+            Some("point region must contain exactly one x/y pair".to_string())
+        }
+        Region::HINT_AXIS_ALIGNED_RECTANGLE if region.points.len() < 4 => {
+            Some("axis-aligned rectangle must contain at least two x/y pairs".to_string())
+        }
+        Region::HINT_POINT | Region::HINT_AXIS_ALIGNED_RECTANGLE => None,
+        hint => Some(format!(
+            "unsupported region hint {}; expected a point or axis-aligned rectangle",
+            hint
+        )),
     }
-
-    None
 }
 
 fn is_supported_region_hint(hint: u8) -> bool {
     matches!(
         hint,
-        Region::HINT_UNSPECIFIED
-            | Region::HINT_POINT
-            | Region::HINT_AXIS_ALIGNED_RECTANGLE
-            | Region::HINT_RECTANGLE
-            | Region::HINT_CONVEX_POLYGON
-            | Region::HINT_POLYGON
+        Region::HINT_POINT | Region::HINT_AXIS_ALIGNED_RECTANGLE
     )
 }
 
@@ -714,13 +722,6 @@ mod tests {
         }
     }
 
-    fn polygon(points: Vec<f32>) -> Region {
-        Region {
-            hint: Region::HINT_POLYGON,
-            points,
-        }
-    }
-
     fn patch(update_type: u8, regions: Vec<Region>) -> MapRegionPatch {
         MapRegionPatch {
             update_type,
@@ -785,28 +786,6 @@ mod tests {
     }
 
     #[test]
-    fn polygon_regions_fill_only_cells_inside_the_polygon() {
-        let mut map = LayeredMap::default();
-        map.set_static_map(static_grid(4, 4, 0));
-
-        assert!(map.ingest_region_update(
-            update(
-                MapRegionPatch::UPDATE_OBSTACLE,
-                vec![polygon(vec![1.0, 1.0, 3.0, 1.0, 3.0, 3.0, 1.0, 3.0])]
-            ),
-            0,
-        ));
-
-        let composed = map.compose().unwrap();
-        assert_eq!(composed.data[1 * 4 + 1], 100);
-        assert_eq!(composed.data[1 * 4 + 2], 100);
-        assert_eq!(composed.data[2 * 4 + 1], 100);
-        assert_eq!(composed.data[2 * 4 + 2], 100);
-        assert_eq!(composed.data[0], 0);
-        assert_eq!(composed.data[3 * 4 + 3], 0);
-    }
-
-    #[test]
     fn out_of_bounds_regions_do_not_touch_the_grid() {
         let mut map = LayeredMap::default();
         map.set_static_map(static_grid(3, 3, 0));
@@ -828,12 +807,12 @@ mod tests {
         let mut map = LayeredMap::default();
         map.set_static_map(static_grid(3, 3, 0));
 
-        assert!(map.ingest_region_update(
+        assert!(!map.ingest_region_update(
             update(
                 MapRegionPatch::UPDATE_OBSTACLE,
                 vec![Region {
-                    hint: Region::HINT_POLYGON,
-                    points: vec![1.0, 1.0, 2.0],
+                    hint: Region::HINT_POINT,
+                    points: vec![1.0, 1.0, 2.0, 2.0],
                 }]
             ),
             0,
@@ -841,6 +820,24 @@ mod tests {
 
         let composed = map.compose().unwrap();
         assert!(composed.data.iter().all(|cell| *cell == 0));
+    }
+
+    #[test]
+    fn unsupported_region_types_are_ignored() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(3, 3, 0));
+
+        assert!(!map.ingest_region_update(
+            update(
+                MapRegionPatch::UPDATE_OBSTACLE,
+                vec![Region {
+                    hint: Region::HINT_POLYGON,
+                    points: vec![0.0, 0.0, 2.0, 0.0, 1.0, 2.0],
+                }]
+            ),
+            0,
+        ));
+        assert_eq!(map.dynamic_observation_count(), 0);
     }
 
     #[test]
