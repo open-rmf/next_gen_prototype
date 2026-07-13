@@ -2,8 +2,9 @@
 
 # Layered Global Map Observations
 
-This post describes the observation interface for contributing temporary map
-information to the next generation Open-RMF prototype.
+This post describes the implemented observation interface and demos for
+contributing temporary map information to the next generation Open-RMF
+prototype.
 
 The goal is to let robots and perception systems publish what they currently
 observe without tying them to a specific central map implementation. The first
@@ -19,15 +20,21 @@ observations, can be added later.
   same sensor snapshot
 * Clear-space patches have TTLs, just like obstacle patches
 * A source can reset its previous observations without using a TTL
-* Robot-mounted sources can include the robot pose at observation time
+* Robot-mounted sources include the observation-frame pose at observation time
+* The Rust map server composes a static occupancy grid and active observations
+  into `/map`
+* The Nav2 demo converts scans from three robots into point regions and displays
+  the combined map
 * The observation messages live in `rmf_layered_map_msgs`, leaving
   `rmf_prototype_msgs` unchanged
 
-# Observation Topic
+# Observation Topics
 
-Observation sources publish dynamic map observations on:
+The layered map server uses these topics:
 
+* `/map/static` - static `nav_msgs/OccupancyGrid`
 * `/map/region_updates` - [`MapRegionUpdate.msg`](../rmf_layered_map_msgs/msg/MapRegionUpdate.msg)
+* `/map` - composed `nav_msgs/OccupancyGrid`
 
 The topic is an event stream. Updates are not latched because expired
 observations should not be replayed to a restarted map service as if they were
@@ -105,6 +112,47 @@ sensor-local regions with their sensor pose, while synthetic sources whose
 regions are already global can use the identity pose. The first implementation
 accepts point and axis-aligned rectangle regions.
 
+# Layered Map Server
+
+`rmf_layered_map_server` keeps the static occupancy grid separate from dynamic
+observations and publishes their composition on `/map`. It validates source
+timestamps and frames, ignores updates that are older than the latest accepted
+update from the same source, supports source resets, and removes observations
+after their TTL expires.
+
+The server applies clear patches before obstacle patches from the same update.
+During composition, obstacle observations win over clear observations so
+occupied space is not accidentally erased by another active source.
+
+# Three-Robot Nav2 Demo
+
+The launch file starts three stationary robots in different free corners of the
+warehouse and spawns one deterministic Gazebo box near each robot. Each
+observation node subscribes to its robot's local `sensor_msgs/LaserScan`,
+filters invalid or out-of-range returns, and publishes the remaining scan
+endpoints as point regions.
+
+Each scan is a replacement snapshot: `reset_source` removes the source's
+preceding points before the new points are added, and a short TTL removes the
+source if it stops publishing. The observation-frame pose is recorded in the
+shared `map` frame so the map server can transform the scan-local regions before
+rasterizing them.
+
+The demo launches Nav2 localization but does not launch Nav2 planning or control
+components, RMF planning, or navigation goals. Three robot-local RViz windows
+are enabled by default, and another RViz window displays the combined global
+`/map`.
+
+The scan-to-region conversion is deliberately simple so its information loss
+and publication cost are visible. `beam_stride` reduces the number of point
+regions, `publish_period_sec` throttles replacement snapshots, and
+`max_observation_range` limits represented returns. `ttl_sec` controls how
+quickly stale snapshots expire. Each publisher logs its number of input beams
+and output regions so message density, update rate, and visual fidelity can be
+compared. The current demo publishes occupied endpoints only; it does not
+convert raycast clearing into free-space regions or compress adjacent points
+into larger regions.
+
 # Example Flow
 
 A local costmap or LiDAR observation node can publish a replacement snapshot by:
@@ -118,22 +166,24 @@ A local costmap or LiDAR observation node can publish a replacement snapshot by:
 5. Giving each patch a TTL long enough to survive normal publication jitter but
    short enough to decay when the observation is no longer refreshed.
 
-The map service should ignore snapshots from a source if their timestamp is
-older than a newer snapshot that has already been accepted. This prevents a late
-clear/reset message from removing obstacle information that came from a newer
+The map server ignores snapshots from a source if their timestamp is older than
+a newer snapshot that has already been accepted. This prevents a late clear or
+reset message from removing obstacle information that came from a newer
 observation.
 
 # Implemented Test Coverage
 
-The first server tests cover:
+The committed server and demo tests cover:
 
 * composing obstacle regions over a static planning grid
 * point regions with non-zero map origins and non-1.0 resolutions
 * transforming robot-local regions into the global map frame
 * out-of-bounds regions, malformed point arrays, and unsupported region types
-* rejecting updates without a timestamp
+* rejecting updates without a timestamp or in a different global frame
 * pruning expired observations by TTL
 * clear and obstacle patches in the same update
 * late older snapshots being ignored
 * reset updates removing observations from the same source and map
 * multiple robot sources being stitched into one composed grid
+* filtering invalid and out-of-range laser returns
+* preserving original beam angles when scan points are sampled

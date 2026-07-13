@@ -11,3 +11,5 @@ ros2 launch rmf_layered_map_server_demo demo.launch.py
 ```
 
 Use `use_rviz:=False` for a headless run.
+
+See [`rmf_layered_map_server_demo/README.md`](rmf_layered_map_server_demo/README.md) for the three-robot Nav2 observation demo.
