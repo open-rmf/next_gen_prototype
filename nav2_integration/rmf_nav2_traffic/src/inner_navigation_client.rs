@@ -1,4 +1,4 @@
-use crate::Nav2Agent;
+use crate::{safe_zone::PlanErrorPublisher, Nav2Agent};
 use bevy::prelude::*;
 use bevy_ros2::{RclrsExecutorCommands, RclrsNode, RosActionClient};
 use crossflow::{prelude::*, service::Service};
@@ -724,7 +724,8 @@ fn process_navigation_result(
         request: result, ..
     }: Blocking<InnerNavigationResult>,
     mut cancelling_inner: Query<&mut CancellingInnerNavigation>,
-    inner_nav_clients: Query<&InnerNavigationClient>,
+    _inner_nav_clients: Query<&InnerNavigationClient>,
+    plan_error_publishers: Query<&PlanErrorPublisher>,
 ) -> Result<InnerNavigationRequest, InnerNavigationResult> {
     match result {
         Ok(_) => return Err(result),
@@ -734,26 +735,34 @@ fn process_navigation_result(
                     return Err(result);
                 };
                 let target = &handle.request;
-                let target_pose = target.target_pose.clone();
 
-                if let Ok(inner_nav_client) = inner_nav_clients.get(target.agent) {
-                    if let Some(active_goal) = inner_nav_client.goal() {
-                        if active_goal.id() != &target.safe_zone_id {
-                            debug!(
-                                "[{:?}] Aborted goal is stale, not retrying",
+                if let Ok(publisher) = plan_error_publishers.get(target.agent) {
+                    let plan_error = ros_env::rmf_prototype_msgs::msg::PlanError {
+                        error: ros_env::rmf_prototype_msgs::msg::Error {
+                            code: ros_env::rmf_prototype_msgs::msg::PlanError::CODE_PATH_BLOCKED,
+                            message: format!(
+                                "Nav2 goal aborted for agent {:?}: path blocked within safe zone",
                                 target.agent.index()
-                            );
-                            return Err(result);
-                        }
+                            ),
+                            parameters: String::new(),
+                        },
+                        plan_id: handle.request.safe_zone_id.plan_id.clone(),
+                    };
+                    if let Err(e) = publisher.publisher.publish(plan_error) {
+                        error!(
+                            "Failed to publish PlanError for agent {:?}: {:?}",
+                            target.agent.index(),
+                            e
+                        );
+                    } else {
+                        warn!(
+                            "[{:?}] Goal aborted by Nav2! Published PlanError CODE_PATH_BLOCKED to ~/plan/error.",
+                            target.agent.index()
+                        );
                     }
                 }
 
-                debug!("[{:?}] Goal aborted. Retrying", target.agent.index());
-                return Ok(InnerNavigationRequest {
-                    agent: target.agent,
-                    safe_zone_id: target.safe_zone_id.clone(),
-                    target_pose,
-                });
+                return Err(result);
             }
             InnerNavigationErrorKind::GoalCancelledError => {
                 // Only mark cancellation success for external cancellation

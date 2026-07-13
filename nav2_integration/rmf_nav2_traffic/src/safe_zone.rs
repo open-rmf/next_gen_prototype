@@ -6,7 +6,7 @@ use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
 use ros_env::{
     nav2_msgs::msg::Costmap,
-    rmf_prototype_msgs::msg::{Progress, Region, SafeZone},
+    rmf_prototype_msgs::msg::{PlanError, Progress, Region, SafeZone},
 };
 use std::sync::Arc;
 
@@ -23,6 +23,11 @@ pub struct CostmapPublisher {
 #[derive(Component)]
 pub struct ProgressPublisher {
     pub publisher: Arc<RosPublisher<Progress>>,
+}
+
+#[derive(Component)]
+pub struct PlanErrorPublisher {
+    pub publisher: Arc<RosPublisher<PlanError>>,
 }
 
 #[derive(Component, Debug, Clone, Default, Deref)]
@@ -86,7 +91,8 @@ impl Plugin for SafeZoneSubscriptionPlugin {
         app.add_systems(PreUpdate, update_incremental_target)
             .add_observer(create_safe_zone_subscriber)
             .add_observer(create_costmap_publisher)
-            .add_observer(create_progress_publisher);
+            .add_observer(create_progress_publisher)
+            .add_observer(create_plan_error_publisher);
     }
 }
 
@@ -141,6 +147,23 @@ fn create_progress_publisher(
     let topic = agent_name + "/plan/progress";
     let publisher = Arc::new(RosPublisher::<Progress>::new(&node, topic));
     commands.entity(e).insert(ProgressPublisher {
+        publisher: Arc::clone(&publisher),
+    });
+}
+
+fn create_plan_error_publisher(
+    trigger: Trigger<OnAdd, Nav2Agent>,
+    mut commands: Commands,
+    agents: Query<&Nav2Agent>,
+    node: Res<RclrsNode>,
+) {
+    let e = trigger.target();
+    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
+        return;
+    };
+    let topic = agent_name + "/plan/error";
+    let publisher = Arc::new(RosPublisher::<PlanError>::new(&node, topic));
+    commands.entity(e).insert(PlanErrorPublisher {
         publisher: Arc::clone(&publisher),
     });
 }
