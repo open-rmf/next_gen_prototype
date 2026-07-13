@@ -39,7 +39,11 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'layered_map_demo_clutter_spawner = '
+            'rmf_layered_map_server_demo.demo_clutter_spawner:main',
             'layered_map_demo_publisher = rmf_layered_map_server_demo.demo_publisher:main',
+            'scan_region_publisher = '
+            'rmf_layered_map_server_demo.scan_region_publisher:main',
         ],
     },
 )
