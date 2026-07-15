@@ -24,6 +24,6 @@ float64 ttl_sec
 
 # 2D geometric observation patches in the robot-local observation frame. The
 # map service transforms them into source.header.frame_id using
-# source.robot_pose. The first prototype supports point and axis-aligned
-# rectangle regions.
+# source.robot_pose. The first prototype supports point, axis-aligned
+# rectangle, and convex polygon regions.
 rmf_prototype_msgs/Region[] regions

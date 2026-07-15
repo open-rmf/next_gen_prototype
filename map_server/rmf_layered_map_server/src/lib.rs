@@ -494,9 +494,14 @@ fn region_validation_error(region: &Region) -> Option<String> {
         Region::HINT_AXIS_ALIGNED_RECTANGLE if region.points.len() < 4 => {
             Some("axis-aligned rectangle must contain at least two x/y pairs".to_string())
         }
-        Region::HINT_POINT | Region::HINT_AXIS_ALIGNED_RECTANGLE => None,
+        Region::HINT_CONVEX_POLYGON if region.points.len() < 6 => {
+            Some("convex polygon must contain at least three x/y pairs".to_string())
+        }
+        Region::HINT_POINT
+        | Region::HINT_AXIS_ALIGNED_RECTANGLE
+        | Region::HINT_CONVEX_POLYGON => None,
         hint => Some(format!(
-            "unsupported region hint {}; expected a point or axis-aligned rectangle",
+            "unsupported region hint {}; expected a point, axis-aligned rectangle, or convex polygon",
             hint
         )),
     }
@@ -833,6 +838,13 @@ mod tests {
         }
     }
 
+    fn convex_polygon(points: Vec<f32>) -> Region {
+        Region {
+            hint: Region::HINT_CONVEX_POLYGON,
+            points,
+        }
+    }
+
     fn patch(update_type: u8, regions: Vec<Region>) -> MapRegionPatch {
         MapRegionPatch {
             update_type,
@@ -894,6 +906,24 @@ mod tests {
         let composed = map.compose().unwrap();
         assert_eq!(composed.data[2 * 4 + 1], 100);
         assert_eq!(composed.data[0], 0);
+    }
+
+    #[test]
+    fn convex_clear_regions_are_composed_over_static_map() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(5, 5, 100));
+
+        assert!(map.ingest_region_update(
+            update(
+                MapRegionPatch::UPDATE_CLEAR,
+                vec![convex_polygon(vec![0.0, 0.0, 4.0, 0.0, 4.0, 4.0])]
+            ),
+            0,
+        ));
+
+        let composed = map.compose().unwrap();
+        assert_eq!(composed.data[1 * 5 + 3], 0);
+        assert_eq!(composed.data[3 * 5 + 1], 100);
     }
 
     #[test]
