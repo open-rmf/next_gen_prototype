@@ -62,6 +62,7 @@ class ScanRegionPublisher(Node):
 
         self.source_id = f'{self.robot_name}/scan'
         self.last_publish_stamp_sec = None
+        self.pending_scan = None
         self.publish_count = 0
         self.transform_failure_count = 0
         self.tf_buffer = Buffer()
@@ -82,6 +83,7 @@ class ScanRegionPublisher(Node):
             self.publish_scan,
             qos_profile_sensor_data,
         )
+        self.scan_retry_timer = self.create_timer(0.05, self.publish_pending_scan)
 
         self.get_logger().info(
             f'Converting {self.scan_topic} into region updates for '
@@ -90,14 +92,24 @@ class ScanRegionPublisher(Node):
         )
 
     def publish_scan(self, scan):
+        self.pending_scan = scan
+        self.publish_pending_scan()
+
+    def publish_pending_scan(self):
+        scan = self.pending_scan
+        if scan is None:
+            return
+
         stamp_sec = scan.header.stamp.sec + scan.header.stamp.nanosec / 1e9
         if scan.header.stamp.sec == 0 and scan.header.stamp.nanosec == 0:
             self.get_logger().warning('Ignoring scan with a zero timestamp')
+            self.pending_scan = None
             return
 
         if self.last_publish_stamp_sec is not None:
             elapsed = stamp_sec - self.last_publish_stamp_sec
             if 0.0 <= elapsed < self.publish_period_sec:
+                self.pending_scan = None
                 return
 
         try:
@@ -106,27 +118,18 @@ class ScanRegionPublisher(Node):
                 scan.header.frame_id,
                 Time.from_msg(scan.header.stamp),
             )
-        except TransformException:
-            # Gazebo can deliver a scan before the matching TF sample.
-            # These demo robots are stationary, so the latest transform is equivalent.
-            try:
-                transform = self.tf_buffer.lookup_transform(
-                    self.map_frame,
-                    scan.header.frame_id,
-                    Time(),
+        except TransformException as error:
+            self.transform_failure_count += 1
+            if self.transform_failure_count == 1 or (
+                self.transform_failure_count % 20 == 0
+            ):
+                self.get_logger().warning(
+                    f'Cannot transform {scan.header.frame_id} to '
+                    f'{self.map_frame} at the scan timestamp: {error}'
                 )
-            except TransformException as error:
-                self.transform_failure_count += 1
-                if self.transform_failure_count == 1 or (
-                    self.transform_failure_count % 20 == 0
-                ):
-                    self.get_logger().warning(
-                        f'Cannot transform {scan.header.frame_id} to '
-                        f'{self.map_frame}: {error}'
-                    )
-                return
+            return
 
-        self.transform_failure_count = 0
+        self.pending_scan = None
         points = scan_obstacle_points(
             scan.ranges,
             scan.angle_min,

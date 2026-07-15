@@ -133,7 +133,7 @@ def generate_launch_description():
 
     # Define commands for launching the navigation instances
     bringup_cmd_group = []
-    for robot_name in robots_list:
+    for robot_index, robot_name in enumerate(robots_list):
         init_pose = robots_list[robot_name]
         namespace = robot_name + '/inner'
         group = GroupAction(
@@ -174,6 +174,13 @@ def generate_launch_description():
                         'headless': 'False',
                         'use_robot_state_pub': use_robot_state_pub,
                         'use_navigation': use_navigation,
+                        'clock_topic': TextSubstitution(
+                            text=(
+                                '/clock'
+                                if robot_index == 0
+                                else f'/{namespace}/clock'
+                            )
+                        ),
                         'x_pose': TextSubstitution(text=str(init_pose['x'])),
                         'y_pose': TextSubstitution(text=str(init_pose['y'])),
                         'z_pose': TextSubstitution(text=str(init_pose['z'])),

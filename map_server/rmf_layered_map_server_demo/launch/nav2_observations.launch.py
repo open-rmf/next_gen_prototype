@@ -37,6 +37,12 @@ ROBOTS = (
     ('robot2', -12.0, 21.0, -0.7854),
 )
 
+ROBOT_GOALS = {
+    'robot0': ((-12.0, -16.0, 1.5708), (-12.0, -21.0, -1.5708)),
+    'robot1': ((10.0, -16.0, 1.5708), (10.0, -21.0, -1.5708)),
+    'robot2': ((-12.0, 16.0, -1.5708), (-12.0, 21.0, 1.5708)),
+}
+
 
 def robots_argument():
     """Format the three warehouse-corner robot poses for Nav2 bringup."""
@@ -54,6 +60,7 @@ def generate_launch_description():
     params_file = LaunchConfiguration('params_file')
     use_nav2_rviz = LaunchConfiguration('use_nav2_rviz')
     use_global_rviz = LaunchConfiguration('use_global_rviz')
+    move_robots = LaunchConfiguration('move_robots')
     spawn_clutter = LaunchConfiguration('spawn_clutter')
     beam_stride = LaunchConfiguration('beam_stride')
     publish_period_sec = LaunchConfiguration('publish_period_sec')
@@ -82,6 +89,11 @@ def generate_launch_description():
             'use_global_rviz',
             default_value='True',
             description='Whether to open the combined global-map RViz window.',
+        ),
+        DeclareLaunchArgument(
+            'move_robots',
+            default_value='True',
+            description='Whether to cycle the robots through example Nav2 goals.',
         ),
         DeclareLaunchArgument(
             'spawn_clutter',
@@ -122,7 +134,7 @@ def generate_launch_description():
             ['map:=', map_file],
             ['params_file:=', params_file],
             ['use_rviz:=', use_nav2_rviz],
-            'use_navigation:=False',
+            ['use_navigation:=', move_robots],
         ],
         output='screen',
     )
@@ -135,6 +147,7 @@ def generate_launch_description():
     )
 
     observation_nodes = []
+    goal_nodes = []
     for robot_name, _, _, _ in ROBOTS:
         observation_nodes.append(
             Node(
@@ -157,6 +170,23 @@ def generate_launch_description():
                     ),
                 }],
                 remappings=[('/tf', 'tf'), ('/tf_static', 'tf_static')],
+            )
+        )
+        goal_nodes.append(
+            Node(
+                condition=IfCondition(move_robots),
+                package='rmf_layered_map_server_demo',
+                executable='nav2_goal_publisher',
+                namespace=f'{robot_name}/inner',
+                output='screen',
+                parameters=[{
+                    'use_sim_time': True,
+                    'waypoints': [
+                        value
+                        for waypoint in ROBOT_GOALS[robot_name]
+                        for value in waypoint
+                    ],
+                }],
             )
         )
 
@@ -197,6 +227,7 @@ def generate_launch_description():
         nav2_simulation,
         layered_map_server,
         *observation_nodes,
+        *goal_nodes,
         clutter_spawner,
         global_rviz,
         global_rviz_exit_handler,
