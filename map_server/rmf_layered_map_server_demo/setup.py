@@ -44,6 +44,8 @@ setup(
             'layered_map_demo_publisher = rmf_layered_map_server_demo.demo_publisher:main',
             'nav2_goal_publisher = '
             'rmf_layered_map_server_demo.nav2_goal_publisher:main',
+            'region_update_visualizer = '
+            'rmf_layered_map_server_demo.region_update_visualizer:main',
             'scan_region_publisher = '
             'rmf_layered_map_server_demo.scan_region_publisher:main',
         ],

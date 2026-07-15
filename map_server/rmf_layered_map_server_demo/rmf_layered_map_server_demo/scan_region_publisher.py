@@ -33,7 +33,7 @@ from .scan_conversion import scan_obstacle_points
 
 
 class ScanRegionPublisher(Node):
-    """Publish one robot's laser endpoints as a replaceable region snapshot."""
+    """Publish one robot's laser endpoints as region snapshots."""
 
     def __init__(self):
         super().__init__('scan_region_publisher')
@@ -42,7 +42,10 @@ class ScanRegionPublisher(Node):
         self.map_frame = self.declare_parameter('map_frame', 'map').value
         self.map_name = self.declare_parameter('map_name', 'warehouse').value
         self.scan_topic = self.declare_parameter('scan_topic', 'scan').value
-        self.ttl_sec = self.declare_parameter('ttl_sec', 1.0).value
+        self.ttl_sec = self.declare_parameter('ttl_sec', 5.0).value
+        self.reset_source = self.declare_parameter(
+            'reset_source', False
+        ).value
         self.publish_period_sec = self.declare_parameter(
             'publish_period_sec', 0.5
         ).value
@@ -152,7 +155,7 @@ class ScanRegionPublisher(Node):
 
     def make_update(self, transform, points):
         update = MapRegionUpdate()
-        update.reset_source = True
+        update.reset_source = self.reset_source
         update.source = MapObservationSource()
         # The Rust map server currently uses a system-time clock.
         # Keep TTL and update ordering in that clock while using the scan stamp for TF.

@@ -65,6 +65,7 @@ def generate_launch_description():
     beam_stride = LaunchConfiguration('beam_stride')
     publish_period_sec = LaunchConfiguration('publish_period_sec')
     ttl_sec = LaunchConfiguration('ttl_sec')
+    reset_source = LaunchConfiguration('reset_source')
     max_observation_range = LaunchConfiguration('max_observation_range')
 
     declarations = [
@@ -112,8 +113,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'ttl_sec',
-            default_value='1.0',
+            default_value='5.0',
             description='Lifetime of each robot observation snapshot.',
+        ),
+        DeclareLaunchArgument(
+            'reset_source',
+            default_value='False',
+            description='Whether each snapshot replaces the source history.',
         ),
         DeclareLaunchArgument(
             'max_observation_range',
@@ -146,6 +152,13 @@ def generate_launch_description():
         remappings=[('/map/static', '/robot0/inner/map')],
     )
 
+    region_visualizer = Node(
+        condition=IfCondition(use_global_rviz),
+        package='rmf_layered_map_server_demo',
+        executable='region_update_visualizer',
+        output='screen',
+    )
+
     observation_nodes = []
     goal_nodes = []
     for robot_name, _, _, _ in ROBOTS:
@@ -165,6 +178,9 @@ def generate_launch_description():
                         publish_period_sec, value_type=float
                     ),
                     'ttl_sec': ParameterValue(ttl_sec, value_type=float),
+                    'reset_source': ParameterValue(
+                        reset_source, value_type=bool
+                    ),
                     'max_observation_range': ParameterValue(
                         max_observation_range, value_type=float
                     ),
@@ -211,7 +227,7 @@ def generate_launch_description():
             '-d',
             os.path.join(demo_share, 'rviz', 'nav2_observations.rviz'),
         ],
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': False}],
         output='screen',
     )
     global_rviz_exit_handler = RegisterEventHandler(
@@ -226,6 +242,7 @@ def generate_launch_description():
         *declarations,
         nav2_simulation,
         layered_map_server,
+        region_visualizer,
         *observation_nodes,
         *goal_nodes,
         clutter_spawner,

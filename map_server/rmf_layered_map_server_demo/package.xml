@@ -25,6 +25,7 @@
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>sp_demo_nav2_bringup</exec_depend>
   <exec_depend>tf2_ros_py</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_pep257</test_depend>
