@@ -23,7 +23,7 @@ observations, can be added later.
 * Robot-mounted sources include the observation-frame pose at observation time
 * The Rust map server composes a static occupancy grid and active observations
   into `/map`
-* The Nav2 demo converts scans from three robots into point regions and displays the source contributions and combined map
+* The Nav2 demo converts scans from three robots into clear ray sectors and occupied endpoint regions, then displays the source contributions and map
 * The observation messages live in `rmf_layered_map_msgs`, leaving
   `rmf_prototype_msgs` unchanged
 
@@ -125,13 +125,13 @@ occupied space is not accidentally erased by another active source.
 
 # Three-Robot Nav2 Demo
 
-The launch file starts three robots in different free corners of the warehouse, cycles them through fixed Nav2 goals, and spawns one deterministic Gazebo box near each robot. Each observation node subscribes to its robot's local `sensor_msgs/LaserScan`, filters invalid or out-of-range returns, and publishes the remaining scan endpoints as point regions.
+The launch file starts three robots in different free corners of the warehouse, cycles them through fixed Nav2 goals, and spawns one deterministic Gazebo box near each robot. Each observation node subscribes to its robot's local `sensor_msgs/LaserScan`, filters invalid or out-of-range returns, and publishes free-space ray sectors as convex polygons and occupied endpoints as point regions.
 
-Each scan is added to a rolling observation history until its TTL expires. An update may set `reset_source` so the new scan replaces all active observations from that source instead of being added to its history. The observation-frame pose is recorded in the shared `map` frame so the map server can transform the scan-local regions before rasterizing them.
+Each scan adds temporary clear and obstacle patches to a rolling observation history. The map server rasterizes clear sectors before obstacle endpoints so a measured hit remains occupied. Active obstacle evidence still wins over clear evidence until its TTL expires. An update may set `reset_source` so the new scan replaces all active observations from that source instead of being added to its history. The observation-frame pose is recorded in the shared `map` frame so the map server can transform the scan-local regions before rasterizing them.
 
 The demo launches Nav2 localization, planning, and control for the fixed goal loops, but does not launch RMF planning. Robot-local RViz windows show Nav2 state, while another RViz window displays the combined global `/map`. The combined view overlays incoming region updates as colored markers grouped by source, with the same retention behavior as the map contributions.
 
-The scan-to-region conversion is deliberately simple so its information loss and publication cost are visible. Scan sampling reduces the number of point regions, publication throttling limits the snapshot rate, and the observation range limits represented returns. The TTL controls how quickly stale snapshots expire. Each publisher logs its number of input beams and output regions so message density, update rate, and visual fidelity can be compared. The current demo publishes occupied endpoints only; it does not convert raycast clearing into free-space regions or compress adjacent points into larger regions.
+The scan-to-region conversion uses one convex sector per sampled beam instead of expanding a Bresenham line into many point regions. Scan sampling reduces the number of sectors, publication throttling limits the snapshot rate, and the observation range limits represented returns. The TTL controls how quickly stale observations expire. Each publisher logs its input beams and clear and obstacle regions so message density, update rate, and visual fidelity can be compared. The current demo remains a 2D occupancy approximation; it does not fuse probabilistic confidence or compress adjacent sectors into larger regions.
 
 # Example Flow
 
@@ -165,6 +165,7 @@ The committed server and demo tests cover:
 * late older snapshots being ignored
 * reset updates removing observations from the same source and map
 * multiple robot sources being stitched into one composed grid
+* converting laser beams into clear sectors and occupied endpoints
 * filtering invalid and out-of-range laser returns
 * preserving original beam angles when scan points are sampled
 * converting point and rectangle updates into source-colored markers
