@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use rclrs::{Context, CreateBasicExecutor, SpinOptions};
-use rmf_path_server::{start_path_server, PibtPlanner};
+use rmf_path_server::{start_path_server, CcbsPlanner, MapfPlanner, PibtPlanner};
+use std::env;
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,7 +22,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut executor = context.create_basic_executor();
     let node = Arc::new(executor.create_node("path_server")?);
 
-    let _path_server_guard = start_path_server(Arc::clone(&node), PibtPlanner::default())?;
+    let args: Vec<String> = env::args().collect();
+    let planner_name = args
+        .iter()
+        .position(|arg| arg == "--planner")
+        .and_then(|i| args.get(i + 1).cloned())
+        .or_else(|| {
+            args.iter()
+                .find_map(|arg| arg.strip_prefix("--planner=").map(String::from))
+        })
+        .unwrap_or_else(|| "pibt-grid-world".to_string());
+
+    let planner: Box<dyn MapfPlanner> = match planner_name.to_lowercase().as_str() {
+        "ccbs" => {
+            rclrs::log!(node.logger(), "Using CCBS planner");
+            Box::new(CcbsPlanner::default())
+        }
+        "pibt-grid-world" | _ => {
+            rclrs::log!(node.logger(), "Using PIBT grid world planner");
+            Box::new(PibtPlanner::default())
+        }
+    };
+
+    let _path_server_guard = start_path_server(Arc::clone(&node), planner)?;
 
     rclrs::log!(
         node.logger(),
