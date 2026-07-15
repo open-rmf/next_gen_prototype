@@ -74,7 +74,7 @@ def _new_marker(update, patch, marker_id, marker_type, color, default_ttl_sec):
 
 def _markers_from_patch(update, patch, first_id, color, default_ttl_sec):
     point_regions = []
-    rectangle_lines = []
+    region_lines = []
 
     for region in patch.regions:
         if region.hint == Region.HINT_POINT and len(region.points) == 2:
@@ -94,12 +94,19 @@ def _markers_from_patch(update, patch, first_id, color, default_ttl_sec):
                 _point(max_x, max_y),
                 _point(min_x, max_y),
             )
-            rectangle_lines.extend((
-                corners[0], corners[1],
-                corners[1], corners[2],
-                corners[2], corners[3],
-                corners[3], corners[0],
-            ))
+            for index, corner in enumerate(corners):
+                region_lines.extend((corner, corners[(index + 1) % len(corners)]))
+        elif (
+            region.hint == Region.HINT_CONVEX_POLYGON
+            and len(region.points) >= 6
+            and len(region.points) % 2 == 0
+        ):
+            corners = tuple(
+                _point(x, y)
+                for x, y in zip(region.points[0::2], region.points[1::2])
+            )
+            for index, corner in enumerate(corners):
+                region_lines.extend((corner, corners[(index + 1) % len(corners)]))
 
     markers = []
     marker_id = first_id
@@ -118,7 +125,7 @@ def _markers_from_patch(update, patch, first_id, color, default_ttl_sec):
         markers.append(marker)
         marker_id += 1
 
-    if rectangle_lines:
+    if region_lines:
         marker = _new_marker(
             update,
             patch,
@@ -128,7 +135,7 @@ def _markers_from_patch(update, patch, first_id, color, default_ttl_sec):
             default_ttl_sec,
         )
         marker.scale.x = 0.08
-        marker.points = rectangle_lines
+        marker.points = region_lines
         markers.append(marker)
 
     return markers

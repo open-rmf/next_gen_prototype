@@ -104,7 +104,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'beam_stride',
             default_value='1',
-            description='Publish every Nth valid laser return as a point region.',
+            description='Convert every Nth laser beam into map regions.',
         ),
         DeclareLaunchArgument(
             'publish_period_sec',

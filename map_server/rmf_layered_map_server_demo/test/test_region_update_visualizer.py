@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from rmf_layered_map_msgs.msg import MapRegionPatch, MapRegionUpdate
 from rmf_layered_map_server_demo.region_update_visualizer import RegionMarkerState
 from rmf_prototype_msgs.msg import Region
@@ -60,6 +62,23 @@ def test_visualizes_point_and_rectangle_regions_in_the_source_pose():
     assert markers[0].lifetime.sec == 4
     assert markers[1].type == Marker.LINE_LIST
     assert len(markers[1].points) == 8
+
+
+def test_visualizes_clear_ray_sectors_as_polygon_outlines():
+    update = _update()
+    patch = MapRegionPatch()
+    patch.update_type = MapRegionPatch.UPDATE_CLEAR
+    patch.regions = [
+        _region(Region.HINT_CONVEX_POLYGON, [0.0, 0.0, 1.0, -0.1, 1.0, 0.1]),
+    ]
+    update.patches = [patch]
+
+    markers = RegionMarkerState().apply_update(update).markers
+
+    assert len(markers) == 1
+    assert markers[0].type == Marker.LINE_LIST
+    assert markers[0].color.a == pytest.approx(0.35)
+    assert len(markers[0].points) == 6
 
 
 def test_reset_deletes_the_previous_source_markers_before_replacing_them():

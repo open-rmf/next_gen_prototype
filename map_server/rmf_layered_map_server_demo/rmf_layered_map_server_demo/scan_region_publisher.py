@@ -29,11 +29,41 @@ from rmf_prototype_msgs.msg import Region
 from sensor_msgs.msg import LaserScan
 from tf2_ros import Buffer, TransformException, TransformListener
 
-from .scan_conversion import scan_obstacle_points
+from .scan_conversion import scan_regions
+
+
+def make_scan_patches(clear_polygons, obstacle_points, ttl_sec):
+    """Build clear and obstacle patches for one converted laser scan."""
+    patches = []
+    if clear_polygons:
+        clear_patch = MapRegionPatch()
+        clear_patch.update_type = MapRegionPatch.UPDATE_CLEAR
+        clear_patch.occupancy_value = 0
+        clear_patch.ttl_sec = ttl_sec
+        for polygon in clear_polygons:
+            region = Region()
+            region.hint = Region.HINT_CONVEX_POLYGON
+            region.points = list(polygon)
+            clear_patch.regions.append(region)
+        patches.append(clear_patch)
+
+    if obstacle_points:
+        obstacle_patch = MapRegionPatch()
+        obstacle_patch.update_type = MapRegionPatch.UPDATE_OBSTACLE
+        obstacle_patch.occupancy_value = 100
+        obstacle_patch.ttl_sec = ttl_sec
+        for x, y in obstacle_points:
+            region = Region()
+            region.hint = Region.HINT_POINT
+            region.points = [x, y]
+            obstacle_patch.regions.append(region)
+        patches.append(obstacle_patch)
+
+    return patches
 
 
 class ScanRegionPublisher(Node):
-    """Publish one robot's laser endpoints as region snapshots."""
+    """Publish one robot's laser scan as clear and obstacle regions."""
 
     def __init__(self):
         super().__init__('scan_region_publisher')
@@ -133,7 +163,7 @@ class ScanRegionPublisher(Node):
             return
 
         self.pending_scan = None
-        points = scan_obstacle_points(
+        clear_polygons, obstacle_points = scan_regions(
             scan.ranges,
             scan.angle_min,
             scan.angle_increment,
@@ -142,18 +172,19 @@ class ScanRegionPublisher(Node):
             self.max_observation_range,
             self.beam_stride,
         )
-        update = self.make_update(transform, points)
+        update = self.make_update(transform, clear_polygons, obstacle_points)
         self.region_update_publisher.publish(update)
         self.last_publish_stamp_sec = stamp_sec
         self.publish_count += 1
 
         if self.publish_count == 1 or self.publish_count % 20 == 0:
             self.get_logger().info(
-                f'Published {len(points)} obstacle regions from '
+                f'Published {len(clear_polygons)} clear regions and '
+                f'{len(obstacle_points)} obstacle regions from '
                 f'{len(scan.ranges)} laser beams'
             )
 
-    def make_update(self, transform, points):
+    def make_update(self, transform, clear_polygons, obstacle_points):
         update = MapRegionUpdate()
         update.reset_source = self.reset_source
         update.source = MapObservationSource()
@@ -173,19 +204,11 @@ class ScanRegionPublisher(Node):
         update.source.robot_pose.position.z = translation.z
         update.source.robot_pose.orientation = rotation
 
-        if not points:
-            return update
-
-        patch = MapRegionPatch()
-        patch.update_type = MapRegionPatch.UPDATE_OBSTACLE
-        patch.occupancy_value = 100
-        patch.ttl_sec = self.ttl_sec
-        for x, y in points:
-            region = Region()
-            region.hint = Region.HINT_POINT
-            region.points = [x, y]
-            patch.regions.append(region)
-        update.patches.append(patch)
+        update.patches = make_scan_patches(
+            clear_polygons,
+            obstacle_points,
+            self.ttl_sec,
+        )
         return update
 
 
