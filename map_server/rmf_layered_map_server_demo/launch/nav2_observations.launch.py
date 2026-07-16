@@ -113,7 +113,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'ttl_sec',
-            default_value='5.0',
+            default_value='10.0',
             description='Lifetime of each robot observation snapshot.',
         ),
         DeclareLaunchArgument(

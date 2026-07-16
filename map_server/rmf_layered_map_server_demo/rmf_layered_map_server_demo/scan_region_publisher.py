@@ -72,7 +72,7 @@ class ScanRegionPublisher(Node):
         self.map_frame = self.declare_parameter('map_frame', 'map').value
         self.map_name = self.declare_parameter('map_name', 'warehouse').value
         self.scan_topic = self.declare_parameter('scan_topic', 'scan').value
-        self.ttl_sec = self.declare_parameter('ttl_sec', 5.0).value
+        self.ttl_sec = self.declare_parameter('ttl_sec', 10.0).value
         self.reset_source = self.declare_parameter(
             'reset_source', False
         ).value
