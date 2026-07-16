@@ -15,7 +15,10 @@
 import pytest
 
 from rmf_layered_map_msgs.msg import MapRegionPatch, MapRegionUpdate
-from rmf_layered_map_server_demo.region_update_visualizer import RegionMarkerState
+from rmf_layered_map_server_demo.region_update_visualizer import (
+    RegionMarkerState,
+    SOURCE_COLORS,
+)
 from rmf_prototype_msgs.msg import Region
 from visualization_msgs.msg import Marker
 
@@ -79,6 +82,37 @@ def test_visualizes_clear_ray_sectors_as_polygon_outlines():
     assert markers[0].type == Marker.LINE_LIST
     assert markers[0].color.a == pytest.approx(0.35)
     assert len(markers[0].points) == 6
+
+
+def test_visualizes_clear_regions_with_a_lighter_source_color():
+    update = _update()
+    clear_patch = MapRegionPatch()
+    clear_patch.update_type = MapRegionPatch.UPDATE_CLEAR
+    clear_patch.regions = [_region(Region.HINT_POINT, [1.0, 2.0])]
+    obstacle_patch = MapRegionPatch()
+    obstacle_patch.update_type = MapRegionPatch.UPDATE_OBSTACLE
+    obstacle_patch.regions = [_region(Region.HINT_POINT, [1.0, 2.0])]
+    update.patches = [clear_patch, obstacle_patch]
+
+    clear_marker, obstacle_marker = RegionMarkerState().apply_update(
+        update
+    ).markers
+    clear_color = (
+        clear_marker.color.r,
+        clear_marker.color.g,
+        clear_marker.color.b,
+    )
+    obstacle_color = (
+        obstacle_marker.color.r,
+        obstacle_marker.color.g,
+        obstacle_marker.color.b,
+    )
+
+    assert obstacle_color == pytest.approx(SOURCE_COLORS[0])
+    assert clear_color == pytest.approx(
+        tuple((channel + 1.0) / 2.0 for channel in SOURCE_COLORS[0])
+    )
+    assert clear_marker.points[0].z < obstacle_marker.points[0].z
 
 
 def test_reset_deletes_the_previous_source_markers_before_replacing_them():

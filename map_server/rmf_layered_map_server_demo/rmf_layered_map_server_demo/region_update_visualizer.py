@@ -32,13 +32,16 @@ SOURCE_COLORS = (
     (0.61, 0.35, 0.71),
     (0.10, 0.74, 0.80),
 )
+CLEAR_COLOR_BLEND = 0.5
+CLEAR_MARKER_Z = 0.04
+OBSTACLE_MARKER_Z = 0.08
 
 
-def _point(x, y):
+def _point(x, y, z):
     point = Point()
     point.x = float(x)
     point.y = float(y)
-    point.z = 0.05
+    point.z = z
     return point
 
 
@@ -53,7 +56,17 @@ def _marker_lifetime(patch, update, default_ttl_sec):
     return Duration().to_msg()
 
 
+def _patch_color(color, update_type):
+    if update_type == MapRegionPatch.UPDATE_OBSTACLE:
+        return color
+    return tuple(
+        channel + (1.0 - channel) * CLEAR_COLOR_BLEND
+        for channel in color
+    )
+
+
 def _new_marker(update, patch, marker_id, marker_type, color, default_ttl_sec):
+    color = _patch_color(color, patch.update_type)
     marker = Marker()
     marker.header.frame_id = update.source.header.frame_id
     marker.ns = update.source.source_id
@@ -75,10 +88,15 @@ def _new_marker(update, patch, marker_id, marker_type, color, default_ttl_sec):
 def _markers_from_patch(update, patch, first_id, color, default_ttl_sec):
     point_regions = []
     region_lines = []
+    z = (
+        OBSTACLE_MARKER_Z
+        if patch.update_type == MapRegionPatch.UPDATE_OBSTACLE
+        else CLEAR_MARKER_Z
+    )
 
     for region in patch.regions:
         if region.hint == Region.HINT_POINT and len(region.points) == 2:
-            point_regions.append(_point(region.points[0], region.points[1]))
+            point_regions.append(_point(region.points[0], region.points[1], z))
         elif (
             region.hint == Region.HINT_AXIS_ALIGNED_RECTANGLE
             and len(region.points) >= 4
@@ -89,10 +107,10 @@ def _markers_from_patch(update, patch, first_id, color, default_ttl_sec):
             min_x, max_x = min(xs), max(xs)
             min_y, max_y = min(ys), max(ys)
             corners = (
-                _point(min_x, min_y),
-                _point(max_x, min_y),
-                _point(max_x, max_y),
-                _point(min_x, max_y),
+                _point(min_x, min_y, z),
+                _point(max_x, min_y, z),
+                _point(max_x, max_y, z),
+                _point(min_x, max_y, z),
             )
             for index, corner in enumerate(corners):
                 region_lines.extend((corner, corners[(index + 1) % len(corners)]))
@@ -102,7 +120,7 @@ def _markers_from_patch(update, patch, first_id, color, default_ttl_sec):
             and len(region.points) % 2 == 0
         ):
             corners = tuple(
-                _point(x, y)
+                _point(x, y, z)
                 for x, y in zip(region.points[0::2], region.points[1::2])
             )
             for index, corner in enumerate(corners):
