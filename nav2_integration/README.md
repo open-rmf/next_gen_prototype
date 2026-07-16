@@ -136,10 +136,20 @@ Spin up the Nav2 simulation:
 ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py   robots:="robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};"
 ```
 
-In a separate terminal, run the demo launch file containing the path server, plan executor, destination server, path visualizer and Nav2 traffic nodes:
+In a separate terminal, run the demo launch file containing the path server, plan executor, destination server, path visualizer and Nav2 traffic nodes (spawning one dedicated `nav2_traffic` instance per robot specified in `robots`):
 ```
 ros2 launch rmf_path_server_demo demo_nav2.launch.py robots:="robot0 robot1"
 ```
+
+You can also selectively enable or disable components and configure which `nav2_traffic` sub-plugins to load via launch options:
+```
+ros2 launch rmf_path_server_demo demo_nav2.launch.py \
+    robots:="robot0 robot1" \
+    nav2_traffic_plugins:="destination_goal_publisher,safe_zone_subscription,inner_navigation_client,navigation_server,nav2_agent" \
+    use_visualizer:=true \
+    use_nav2_traffic:=true
+```
+
 
 Send action goals to the robots:
 
