@@ -133,12 +133,12 @@ With the workspace built and sourced, run the following nodes:
 
 Spin up the Nav2 simulation:
 ```
-ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py   robots:="robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};"
+ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py robots:="robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};"
 ```
 
 In a separate terminal, run the demo launch file containing the path server, plan executor, destination server, path visualizer and Nav2 traffic nodes:
 ```
-ros2 launch rmf_path_server_demo demo_nav2.launch.py robots:="robot0 robot1"
+ros2 launch rmf_path_server_demo demo_nav2.launch.py
 ```
 
 Send action goals to the robots:

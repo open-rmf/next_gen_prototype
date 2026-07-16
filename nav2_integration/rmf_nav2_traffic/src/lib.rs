@@ -18,15 +18,14 @@
 use bevy::prelude::*;
 use bevy_ros2::RclrsPlugin;
 use crossflow::CrossflowPlugin;
+use serde::Deserialize;
+use std::collections::HashMap;
 
 pub mod agent;
 pub use agent::*;
 
 pub mod destination;
 pub use destination::*;
-
-pub mod discovery;
-pub use discovery::*;
 
 pub mod inner_navigation_client;
 pub use inner_navigation_client::*;
@@ -36,6 +35,21 @@ pub use navigation_server::*;
 
 pub mod safe_zone;
 pub use safe_zone::*;
+
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct AgentConfigEntry {
+    // TODO(@xiyuoh) add configurable agent-specific fields here when we need it
+}
+
+#[derive(Deserialize, Debug)]
+pub struct AgentConfig {
+    pub agents: HashMap<String, Option<AgentConfigEntry>>,
+}
+
+#[derive(Resource, Debug, Clone)]
+pub struct ConfiguredAgents {
+    pub names: Vec<String>,
+}
 
 #[derive(Default)]
 pub struct Nav2TrafficPlugin {}
@@ -49,7 +63,14 @@ impl Plugin for Nav2TrafficPlugin {
                 InnerNavigationClientPlugin::default(),
                 NavigationServerPlugin::default(),
                 Nav2AgentPlugin::default(),
-                AgentDiscoveryPlugin::default(),
-            ));
+            ))
+            .add_systems(Startup, spawn_configured_agents);
+    }
+}
+
+fn spawn_configured_agents(mut commands: Commands, configured_agents: Res<ConfiguredAgents>) {
+    for name in &configured_agents.names {
+        info!("Spawning configured agent: {}", name);
+        commands.spawn(Nav2Agent::new(name.clone()));
     }
 }

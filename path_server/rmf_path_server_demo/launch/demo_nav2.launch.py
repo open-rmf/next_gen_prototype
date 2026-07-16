@@ -98,6 +98,11 @@ def generate_launch_description():
         executable='nav2_traffic',
         name='nav2_traffic',
         output='both',
+        arguments=['--config', os.path.join(
+            get_package_share_directory('rmf_nav2_traffic'),
+            'config',
+            'config.yaml'
+        )],
         parameters=[{'use_sim_time': True}]
     )
 
