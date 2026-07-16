@@ -20,6 +20,8 @@ This demo combines laser observations from three moving Nav2 robots in the globa
 ros2 launch rmf_layered_map_server_demo nav2_observations.launch.py
 ```
 
+![Three robot laser observations in the combined global map](docs/images/nav2_observations.png)
+
 By default, the demo opens three robot-local RViz windows and one combined-map view, moves the robots between fixed goals, spawns demo obstacles, and retains scans for ten seconds.
 
 * Set `use_nav2_rviz:=False` or `use_global_rviz:=False` to disable either RViz view.
