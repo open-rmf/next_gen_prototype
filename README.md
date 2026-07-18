@@ -16,36 +16,44 @@ on discourse.
 
 * ROS 2 jazzy
 * The latest Rust compiler.
+* Cargo extensions for colcon
 
 
 ## Build Instructions
 
 
-1. Install `rust` and `colcon-cargo`.
+1. Install `ROS 2`, `rust` and `colcon-cargo`.
 
-   **Method 1: Using a machine with ros2-jazzy installed**
-   
-   ```
-   # Install Rust (see https://rustup.rs/)
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   **Method 1: On your local system**
 
-   # Install required system packages
-   sudo apt install -y git libclang-dev python3-pip
+   a. [Install ROS 2 Jazzy](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html). Make sure to [install the development tools](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html#install-development-tools-optional).
 
-   # Install colcon plugins for Rust
-   sudo apt install python3-colcon-cargo
-   pip3 install --break-system-packages colcon-ros-cargo
-   ```
+   b. Install `rust`:
+      ```bash
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+      ```
+
+   c. Install colcon extensions:
+
+      ```bash
+      # Install required system packages
+      sudo apt install -y git libclang-dev python3-pip
+
+      # Install colcon plugins for Rust
+      sudo apt install python3-colcon-cargo
+      pip3 install --break-system-packages colcon-ros-cargo
+      cargo install cargo-ament-build
+      ```
 
    **Method 2: Using a container**
    We pre-build base containers with all the dependencies you can use `rocker`, `distrobox`, `podman` or
    any other oci compliant tool to get a base dev environment. For the purposes of this set of instructions we use distrobox:
-   ```
+   ```bash
    distrobox create --image ghcr.io/open-rmf/ros2_rust_base:jazzy -n ros2_rust_base
    distrobox enter ros2_rust_base
    ```
 
-2. **Import Workspace Dependencies**  
+2. **Import Workspace Dependencies**
    Create a workspace and clone the repo:
    ```bash
    mkdir -p rmf_ws/src
@@ -54,9 +62,15 @@ on discourse.
    cd ..
    ```
 
-3. **Build the PR Packages**  
+3. **Install ROS package dependencies**
+   ```bash
+   rosdep install --from-paths src --ignore-src --rosdistro jazzy -yr
+   ```
+
+4. **Build the PR Packages**
    Ensure you are at the workspace root inside the `jazzy` distrobox container, then build the relevant packages:
    ```bash
+   source /opt/ros/jazzy/setup.bash
    colcon build
    ```
 
