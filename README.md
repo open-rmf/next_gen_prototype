@@ -25,7 +25,7 @@ on discourse.
 ### 1. Install `ROS 2`, `rust` and `colcon-cargo`.
 
 <details>
-   <summary><b>Method 1: On your local system</b></summary>
+   <summary><b>Method 1: On your local system (click here)</b></summary>
 
 > a. [Install ROS 2 Jazzy](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html). Make sure to [install the development tools](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html#install-development-tools-optional).
 >
@@ -47,7 +47,7 @@ on discourse.
 </details>
 
 <details>
-   <summary><b>Method 2: Using a container</b></summary>
+   <summary><b>Method 2: Using a container (click here)</b></summary>
 
 > We pre-build base containers with all the dependencies you can use `rocker`, `distrobox`, `podman` or any other oci compliant tool to get a base dev environment. For the purposes of this set of instructions we use distrobox:
 > ```bash
