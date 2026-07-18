@@ -25,9 +25,10 @@ on discourse.
 ### 1. Install `ROS 2`, `rust` and `colcon-cargo`.
 
 <details>
-   <summary>**Method 1: On your local system**</summary>
+   <summary><b>Method 1: On your local system</b></summary>
 
    > [!TIP]
+   >
    > a. [Install ROS 2 Jazzy](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html). Make sure to [install the development tools](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html#install-development-tools-optional).
    > b. Install `rust`:
    >    ```bash
