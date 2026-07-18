@@ -67,6 +67,7 @@ cd ..
 
 ### 3. Install ROS package dependencies
 ```bash
+rosdep update
 rosdep install --from-paths src --ignore-src --rosdistro jazzy -yr
 ```
 
