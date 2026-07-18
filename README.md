@@ -24,7 +24,8 @@ on discourse.
 
 ### 1. Install `ROS 2`, `rust` and `colcon-cargo`.
 
-#### Method 1: On your local system
+---
+**Method 1: On your local system**
 
 a. [Install ROS 2 Jazzy](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html). Make sure to [install the development tools](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html#install-development-tools-optional).
 b. Install `rust`:
@@ -42,13 +43,18 @@ c. Install colcon extensions:
    cargo install cargo-ament-build
    ```
 
-#### Method 2: Using a container
+---
+
+---
+**Method 2: Using a container**
 
 We pre-build base containers with all the dependencies you can use `rocker`, `distrobox`, `podman` or any other oci compliant tool to get a base dev environment. For the purposes of this set of instructions we use distrobox:
 ```bash
 distrobox create --image ghcr.io/open-rmf/ros2_rust_base:jazzy -n ros2_rust_base
 distrobox enter ros2_rust_base
 ```
+
+---
 
 ### 2. Import Workspace Dependencies
 Create a workspace and clone the repo:
