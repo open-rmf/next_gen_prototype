@@ -28,10 +28,12 @@ on discourse.
    <summary><b>Method 1: On your local system</b></summary>
 
 > a. [Install ROS 2 Jazzy](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html). Make sure to [install the development tools](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html#install-development-tools-optional).
+>
 > b. Install `rust`:
 >    ```bash
 >    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 >    ```
+>
 > c. Install colcon extensions:
 >    ```bash
 >    # Install required system packages
