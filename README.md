@@ -26,24 +26,24 @@ on discourse.
 
    **Method 1: On your local system**
 
-       a. [Install ROS 2 Jazzy](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html). Make sure to [install the development tools](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html#install-development-tools-optional).
+   a. [Install ROS 2 Jazzy](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html). Make sure to [install the development tools](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html#install-development-tools-optional).
 
-       b. Install `rust`:
-          ```bash
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-          ```
+   b. Install `rust`:
+      ```bash
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+      ```
 
-       c. Install colcon extensions:
+   c. Install colcon extensions:
 
-          ```bash
-          # Install required system packages
-          sudo apt install -y git libclang-dev python3-pip
+      ```bash
+      # Install required system packages
+      sudo apt install -y git libclang-dev python3-pip
 
-          # Install colcon plugins for Rust
-          sudo apt install python3-colcon-cargo
-          pip3 install --break-system-packages colcon-ros-cargo
-          cargo install cargo-ament-build
-          ```
+      # Install colcon plugins for Rust
+      sudo apt install python3-colcon-cargo
+      pip3 install --break-system-packages colcon-ros-cargo
+      cargo install cargo-ament-build
+      ```
 
    **Method 2: Using a container**
    We pre-build base containers with all the dependencies you can use `rocker`, `distrobox`, `podman` or
