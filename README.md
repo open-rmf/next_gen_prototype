@@ -24,9 +24,9 @@ on discourse.
 
 ### 1. Install `ROS 2`, `rust` and `colcon-cargo`.
 
-> [!NOTE]
-> **Method 1: On your local system**
->
+<details>
+<summary>**Method 1: On your local system**</summary>
+> [!TIP]
 > a. [Install ROS 2 Jazzy](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html). Make sure to [install the development tools](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html#install-development-tools-optional).
 > b. Install `rust`:
 >    ```bash
@@ -42,6 +42,7 @@ on discourse.
 >    pip3 install --break-system-packages colcon-ros-cargo
 >    cargo install cargo-ament-build
 >    ```
+</details>
 
 > [!NOTE]
 > **Method 2: Using a container**
