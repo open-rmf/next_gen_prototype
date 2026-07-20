@@ -63,6 +63,7 @@ def generate_launch_description():
     rviz_config_file = LaunchConfiguration('rviz_config')
     use_robot_state_pub = LaunchConfiguration('use_robot_state_pub')
     use_rviz = LaunchConfiguration('use_rviz')
+    use_navigation = LaunchConfiguration('use_navigation')
     log_settings = LaunchConfiguration('log_settings', default='true')
 
     # Declare the launch arguments
@@ -108,6 +109,12 @@ def generate_launch_description():
         'use_rviz', default_value='True', description='Whether to start RVIZ'
     )
 
+    declare_use_navigation_cmd = DeclareLaunchArgument(
+        'use_navigation',
+        default_value='True',
+        description='Whether to enable the Nav2 planning and control stack',
+    )
+
     # Start Gazebo with plugin providing the robot spawning service
     world_sdf = tempfile.mktemp(prefix='nav2_', suffix='.sdf')
     world_sdf_xacro = ExecuteProcess(
@@ -126,7 +133,7 @@ def generate_launch_description():
 
     # Define commands for launching the navigation instances
     bringup_cmd_group = []
-    for robot_name in robots_list:
+    for robot_index, robot_name in enumerate(robots_list):
         init_pose = robots_list[robot_name]
         namespace = robot_name + '/inner'
         group = GroupAction(
@@ -166,6 +173,14 @@ def generate_launch_description():
                         'use_simulator': 'False',
                         'headless': 'False',
                         'use_robot_state_pub': use_robot_state_pub,
+                        'use_navigation': use_navigation,
+                        'clock_topic': TextSubstitution(
+                            text=(
+                                '/clock'
+                                if robot_index == 0
+                                else f'/{namespace}/clock'
+                            )
+                        ),
                         'x_pose': TextSubstitution(text=str(init_pose['x'])),
                         'y_pose': TextSubstitution(text=str(init_pose['y'])),
                         'z_pose': TextSubstitution(text=str(init_pose['z'])),
@@ -199,6 +214,7 @@ def generate_launch_description():
     ld.add_action(declare_autostart_cmd)
     ld.add_action(declare_rviz_config_file_cmd)
     ld.add_action(declare_use_robot_state_pub_cmd)
+    ld.add_action(declare_use_navigation_cmd)
 
     # initial localization node
     for robot_name in robots_list:
