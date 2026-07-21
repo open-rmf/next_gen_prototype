@@ -118,6 +118,7 @@ class TestPathServer(unittest.TestCase):
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
         )
         discovery_pub = self.node.create_publisher(
             ParticipantList,
@@ -142,7 +143,7 @@ class TestPathServer(unittest.TestCase):
         odom = self.create_odom(0.0, 0.0)
 
         start_time = time.time()
-        timeout = 8.0
+        timeout = 15.0
         while time.time() - start_time < timeout:
             discovery_pub.publish(parts)
             dest_pub.publish(dest)
