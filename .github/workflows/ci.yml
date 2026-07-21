@@ -2,16 +2,24 @@ name: Next-Gen Prototype CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, epic/next-gen-base ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, epic/next-gen-base ]
+  workflow_dispatch:
 
 jobs:
   ci-check:
-    name: Colcon Overlay Build & Test Suite
+    name: Colcon Overlay Build & Test Suite (${{ matrix.rmw_implementation }})
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/open-rmf/ros2_rust_base:jazzy
+
+    strategy:
+      fail-fast: false
+      matrix:
+        rmw_implementation:
+          - rmw_fastrtps_cpp
+          - rmw_cyclonedds_cpp
 
     steps:
       - name: Checkout Prototype Repository
@@ -25,6 +33,9 @@ jobs:
           source /opt/ros/jazzy/setup.bash
           rosdep update
           apt update
+          if [ "${{ matrix.rmw_implementation }}" = "rmw_cyclonedds_cpp" ]; then
+            apt install -y ros-jazzy-rmw-cyclonedds-cpp
+          fi
           rosdep install --from-paths . --ignore-src -y --skip-keys="rclrs ament_cargo ament_python"
           colcon build
         shell: bash
@@ -34,6 +45,9 @@ jobs:
         run: |
           source /opt/ros/jazzy/setup.bash
           source install/setup.bash
+          export ROS_LOCALHOST_ONLY=1
+          export RMW_IMPLEMENTATION=${{ matrix.rmw_implementation }}
           colcon test --executor sequential --packages-select rmf_path_server_test rmf_reservation_tests --event-handlers console_direct+
           colcon test-result --all
         shell: bash
+
