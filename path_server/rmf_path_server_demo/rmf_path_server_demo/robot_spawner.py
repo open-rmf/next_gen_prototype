@@ -410,7 +410,7 @@ class RobotSpawnerNode(Node):
             Odometry,
             f'{name}/odom',
             odom_callback,
-            qos_profile=self.reliable_transient_qos
+            qos_profile=10
         )
 
     def subscribe_to_plan(self, name):

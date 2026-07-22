@@ -537,7 +537,7 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
     let footprints_clone2 = Arc::clone(&footprints_clone);
     let list_subscription = discovery_worker
         .create_subscription::<rmf_prototype_msgs::msg::ParticipantList, _>(
-            "/destination/discovery",
+            "/destination/discovery".transient_local().reliable(),
             move |_server: &mut DiscoveryServer<P>,
                   msg: rmf_prototype_msgs::msg::ParticipantList| {
                 if let Ok(mut map) = footprints_clone2.lock() {
@@ -590,7 +590,7 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
                 let odom_sub = match server
                     .destinations_worker
                     .create_subscription::<Odometry, _>(
-                        odom_topic.as_str(),
+                        odom_topic.as_str().reliable(),
                         move |dest_server: &mut PlanServer<P>, odom_msg: Odometry| {
                             dest_server.handle_odometry(&robot_id_clone2, odom_msg);
                         },

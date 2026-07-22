@@ -78,6 +78,7 @@ class TestQueue(unittest.TestCase):
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
         )
 
         cls.destinations = {name: [] for name in ROBOT_NAMES}

@@ -176,11 +176,11 @@ class TestPathServerFollow(unittest.TestCase):
 
         self.node.create_subscription(
             Odometry, 'robot_1/odom', r1_odom_cb,
-            qos_profile=reliable_transient_qos
+            qos_profile=10
         )
         self.node.create_subscription(
             Odometry, 'robot_2/odom', r2_odom_cb,
-            qos_profile=reliable_transient_qos
+            qos_profile=10
         )
         self.node.create_subscription(
             Plan, 'robot_1/plan', r1_plan_cb,
@@ -207,7 +207,8 @@ class TestPathServerFollow(unittest.TestCase):
         discovery_qos = QoSProfile(
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            history=HistoryPolicy.KEEP_LAST
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
         )
 
         discovery_pub = self.node.create_publisher(

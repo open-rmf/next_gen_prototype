@@ -83,7 +83,7 @@ where
 {
     let mut tracker = ParticipantTracker::new();
     worker.create_subscription::<ParticipantList, _>(
-        topic.transient_local().reliable().keep_all(),
+        topic.transient_local().reliable().keep_last(10),
         move |server: &mut T, msg: ParticipantList| {
             let (added, removed) = tracker.update(&msg);
 
