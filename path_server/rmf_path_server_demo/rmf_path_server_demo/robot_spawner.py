@@ -180,6 +180,8 @@ class RobotSpawnerNode(Node):
         # Parameters
         self.declare_parameter('use_destination_server', False)
         self.use_destination_server = self.get_parameter('use_destination_server').value
+        self.declare_parameter('port', 8080)
+        self.port = int(self.get_parameter('port').value)
 
         self.current_map = None
         self.active_processes = {}
@@ -247,7 +249,7 @@ class RobotSpawnerNode(Node):
             self.web_dir = "./www"
 
         # Start the HTTP server
-        self.start_http_server(port=8080)
+        self.start_http_server(port=self.port)
 
     def start_http_server(self, port):
         def serve():

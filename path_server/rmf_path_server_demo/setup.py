@@ -44,6 +44,7 @@ setup(
     entry_points={
         'console_scripts': [
             'robot_spawner = rmf_path_server_demo.robot_spawner:main',
+            'rmf_demo_test_client = rmf_path_server_demo.test_client:main',
         ],
     },
 )
