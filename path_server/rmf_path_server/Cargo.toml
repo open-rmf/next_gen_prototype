@@ -1,0 +1,16 @@
+[package]
+name = "rmf_path_server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures = "0.3.32"
+rclrs = "*"
+ros-env = "0.2.0"
+rmf_participant_discovery = { path = "../../rmf_participant_discovery" }
+
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
+mapf = { git = "https://github.com/open-rmf/mapf" }
+mapf_post = { git = "https://github.com/arjo129/mapf_post", branch="arjo/feat/more_efficient_checks"}
+hetpibt = { git = "https://github.com/arjo129/pibt_rs", branch="scalability-study-updates" }
