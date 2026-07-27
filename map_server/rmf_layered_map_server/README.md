@@ -10,7 +10,7 @@ Default topics:
 - `/map/region_updates`: `rmf_layered_map_msgs/MapRegionUpdate`
 - `/map`: composed `nav_msgs/OccupancyGrid`
 
-Dynamic observations expire according to their TTL, so transient local obstacles do not remain in the global planning map forever. A LiDAR or local costmap observer can keep refreshing an obstacle while it is still seen, then let the server decay it after the TTL.
+Dynamic observations expire according to their TTL, so transient obstacles do not remain in the global planning map forever. The server transforms and rasterizes each region on arrival, then stores cell contributions by source, map, update type, and cell. Repeated observations refresh matching cells instead of stacking region snapshots. Older evidence is retained only when it outlives a newer contribution.
 
 `MapRegionUpdate` messages contain a list of `MapRegionPatch` entries. A sensor
 snapshot that clears freespace and marks obstacles can publish clear and obstacle
@@ -25,6 +25,25 @@ uses `source.robot_pose` to transform them into `source.header.frame_id`, which
 must match the static occupancy grid frame. Updates need a non-zero source
 timestamp. The current implementation accepts point and axis-aligned rectangle
 regions. It logs and ignores other region types.
+
+Region updates received before the static occupancy grid are held in a bounded FIFO queue and rasterized once the grid arrives. Replacing only the static grid data preserves active dynamic cells; changing its frame, dimensions, resolution, or origin discards them because their cell indices no longer describe the new grid.
+
+## Performance Benchmark
+
+The deterministic benchmark is installed by the normal colcon build and exercises the map server without ROS transport, visualization, or simulator overhead. It reports ingest, prune, composition, and total latency, plus throughput, peak RSS, and an output-grid checksum.
+
+Build and source the workspace, then run each supported update pattern:
+
+```bash
+ros2 run rmf_layered_map_server layered_map_benchmark \
+  --label candidate --scenario reset
+ros2 run rmf_layered_map_server layered_map_benchmark \
+  --label candidate --scenario rolling-overlap
+ros2 run rmf_layered_map_server layered_map_benchmark \
+  --label candidate --scenario rolling-moving
+```
+
+For an A/B comparison, run the same benchmark source and arguments against both revisions. Compare performance only when the checksums match.
 
 ## Visualization Smoke Test
 

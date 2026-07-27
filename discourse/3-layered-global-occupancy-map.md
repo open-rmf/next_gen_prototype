@@ -21,8 +21,7 @@ observations, can be added later.
 * Clear-space patches have TTLs, just like obstacle patches
 * A source can reset its previous observations without using a TTL
 * Robot-mounted sources include the observation-frame pose at observation time
-* The Rust map server composes a static occupancy grid and active observations
-  into `/map`
+* The Rust map server rasterizes incoming observations once and composes their active cell contributions with a static occupancy grid into `/map`
 * The Nav2 demo converts scans from three robots into clear ray sectors and occupied endpoint regions, then displays the source contributions and map
 * The replanning demo fuses two robots' scans and replans when an updated map blocks an active route
 * The observation messages live in `rmf_layered_map_msgs`, leaving
@@ -114,21 +113,15 @@ accepts point and axis-aligned rectangle regions.
 
 # Layered Map Server
 
-`rmf_layered_map_server` keeps the static occupancy grid separate from dynamic
-observations and publishes their composition on `/map`. It validates source
-timestamps and frames, ignores updates that are older than the latest accepted
-update from the same source, supports source resets, and removes observations
-after their TTL expires.
+`rmf_layered_map_server` keeps the static occupancy grid separate from dynamic observations and publishes their composition on `/map`. It validates source timestamps and frames, ignores updates older than the latest accepted update from the same source, supports source resets, and removes observations after their TTL expires. Each region is transformed and rasterized on arrival. Repeated observations refresh cell contributions instead of stacking region snapshots. Older evidence is retained only when it outlives a newer contribution.
 
-The server applies clear patches before obstacle patches from the same update.
-During composition, obstacle observations win over clear observations so
-occupied space is not accidentally erased by another active source.
+The server applies clear patches before obstacle patches from the same update. During composition, obstacle observations win over clear observations so occupied space is not accidentally erased by another active source. Updates received before the static grid are held in a bounded FIFO queue and rasterized when the grid arrives. A static grid geometry change discards active cell contributions because their indices refer to the old geometry.
 
 # Three-Robot Nav2 Demo
 
 The launch file starts three robots in different free corners of the warehouse, cycles them through fixed Nav2 goals, and spawns one deterministic Gazebo box near each robot. Each observation node subscribes to its robot's local `sensor_msgs/LaserScan`, filters invalid or out-of-range returns, and publishes free-space ray sectors as convex polygons and occupied endpoints as point regions.
 
-Each scan adds temporary clear and obstacle patches to a rolling observation history. The map server rasterizes clear sectors before obstacle endpoints so a measured hit remains occupied. Active obstacle evidence still wins over clear evidence until its TTL expires. An update may set `reset_source` so the new scan replaces all active observations from that source instead of being added to its history. The observation-frame pose is recorded in the shared `map` frame so the map server can transform the scan-local regions before rasterizing them.
+Each scan adds temporary clear and obstacle patches. The map server rasterizes them on arrival and refreshes matching cell contributions rather than retaining region messages. It applies clear cells before obstacle cells so a measured hit remains occupied. Active obstacle evidence still wins over clear evidence until its TTL expires. An update may set `reset_source` so the new scan replaces all active observations from that source. The observation-frame pose is recorded in the shared `map` frame so the map server can transform scan-local regions before rasterizing them.
 
 The demo launches Nav2 localization, planning, and control for the fixed goal loops, but does not launch RMF planning. Robot-local RViz windows show Nav2 state, while another RViz window displays the combined global `/map`. The combined view overlays incoming region updates as colored markers grouped by source, with the same retention behavior as the map contributions.
 
