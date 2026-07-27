@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from glob import glob
+import os
 
 from setuptools import find_packages, setup
 
@@ -28,7 +28,9 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        (os.path.join('share', package_name, 'maps'), glob('maps/*')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
+        (os.path.join('share', package_name, 'worlds'), glob('worlds/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -44,6 +46,8 @@ setup(
             'layered_map_demo_publisher = rmf_layered_map_server_demo.demo_publisher:main',
             'nav2_goal_publisher = '
             'rmf_layered_map_server_demo.nav2_goal_publisher:main',
+            'replan_obstacle_demo = '
+            'rmf_layered_map_server_demo.replan_obstacle_demo:main',
             'region_update_visualizer = '
             'rmf_layered_map_server_demo.region_update_visualizer:main',
             'scan_region_publisher = '

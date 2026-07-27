@@ -14,7 +14,7 @@
 
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use rmf_plan_executor::PlanExecutor;
-use ros_env::nav_msgs::msg::Odometry;
+use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
 use ros_env::rmf_prototype_msgs::msg::{ParticipantList, Plan};
 use std::collections::HashMap;
 
@@ -70,6 +70,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     executor.handle_robot_added(&p.name, 0.49);
                 }
             }
+        },
+    )?;
+
+    let _map_subscription = executor_worker.create_subscription::<OccupancyGrid, _>(
+        "/map".transient_local().reliable(),
+        move |executor: &mut PlanExecutor, msg: OccupancyGrid| {
+            executor.handle_map(msg);
         },
     )?;
 

@@ -1,7 +1,8 @@
 # Path Server
 
-This folder contains a path server implementation. It works by triggering a replan any time a new destination event comes in. The replan should only include robots that are actively moving.
-Currently it uses a grid-world PIBT based planner, but it is designed to work with any MapfPlanner implementation.
+This folder contains the path server and plan executor. The path server plans for new destinations and replans active robots that report `PlanError.CODE_PATH_BLOCKED`.
+
+The plan executor checks each remaining route against updates to `/map`, with a 300 ms debounce and two-second cooldown. The grid-world PiBT planner conservatively downsamples maps finer than `1.0 m`; other `MapfPlanner` implementations can be substituted.
 
 ## Path Server Demo Dashboard
 

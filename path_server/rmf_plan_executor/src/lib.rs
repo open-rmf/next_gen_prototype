@@ -22,16 +22,22 @@ use ros_env::builtin_interfaces;
 use ros_env::geometry_msgs::msg::Pose;
 use ros_env::nav2_msgs;
 use ros_env::nav2_msgs::msg::Costmap;
-use ros_env::nav_msgs::msg::Odometry;
+use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
 use ros_env::rmf_prototype_msgs;
 use ros_env::rmf_prototype_msgs::msg::{
-    DestinationConstraints, Plan, PlanRelease, SafeZone, SafeZoneId, TargetOrientation,
+    DestinationConstraints, Plan, PlanError, PlanId, PlanRelease, SafeZone, SafeZoneId,
+    TargetOrientation,
 };
 use ros_env::std_msgs;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
+    time::{Duration, Instant},
 };
+
+const BLOCKAGE_DEBOUNCE: Duration = Duration::from_millis(300);
+const REPLAN_COOLDOWN: Duration = Duration::from_secs(2);
+const OCCUPIED_THRESHOLD: i8 = 50;
 
 pub struct RobotState {
     pub radius: f32,
@@ -40,6 +46,48 @@ pub struct RobotState {
     pub waypoint_follower: Option<WaypointFollower>,
     pub safe_zone_version: u64,
     pub last_incremental_target_wp: Option<usize>,
+    blockage_monitor: BlockageMonitor,
+}
+
+#[derive(Default)]
+struct BlockageMonitor {
+    blocked_since: Option<Instant>,
+    reported_plan: Option<PlanId>,
+    last_reported_at: Option<Instant>,
+}
+
+impl BlockageMonitor {
+    fn begin_plan(&mut self) {
+        self.blocked_since = None;
+    }
+
+    fn observe(&mut self, blocked: bool, plan_id: &PlanId, now: Instant) -> bool {
+        if !blocked {
+            self.blocked_since = None;
+            return false;
+        }
+
+        if self.reported_plan.as_ref() == Some(plan_id) {
+            return false;
+        }
+
+        let blocked_since = self.blocked_since.get_or_insert(now);
+        if now.duration_since(*blocked_since) < BLOCKAGE_DEBOUNCE {
+            return false;
+        }
+
+        if self
+            .last_reported_at
+            .is_some_and(|last| now.duration_since(last) < REPLAN_COOLDOWN)
+        {
+            return false;
+        }
+
+        self.reported_plan = Some(plan_id.clone());
+        self.last_reported_at = Some(now);
+        self.blocked_since = None;
+        true
+    }
 }
 
 pub struct PlanExecutor {
@@ -50,11 +98,38 @@ pub struct PlanExecutor {
     pub active_robots: BTreeMap<String, RobotState>,
     pub plan_release_publishers: HashMap<String, rclrs::Publisher<PlanRelease>>,
     pub safezone_publishers: HashMap<String, rclrs::Publisher<SafeZone>>,
+    pub plan_error_publishers: HashMap<String, rclrs::Publisher<PlanError>>,
     pub grid: Arc<Grid2D>,
     pub grid_width: u32,
     pub grid_height: u32,
     pub grid_resolution: f32,
     pub grid_origin: Pose,
+    pub latest_map: Option<OccupancyGrid>,
+}
+
+fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
+    let Some(target) = plan.waypoints.get(target_idx) else {
+        return 0.0;
+    };
+    let [target_x, target_y] = target.position;
+
+    for waypoint in plan.waypoints[..target_idx].iter().rev() {
+        let dx = target_x - waypoint.position[0];
+        let dy = target_y - waypoint.position[1];
+        if dx.hypot(dy) > 1e-3 {
+            return dy.atan2(dx);
+        }
+    }
+
+    for waypoint in plan.waypoints.iter().skip(target_idx + 1) {
+        let dx = waypoint.position[0] - target_x;
+        let dy = waypoint.position[1] - target_y;
+        if dx.hypot(dy) > 1e-3 {
+            return dy.atan2(dx);
+        }
+    }
+
+    0.0
 }
 
 impl PlanExecutor {
@@ -66,11 +141,13 @@ impl PlanExecutor {
             active_robots: BTreeMap::new(),
             plan_release_publishers: HashMap::new(),
             safezone_publishers: HashMap::new(),
+            plan_error_publishers: HashMap::new(),
             grid: Arc::new(Grid2D::new(vec![vec![0; 20]; 20], 1.0)),
             grid_width: 20,
             grid_height: 20,
             grid_resolution: 1.0,
             grid_origin: origin,
+            latest_map: None,
         }
     }
 
@@ -91,6 +168,7 @@ impl PlanExecutor {
                     waypoint_follower: None,
                     safe_zone_version: 0,
                     last_incremental_target_wp: None,
+                    blockage_monitor: BlockageMonitor::default(),
                 },
             );
             self.reindex_followers();
@@ -106,6 +184,7 @@ impl PlanExecutor {
             );
             self.plan_release_publishers.remove(robot_id);
             self.safezone_publishers.remove(robot_id);
+            self.plan_error_publishers.remove(robot_id);
             self.reindex_followers();
         }
     }
@@ -164,36 +243,49 @@ impl PlanExecutor {
         state.plan = Some(msg);
         state.safe_zone_version = 0;
         state.last_incremental_target_wp = None;
+        state.blockage_monitor.begin_plan();
 
         // Reindex because we updated the plan
         self.reindex_followers();
+    }
+
+    pub fn handle_map(&mut self, msg: OccupancyGrid) {
+        self.latest_map = Some(msg);
+        let robot_ids: Vec<_> = self.active_robots.keys().cloned().collect();
+        for robot_id in robot_ids {
+            self.update_route_blockage(&robot_id);
+        }
     }
 
     pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) {
         let current_x = msg.pose.pose.position.x as f32;
         let current_y = msg.pose.pose.position.y as f32;
 
-        let Some(state) = self.active_robots.get_mut(robot_id) else {
-            return;
-        };
+        {
+            let Some(state) = self.active_robots.get_mut(robot_id) else {
+                return;
+            };
 
-        state.latest_odom = Some(msg.clone());
+            state.latest_odom = Some(msg.clone());
 
-        if let Some(fw) = &mut state.waypoint_follower {
-            let before = fw.get_semantic_waypoint().trajectory_index;
-            let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
-            fw.update_position_estimate(&position, 0.5);
-            let after = fw.get_semantic_waypoint().trajectory_index;
-            rclrs::log_debug!(
-                self.node.logger(),
-                "[Executor Debug] Robot {} pos=({}, {}) index before={}, after={}",
-                robot_id,
-                current_x,
-                current_y,
-                before,
-                after
-            );
+            if let Some(fw) = &mut state.waypoint_follower {
+                let before = fw.get_semantic_waypoint().trajectory_index;
+                let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
+                fw.update_position_estimate(&position, 0.5);
+                let after = fw.get_semantic_waypoint().trajectory_index;
+                rclrs::log_debug!(
+                    self.node.logger(),
+                    "[Executor Debug] Robot {} pos=({}, {}) index before={}, after={}",
+                    robot_id,
+                    current_x,
+                    current_y,
+                    before,
+                    after
+                );
+            }
         }
+
+        self.update_route_blockage(robot_id);
 
         if !self.ready_to_execute() {
             return;
@@ -412,6 +504,7 @@ impl PlanExecutor {
 
         let target_x = plan.waypoints[released_wp_idx].position[0];
         let target_y = plan.waypoints[released_wp_idx].position[1];
+        let target_yaw = target_yaw(plan, released_wp_idx);
 
         let costmap = Self::to_costmap_msg(
             &positions,
@@ -433,16 +526,17 @@ impl PlanExecutor {
         let safe_zone = SafeZone {
             incremental_target: DestinationConstraints {
                 regions: vec![rmf_prototype_msgs::msg::TargetRegion {
-                    tolerance: 0.2,
+                    tolerance: 0.1,
                     region: rmf_prototype_msgs::msg::Region {
                         points: vec![target_x, target_y],
                         hint: rmf_prototype_msgs::msg::Region::HINT_POINT,
                     },
                     orientations: vec![TargetOrientation {
-                        orientation_radians: 0.0, // TODO(@xiyuoh)
+                        // Avoid turning in place at hold points.
+                        orientation_radians: target_yaw,
                         spread_radians: 0.0,
                         tolerance_radians: 0.0,
-                    }], // TODO(@xiyuoh) calculate actual orientation
+                    }],
                 }],
                 nodes: vec![],
             },
@@ -471,6 +565,82 @@ impl PlanExecutor {
             let _ = publisher.publish(safe_zone);
             self.safezone_publishers
                 .insert(robot_id.to_string(), publisher);
+        }
+    }
+
+    fn update_route_blockage(&mut self, robot_id: &str) {
+        let Some(map) = self.latest_map.as_ref() else {
+            return;
+        };
+
+        let Some(state) = self.active_robots.get_mut(robot_id) else {
+            return;
+        };
+        let (Some(plan), Some(odom), Some(follower)) = (
+            state.plan.as_ref(),
+            state.latest_odom.as_ref(),
+            state.waypoint_follower.as_mut(),
+        ) else {
+            return;
+        };
+
+        let remaining = follower.remaining_trajectory();
+        let mut route = Vec::with_capacity(remaining.len() + 1);
+        route.push((
+            odom.pose.pose.position.x as f32,
+            odom.pose.pose.position.y as f32,
+        ));
+        route.extend(remaining);
+
+        let blocked = route_intersects_map(map, &route, state.radius);
+        let plan_id = plan.plan_id.clone();
+        if !state
+            .blockage_monitor
+            .observe(blocked, &plan_id, Instant::now())
+        {
+            return;
+        }
+
+        let publisher = match self.plan_error_publishers.entry(robot_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let topic = format!("{robot_id}/plan/error");
+                match self.node.create_publisher(topic.as_str()) {
+                    Ok(publisher) => entry.insert(publisher),
+                    Err(error) => {
+                        rclrs::log_error!(
+                            self.node.logger(),
+                            "Failed to create plan error publisher for {}: {:?}",
+                            robot_id,
+                            error
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+
+        let error = PlanError {
+            error: rmf_prototype_msgs::msg::Error {
+                code: PlanError::CODE_PATH_BLOCKED,
+                message: format!("Updated map blocks the remaining route for {robot_id}"),
+                parameters: String::new(),
+            },
+            plan_id,
+        };
+        if let Err(error) = publisher.publish(error) {
+            rclrs::log_error!(
+                self.node.logger(),
+                "Failed to publish path blockage for {}: {:?}",
+                robot_id,
+                error
+            );
+        } else {
+            rclrs::log_warn!(
+                self.node.logger(),
+                "Updated map blocks the remaining route for {}. Requesting a replan.",
+                robot_id
+            );
         }
     }
 
@@ -527,10 +697,185 @@ impl PlanExecutor {
     }
 }
 
+fn route_intersects_map(map: &OccupancyGrid, route: &[(f32, f32)], radius: f32) -> bool {
+    if route.len() < 2 || map.info.resolution <= 0.0 {
+        return false;
+    }
+
+    let width = map.info.width as isize;
+    let height = map.info.height as isize;
+    if width == 0 || height == 0 {
+        return false;
+    }
+
+    let resolution = map.info.resolution;
+    let q = &map.info.origin.orientation;
+    let yaw = (2.0 * (q.w * q.z + q.x * q.y)).atan2(1.0 - 2.0 * (q.y * q.y + q.z * q.z)) as f32;
+    let cos_yaw = yaw.cos();
+    let sin_yaw = yaw.sin();
+    let origin_x = map.info.origin.position.x as f32;
+    let origin_y = map.info.origin.position.y as f32;
+    let clearance = radius.max(0.0) + resolution * std::f32::consts::FRAC_1_SQRT_2;
+    let clearance_squared = clearance * clearance;
+
+    let to_map = |(x, y): (f32, f32)| {
+        let dx = x - origin_x;
+        let dy = y - origin_y;
+        (cos_yaw * dx + sin_yaw * dy, -sin_yaw * dx + cos_yaw * dy)
+    };
+
+    for segment in route.windows(2) {
+        let start = to_map(segment[0]);
+        let end = to_map(segment[1]);
+        let min_x = (((start.0.min(end.0) - clearance) / resolution).floor() as isize).max(0);
+        let max_x =
+            (((start.0.max(end.0) + clearance) / resolution).floor() as isize).min(width - 1);
+        let min_y = (((start.1.min(end.1) - clearance) / resolution).floor() as isize).max(0);
+        let max_y =
+            (((start.1.max(end.1) + clearance) / resolution).floor() as isize).min(height - 1);
+
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let index = y as usize * width as usize + x as usize;
+                if map.data.get(index).copied().unwrap_or(-1) <= OCCUPIED_THRESHOLD {
+                    continue;
+                }
+
+                let center = ((x as f32 + 0.5) * resolution, (y as f32 + 0.5) * resolution);
+                if distance_squared_to_segment(center, start, end) <= clearance_squared {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn distance_squared_to_segment(point: (f32, f32), start: (f32, f32), end: (f32, f32)) -> f32 {
+    let segment = (end.0 - start.0, end.1 - start.1);
+    let length_squared = segment.0 * segment.0 + segment.1 * segment.1;
+    if length_squared <= f32::EPSILON {
+        return (point.0 - start.0).powi(2) + (point.1 - start.1).powi(2);
+    }
+
+    let offset = (point.0 - start.0, point.1 - start.1);
+    let t = ((offset.0 * segment.0 + offset.1 * segment.1) / length_squared).clamp(0.0, 1.0);
+    let closest = (start.0 + t * segment.0, start.1 + t * segment.1);
+    (point.0 - closest.0).powi(2) + (point.1 - closest.1).powi(2)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{
+        route_intersects_map, target_yaw, BlockageMonitor, BLOCKAGE_DEBOUNCE, REPLAN_COOLDOWN,
+    };
     use mapf_post::na::{Isometry2, Vector2};
     use mapf_post::{Trajectory, WaypointFollower};
+    use ros_env::{
+        nav_msgs::msg::OccupancyGrid,
+        rmf_prototype_msgs::msg::{Plan, PlanId, Waypoint},
+    };
+    use std::time::Instant;
+
+    fn plan_with_positions(positions: &[[f32; 2]]) -> Plan {
+        Plan {
+            waypoints: positions
+                .iter()
+                .map(|position| Waypoint {
+                    position: *position,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn target_yaw_ignores_stationary_wait_waypoints() {
+        let plan = plan_with_positions(&[[3.0, 4.0], [3.0, 4.0], [3.0, 4.0], [3.0, 5.0]]);
+
+        assert!((target_yaw(&plan, 3) - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn target_yaw_uses_departure_direction_at_trajectory_start() {
+        let plan = plan_with_positions(&[[3.0, 4.0], [3.0, 4.0], [2.0, 4.0]]);
+
+        assert!((target_yaw(&plan, 0) - std::f32::consts::PI).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stationary_trajectory_has_neutral_yaw() {
+        let plan = plan_with_positions(&[[3.0, 4.0], [3.0, 4.0]]);
+
+        assert_eq!(target_yaw(&plan, 1), 0.0);
+    }
+
+    #[test]
+    fn occupied_cell_on_remaining_route_is_blocked() {
+        let mut map = OccupancyGrid::default();
+        map.info.resolution = 1.0;
+        map.info.width = 10;
+        map.info.height = 10;
+        map.info.origin.orientation.w = 1.0;
+        map.data = vec![0; 100];
+        map.data[5 * 10 + 5] = 100;
+
+        assert!(route_intersects_map(&map, &[(1.5, 5.5), (8.5, 5.5)], 0.25));
+        assert!(!route_intersects_map(&map, &[(1.5, 8.5), (8.5, 8.5)], 0.25));
+    }
+
+    #[test]
+    fn blockage_must_persist_before_reporting() {
+        let mut monitor = BlockageMonitor::default();
+        let plan_id = PlanId::default();
+        let start = Instant::now();
+
+        assert!(!monitor.observe(true, &plan_id, start));
+        assert!(!monitor.observe(true, &plan_id, start + BLOCKAGE_DEBOUNCE / 2));
+        assert!(monitor.observe(true, &plan_id, start + BLOCKAGE_DEBOUNCE));
+        let later = start + BLOCKAGE_DEBOUNCE + REPLAN_COOLDOWN;
+        assert!(!monitor.observe(true, &plan_id, later));
+    }
+
+    #[test]
+    fn clear_route_resets_the_debounce_window() {
+        let mut monitor = BlockageMonitor::default();
+        let plan_id = PlanId::default();
+        let start = Instant::now();
+
+        assert!(!monitor.observe(true, &plan_id, start));
+        assert!(!monitor.observe(false, &plan_id, start + BLOCKAGE_DEBOUNCE));
+        assert!(!monitor.observe(true, &plan_id, start + BLOCKAGE_DEBOUNCE));
+        let before_debounce = start + BLOCKAGE_DEBOUNCE * 3 / 2;
+        assert!(!monitor.observe(true, &plan_id, before_debounce));
+        assert!(monitor.observe(true, &plan_id, start + BLOCKAGE_DEBOUNCE * 2));
+    }
+
+    #[test]
+    fn cooldown_delays_a_blockage_on_the_next_plan() {
+        let mut monitor = BlockageMonitor::default();
+        let first_plan = PlanId::default();
+        let second_plan = PlanId {
+            plan_version: 1,
+            ..Default::default()
+        };
+        let start = Instant::now();
+
+        assert!(!monitor.observe(true, &first_plan, start));
+        assert!(monitor.observe(true, &first_plan, start + BLOCKAGE_DEBOUNCE));
+        monitor.begin_plan();
+        let during_cooldown = start + BLOCKAGE_DEBOUNCE * 2;
+        assert!(!monitor.observe(true, &second_plan, during_cooldown));
+        let after_debounce = start + BLOCKAGE_DEBOUNCE * 3;
+        assert!(!monitor.observe(true, &second_plan, after_debounce));
+        assert!(monitor.observe(
+            true,
+            &second_plan,
+            start + BLOCKAGE_DEBOUNCE + REPLAN_COOLDOWN,
+        ));
+    }
 
     #[test]
     fn test_robot_2_follower() {

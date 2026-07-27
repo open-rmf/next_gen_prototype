@@ -30,8 +30,8 @@ from launch.actions import (
     OpaqueFunction,
     RegisterEventHandler,
 )
-from launch.conditions import IfCondition
-from launch.event_handlers import OnShutdown
+from launch.conditions import IfCondition, UnlessCondition
+from launch.event_handlers import OnProcessExit, OnShutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, TextSubstitution
 from launch_ros.actions import Node
@@ -64,6 +64,7 @@ def generate_launch_description():
     use_robot_state_pub = LaunchConfiguration('use_robot_state_pub')
     use_rviz = LaunchConfiguration('use_rviz')
     use_navigation = LaunchConfiguration('use_navigation')
+    staged_startup = LaunchConfiguration('staged_startup')
     log_settings = LaunchConfiguration('log_settings', default='true')
 
     # Declare the launch arguments
@@ -115,6 +116,12 @@ def generate_launch_description():
         description='Whether to enable the Nav2 planning and control stack',
     )
 
+    declare_staged_startup_cmd = DeclareLaunchArgument(
+        'staged_startup',
+        default_value='False',
+        description='Start each robot stack after its transforms are ready.',
+    )
+
     # Start Gazebo with plugin providing the robot spawning service
     world_sdf = tempfile.mktemp(prefix='nav2_', suffix='.sdf')
     world_sdf_xacro = ExecuteProcess(
@@ -133,11 +140,14 @@ def generate_launch_description():
 
     # Define commands for launching the navigation instances
     bringup_cmd_group = []
+    staged_groups = []
+    staged_init_nodes = []
     for robot_index, robot_name in enumerate(robots_list):
         init_pose = robots_list[robot_name]
         namespace = robot_name + '/inner'
-        group = GroupAction(
-            [
+
+        def make_group(robot_autostart, condition, ready_node=None):
+            actions = [
                 LogInfo(
                     msg=[
                         'Launching namespace=',
@@ -168,7 +178,7 @@ def generate_launch_description():
                         'map': map_yaml_file,
                         'use_sim_time': 'True',
                         'params_file': params_file,
-                        'autostart': autostart,
+                        'autostart': robot_autostart,
                         'use_rviz': 'False',
                         'use_simulator': 'False',
                         'headless': 'False',
@@ -191,9 +201,29 @@ def generate_launch_description():
                     }.items(),
                 ),
             ]
-        )
+            if ready_node is not None:
+                actions.append(ready_node)
+            return GroupAction(actions, condition=condition)
 
-        bringup_cmd_group.append(group)
+        bringup_cmd_group.append(
+            make_group(autostart, UnlessCondition(staged_startup))
+        )
+        staged_init = Node(
+            package='demo_world',
+            executable='staged_nav2_init',
+            arguments=[
+                str(init_pose['x']),
+                str(init_pose['y']),
+                str(init_pose['yaw']),
+            ],
+            namespace=namespace,
+            output='screen',
+            remappings=[('/tf', 'tf'), ('/tf_static', 'tf_static')],
+        )
+        staged_init_nodes.append(staged_init)
+        staged_groups.append(
+            make_group('False', IfCondition(staged_startup), staged_init)
+        )
 
     set_env_vars_resources = AppendEnvironmentVariable(
         'GZ_SIM_RESOURCE_PATH', os.path.join(sim_dir, 'models'))
@@ -215,12 +245,14 @@ def generate_launch_description():
     ld.add_action(declare_rviz_config_file_cmd)
     ld.add_action(declare_use_robot_state_pub_cmd)
     ld.add_action(declare_use_navigation_cmd)
+    ld.add_action(declare_staged_startup_cmd)
 
     # initial localization node
     for robot_name in robots_list:
         init_pose = robots_list[robot_name]
         namespace = robot_name + '/inner'
         ld.add_action(Node(
+                      condition=UnlessCondition(staged_startup),
                       package='demo_world',
                       executable='set_init',
                       arguments=[str(init_pose['x']), str(init_pose['y']), str(init_pose['yaw'])],
@@ -258,5 +290,21 @@ def generate_launch_description():
 
     for cmd in bringup_cmd_group:
         ld.add_action(cmd)
+
+    for staged_init, next_group in zip(
+        staged_init_nodes,
+        staged_groups[1:],
+    ):
+        ld.add_action(
+            RegisterEventHandler(
+                condition=IfCondition(staged_startup),
+                event_handler=OnProcessExit(
+                    target_action=staged_init,
+                    on_exit=[next_group],
+                ),
+            )
+        )
+    if staged_groups:
+        ld.add_action(staged_groups[0])
 
     return ld

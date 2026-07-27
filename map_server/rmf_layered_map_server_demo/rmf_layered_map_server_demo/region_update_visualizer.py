@@ -23,14 +23,16 @@ from rmf_layered_map_msgs.msg import MapRegionPatch, MapRegionUpdate
 from rmf_prototype_msgs.msg import Region
 from visualization_msgs.msg import Marker, MarkerArray
 
+from .replan_scenarios import ROBOT_COLORS
+
 
 SOURCE_COLORS = (
-    (0.96, 0.26, 0.21),
+    ROBOT_COLORS['robot0'][:3],
+    ROBOT_COLORS['robot1'][:3],
     (0.18, 0.80, 0.44),
-    (0.20, 0.60, 0.98),
-    (1.00, 0.65, 0.15),
     (0.61, 0.35, 0.71),
     (0.10, 0.74, 0.80),
+    (0.96, 0.26, 0.21),
 )
 CLEAR_COLOR_BLEND = 0.5
 CLEAR_MARKER_Z = 0.04
@@ -183,10 +185,15 @@ class RegionMarkerState:
         if latest_stamp is not None and stamp_nsec < latest_stamp:
             return MarkerArray()
 
-        color = self.source_colors.setdefault(
-            key,
-            SOURCE_COLORS[len(self.source_colors) % len(SOURCE_COLORS)],
-        )
+        color = self.source_colors.get(key)
+        if color is None:
+            robot_color = ROBOT_COLORS.get(update.source.robot_name)
+            color = (
+                robot_color[:3]
+                if robot_color is not None
+                else SOURCE_COLORS[len(self.source_colors) % len(SOURCE_COLORS)]
+            )
+            self.source_colors[key] = color
         marker_array = MarkerArray()
         self.markers_by_source[key] = [
             marker

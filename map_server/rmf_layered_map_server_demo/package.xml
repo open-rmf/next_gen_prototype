@@ -13,13 +13,20 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>lifecycle_msgs</exec_depend>
   <exec_depend>gz_tools_vendor</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>nav2_common</exec_depend>
   <exec_depend>nav2_msgs</exec_depend>
   <exec_depend>rmf_layered_map_msgs</exec_depend>
   <exec_depend>rmf_layered_map_server</exec_depend>
+  <exec_depend>rmf_nav2_traffic</exec_depend>
+  <exec_depend>rmf_path_server</exec_depend>
+  <exec_depend>rmf_path_visualizer</exec_depend>
+  <exec_depend>rmf_plan_executor</exec_depend>
+  <exec_depend>rmf_simple_destination_server</exec_depend>
   <exec_depend>rmf_prototype_msgs</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>

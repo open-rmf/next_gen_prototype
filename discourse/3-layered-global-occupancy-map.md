@@ -24,6 +24,7 @@ observations, can be added later.
 * The Rust map server composes a static occupancy grid and active observations
   into `/map`
 * The Nav2 demo converts scans from three robots into clear ray sectors and occupied endpoint regions, then displays the source contributions and map
+* The replanning demo fuses two robots' scans and replans when an updated map blocks an active route
 * The observation messages live in `rmf_layered_map_msgs`, leaving
   `rmf_prototype_msgs` unchanged
 
@@ -132,6 +133,12 @@ Each scan adds temporary clear and obstacle patches to a rolling observation his
 The demo launches Nav2 localization, planning, and control for the fixed goal loops, but does not launch RMF planning. Robot-local RViz windows show Nav2 state, while another RViz window displays the combined global `/map`. The combined view overlays incoming region updates as colored markers grouped by source, with the same retention behavior as the map contributions.
 
 The scan-to-region conversion uses one convex sector per sampled beam instead of expanding a Bresenham line into many point regions. Scan sampling reduces the number of sectors, publication throttling limits the snapshot rate, and the observation range limits represented returns. The TTL controls how quickly stale observations expire. Each publisher logs its input beams and clear and obstacle regions so message density, update rate, and visual fidelity can be compared. The current demo remains a 2D occupancy approximation; it does not fuse probabilistic confidence or compress adjacent sectors into larger regions.
+
+# Two-Robot Replanning Demo
+
+The replanning launch starts with a simple room by default and retains the warehouse layout as a regression scenario. It fuses both robots' scans into `/map`, spawns a blocking bar, and displays robot-colored poses, goals, observations, and Nav2 paths alongside the green RMF plans.
+
+The plan executor checks each remaining route against the composed map and publishes `CODE_PATH_BLOCKED` after a short debounce. The path server replans on a conservatively downsampled `1.0 m` grid, while the Nav2 bridge ignores superseded aborts and resends unchanged targets when a new plan requires them.
 
 # Example Flow
 
