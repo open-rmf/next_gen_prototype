@@ -9,8 +9,11 @@ Default topics:
 - `/map/static`: static `nav_msgs/OccupancyGrid`
 - `/map/region_updates`: `rmf_layered_map_msgs/MapRegionUpdate`
 - `/map`: composed `nav_msgs/OccupancyGrid`
+- `/map/source_contributions`: active cells grouped by source
 
 Dynamic observations expire according to their TTL, so transient obstacles do not remain in the global planning map forever. The server transforms and rasterizes each region on arrival, then stores cell contributions by source, map, update type, and cell. Repeated observations refresh matching cells instead of stacking region snapshots. Older evidence is retained only when it outlives a newer contribution.
+
+`/map/source_contributions` publishes the active rasterized cells for each source whenever the composed map changes.
 
 `MapRegionUpdate` messages contain a list of `MapRegionPatch` entries. A sensor snapshot that clears freespace and marks obstacles can publish clear and obstacle patches in the same message. The server applies clear patches before obstacle patches. Clear cells remove older obstacles from the same source, while current obstacle endpoints and obstacles reported by other sources remain occupied. Observations outside the clear regions remain active until their TTL expires. If the snapshot replaces the source's entire previous observation state, set `reset_source` so the server removes all old observations from that `source_id` and `map_name` before adding the new patches. Resetting has no TTL. Clear and obstacle patches both use TTLs in seconds.
 

@@ -26,6 +26,7 @@ from rmf_layered_map_msgs.msg import (
     MapObservationSource,
     MapRegionPatch,
     MapRegionUpdate,
+    MapSourceSnapshot,
 )
 from rmf_prototype_msgs.msg import Region
 
@@ -58,6 +59,7 @@ class TestLayeredMapServer(unittest.TestCase):
     def setUp(self):
         self.node = rclpy.create_node('test_layered_map_server_node')
         self.maps = []
+        self.source_snapshots = []
 
         transient_qos = QoSProfile(
             depth=10,
@@ -87,6 +89,12 @@ class TestLayeredMapServer(unittest.TestCase):
             self.maps.append,
             qos_profile=transient_qos,
         )
+        self.source_subscription = self.node.create_subscription(
+            MapSourceSnapshot,
+            '/map/source_contributions',
+            self.source_snapshots.append,
+            qos_profile=transient_qos,
+        )
 
     def tearDown(self):
         self.node.destroy_node()
@@ -114,6 +122,16 @@ class TestLayeredMapServer(unittest.TestCase):
         latest = self.maps[-1]
         return latest.data[y * latest.info.width + x]
 
+    def last_source_cell(self, source_id, cell_index):
+        if not self.source_snapshots:
+            return None
+        for source in self.source_snapshots[-1].sources:
+            if source.source.source_id != source_id:
+                continue
+            values = dict(zip(source.cell_indices, source.occupancy_values))
+            return values.get(cell_index)
+        return None
+
     def test_region_update_is_composed_reset_and_expires(self):
         time.sleep(2.0)
 
@@ -136,9 +154,12 @@ class TestLayeredMapServer(unittest.TestCase):
             self.publish_until(
                 self.region_update_publisher,
                 update,
-                lambda: self.last_cell(2, 2) == 100,
+                lambda: (
+                    self.last_cell(2, 2) == 100
+                    and self.last_source_cell('test/obstacle', 12) == 100
+                ),
             ),
-            'layered map server did not compose the obstacle region',
+            'layered map server did not publish the obstacle contribution',
         )
 
         reset = reset_update()
@@ -147,9 +168,12 @@ class TestLayeredMapServer(unittest.TestCase):
             self.publish_until(
                 self.region_update_publisher,
                 reset,
-                lambda: self.last_cell(2, 2) == 0,
+                lambda: (
+                    self.last_cell(2, 2) == 0
+                    and self.last_source_cell('test/obstacle', 12) is None
+                ),
             ),
-            'layered map server did not reset the obstacle region',
+            'layered map server did not reset the obstacle source',
         )
 
         update = obstacle_update()
@@ -163,8 +187,14 @@ class TestLayeredMapServer(unittest.TestCase):
             'layered map server did not compose the obstacle region',
         )
         self.assertTrue(
-            self.wait_for(lambda: self.last_cell(2, 2) == 0, timeout=4.0),
-            'layered map server did not prune the expired obstacle',
+            self.wait_for(
+                lambda: (
+                    self.last_cell(2, 2) == 0
+                    and self.last_source_cell('test/obstacle', 12) is None
+                ),
+                timeout=4.0,
+            ),
+            'layered map server did not prune the expired obstacle source',
         )
 
 

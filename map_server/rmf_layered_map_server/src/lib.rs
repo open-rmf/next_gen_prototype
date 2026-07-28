@@ -16,7 +16,10 @@ use rclrs::{IntoPrimitiveOptions, Node, PrimitiveOptions};
 use ros_env::{
     geometry_msgs::msg::Pose,
     nav_msgs::msg::OccupancyGrid,
-    rmf_layered_map_msgs::msg::{MapRegionPatch, MapRegionUpdate},
+    rmf_layered_map_msgs::msg::{
+        MapObservationSource, MapRegionPatch, MapRegionUpdate, MapSourceContribution,
+        MapSourceSnapshot,
+    },
     rmf_prototype_msgs::msg::Region,
 };
 use std::{
@@ -57,6 +60,7 @@ struct ObservationSourceKey {
 pub struct LayeredMap {
     static_grid: Option<OccupancyGrid>,
     dynamic_cells: HashMap<ObservationSourceKey, HashMap<DynamicCellKey, Vec<DynamicCell>>>,
+    source_metadata: HashMap<ObservationSourceKey, MapObservationSource>,
     latest_source_stamps: HashMap<ObservationSourceKey, i128>,
     default_ttl_nsec: i128,
     next_sequence: u64,
@@ -68,6 +72,7 @@ impl LayeredMap {
         Self {
             static_grid: None,
             dynamic_cells: HashMap::new(),
+            source_metadata: HashMap::new(),
             latest_source_stamps: HashMap::new(),
             default_ttl_nsec: duration_to_nsec(default_ttl),
             next_sequence: 0,
@@ -105,6 +110,7 @@ impl LayeredMap {
         };
 
         let reset_source = update.reset_source;
+        let source_metadata = update.source.clone();
         let key = ObservationSourceKey {
             source_id: update.source.source_id.clone(),
             map_name: update.source.map_name.clone(),
@@ -202,6 +208,7 @@ impl LayeredMap {
         }
 
         if changed || reset_source {
+            self.source_metadata.insert(key.clone(), source_metadata);
             self.latest_source_stamps.insert(key, stamp_nsec);
         }
 
@@ -258,6 +265,58 @@ impl LayeredMap {
         Some(composed)
     }
 
+    pub fn source_snapshot(&self) -> Option<MapSourceSnapshot> {
+        let static_grid = self.static_grid.as_ref()?;
+        let mut source_entries = self.dynamic_cells.iter().collect::<Vec<_>>();
+        source_entries.sort_by(|(left, _), (right, _)| {
+            (&left.source_id, &left.map_name).cmp(&(&right.source_id, &right.map_name))
+        });
+
+        let mut sources = Vec::new();
+        for (source_key, source_cells) in source_entries {
+            let mut final_cells = HashMap::new();
+            for update_type in [DynamicUpdateType::Clear, DynamicUpdateType::Obstacle] {
+                for (cell_key, history) in source_cells {
+                    if cell_key.update_type != update_type {
+                        continue;
+                    }
+                    if let Some(cell) = history.last() {
+                        final_cells.insert(cell_key.cell_index, cell.occupancy_value);
+                    }
+                }
+            }
+            if final_cells.is_empty() {
+                continue;
+            }
+
+            let mut cells = final_cells.into_iter().collect::<Vec<_>>();
+            cells.sort_by_key(|(cell_index, _)| *cell_index);
+            let mut contribution = MapSourceContribution {
+                source: self
+                    .source_metadata
+                    .get(source_key)
+                    .cloned()
+                    .unwrap_or_default(),
+                ..Default::default()
+            };
+            for (cell_index, occupancy_value) in cells {
+                if let Ok(cell_index) = u64::try_from(cell_index) {
+                    contribution.cell_indices.push(cell_index);
+                    contribution.occupancy_values.push(occupancy_value);
+                }
+            }
+            if !contribution.cell_indices.is_empty() {
+                sources.push(contribution);
+            }
+        }
+
+        Some(MapSourceSnapshot {
+            header: static_grid.header.clone(),
+            info: static_grid.info.clone(),
+            sources,
+        })
+    }
+
     fn static_frame_id(&self) -> Option<&str> {
         self.static_grid
             .as_ref()
@@ -276,6 +335,7 @@ pub struct LayeredMapServerConfig {
     pub static_map_topic: String,
     pub region_updates_topic: String,
     pub composed_map_topic: String,
+    pub source_contributions_topic: String,
     pub default_ttl: Duration,
     pub publish_period: Duration,
 }
@@ -286,6 +346,7 @@ impl Default for LayeredMapServerConfig {
             static_map_topic: "/map/static".to_string(),
             region_updates_topic: "/map/region_updates".to_string(),
             composed_map_topic: "/map".to_string(),
+            source_contributions_topic: "/map/source_contributions".to_string(),
             default_ttl: Duration::from_secs(30),
             publish_period: Duration::from_millis(250),
         }
@@ -310,6 +371,7 @@ pub struct LayeredMapServer {
     map: LayeredMap,
     pending_region_updates: VecDeque<MapRegionUpdate>,
     map_publisher: rclrs::Publisher<OccupancyGrid>,
+    source_contributions_publisher: rclrs::Publisher<MapSourceSnapshot>,
     last_published_revision: Option<u64>,
 }
 
@@ -320,12 +382,16 @@ impl LayeredMapServer {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let map_publisher =
             node.create_publisher::<OccupancyGrid>(composed_map_qos(&config.composed_map_topic))?;
+        let source_contributions_publisher = node.create_publisher::<MapSourceSnapshot>(
+            source_contributions_qos(&config.source_contributions_topic),
+        )?;
 
         Ok(Self {
             node,
             map: LayeredMap::new(config.default_ttl),
             pending_region_updates: VecDeque::new(),
             map_publisher,
+            source_contributions_publisher,
             last_published_revision: None,
         })
     }
@@ -418,9 +484,23 @@ impl LayeredMapServer {
         let Some(composed) = self.map.compose() else {
             return;
         };
+        let source_snapshot = self.map.source_snapshot();
 
         match self.map_publisher.publish(&composed) {
             Ok(()) => {
+                if let Some(source_snapshot) = source_snapshot {
+                    if let Err(err) = self
+                        .source_contributions_publisher
+                        .publish(&source_snapshot)
+                    {
+                        rclrs::log_error!(
+                            self.node.logger(),
+                            "Failed to publish source contributions: {:?}",
+                            err
+                        );
+                        return;
+                    }
+                }
                 self.last_published_revision = Some(self.map.revision());
                 rclrs::log!(
                     self.node.logger(),
@@ -494,6 +574,10 @@ fn static_map_qos(topic: &str) -> PrimitiveOptions<'_> {
 }
 
 fn composed_map_qos(topic: &str) -> PrimitiveOptions<'_> {
+    topic.keep_last(MAP_QOS_DEPTH).transient_local().reliable()
+}
+
+fn source_contributions_qos(topic: &str) -> PrimitiveOptions<'_> {
     topic.keep_last(MAP_QOS_DEPTH).transient_local().reliable()
 }
 
@@ -1228,6 +1312,62 @@ mod tests {
 
         let composed = map.compose().unwrap();
         assert_eq!(composed.data[1 * 5 + 1], 100);
+    }
+
+    #[test]
+    fn source_snapshot_reports_authoritative_rasterized_contributions() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(5, 5, 0));
+
+        assert!(map.ingest_region_update(
+            update(
+                MapRegionPatch::UPDATE_OBSTACLE,
+                vec![point(1.0, 1.0), point(3.0, 3.0)]
+            ),
+            0,
+        ));
+        assert!(map.ingest_region_update(
+            update_from(
+                "robot_2/local_costmap",
+                MapRegionPatch::UPDATE_OBSTACLE,
+                vec![point(2.0, 2.0)]
+            ),
+            0,
+        ));
+
+        let mut clear = update(
+            MapRegionPatch::UPDATE_CLEAR,
+            vec![rectangle(0.0, 0.0, 2.0, 2.0)],
+        );
+        clear.source.header.stamp.sec = 2;
+        assert!(map.ingest_region_update(clear, NANOS_PER_SECOND));
+
+        let snapshot = map.source_snapshot().unwrap();
+        assert_eq!(snapshot.info.width, 5);
+        assert_eq!(snapshot.info.height, 5);
+        assert_eq!(snapshot.sources.len(), 2);
+
+        let robot_1 = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source.source_id == "robot_1/local_costmap")
+            .unwrap();
+        let robot_1_cells = robot_1
+            .cell_indices
+            .iter()
+            .copied()
+            .zip(robot_1.occupancy_values.iter().copied())
+            .collect::<HashMap<_, _>>();
+        assert_eq!(robot_1_cells.get(&6), Some(&0));
+        assert_eq!(robot_1_cells.get(&18), Some(&100));
+
+        let robot_2 = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source.source_id == "robot_2/local_costmap")
+            .unwrap();
+        assert_eq!(robot_2.cell_indices, vec![12]);
+        assert_eq!(robot_2.occupancy_values, vec![100]);
     }
 
     #[test]

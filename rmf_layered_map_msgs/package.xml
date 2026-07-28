@@ -11,10 +11,12 @@
   <buildtool_depend>rosidl_default_generators</buildtool_depend>
 
   <build_depend>geometry_msgs</build_depend>
+  <build_depend>nav_msgs</build_depend>
   <build_depend>rmf_prototype_msgs</build_depend>
   <build_depend>std_msgs</build_depend>
 
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
   <exec_depend>rmf_prototype_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>rosidl_default_runtime</exec_depend>
