@@ -3,7 +3,8 @@
 # The regions should be interpreted as temporary occupied space.
 uint8 UPDATE_OBSTACLE=1
 
-# The regions should be interpreted as temporary free space.
+# The regions should be interpreted as temporary free space. They replace older
+# same-source obstacles but do not affect other sources.
 uint8 UPDATE_CLEAR=2
 
 # UPDATE_OBSTACLE or UPDATE_CLEAR.

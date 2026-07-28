@@ -10,6 +10,6 @@ MapObservationSource source
 bool reset_source
 
 # Patches from the same observation snapshot. The map server applies clear
-# patches before obstacle patches so stale free-space evidence is cleared before
-# occupied space is marked.
+# patches before obstacle patches so older same-source obstacles are removed
+# along clear rays before current obstacle endpoints are marked.
 MapRegionPatch[] patches

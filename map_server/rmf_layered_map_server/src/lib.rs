@@ -176,6 +176,14 @@ impl LayeredMap {
             self.next_sequence = self.next_sequence.wrapping_add(1);
             let source_cells = self.dynamic_cells.entry(key.clone()).or_default();
             for cell_index in cell_indices {
+                if update_type == DynamicUpdateType::Clear {
+                    // Clear cells replace older obstacles from the same source.
+                    source_cells.remove(&DynamicCellKey {
+                        update_type: DynamicUpdateType::Obstacle,
+                        cell_index,
+                    });
+                }
+
                 let history = source_cells
                     .entry(DynamicCellKey {
                         update_type,
@@ -1166,6 +1174,60 @@ mod tests {
         assert_eq!(composed.data[1 * 5 + 1], 0);
         assert_eq!(composed.data[2 * 5 + 2], 100);
         assert_eq!(composed.data[0], -1);
+    }
+
+    #[test]
+    fn clear_regions_replace_only_observed_same_source_obstacles() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(5, 5, 0));
+
+        assert!(map.ingest_region_update(
+            update(
+                MapRegionPatch::UPDATE_OBSTACLE,
+                vec![point(1.0, 1.0), point(3.0, 3.0)]
+            ),
+            0,
+        ));
+
+        let mut clear = update(
+            MapRegionPatch::UPDATE_CLEAR,
+            vec![rectangle(0.0, 0.0, 2.0, 2.0)],
+        );
+        clear.source.header.stamp.sec = 2;
+        assert!(map.ingest_region_update(clear, NANOS_PER_SECOND));
+
+        let composed = map.compose().unwrap();
+        assert_eq!(composed.data[1 * 5 + 1], 0);
+        assert_eq!(composed.data[3 * 5 + 3], 100);
+
+        assert!(map.prune_expired(11 * NANOS_PER_SECOND));
+        let composed = map.compose().unwrap();
+        assert_eq!(composed.data[3 * 5 + 3], 0);
+    }
+
+    #[test]
+    fn clear_regions_do_not_remove_other_source_obstacles() {
+        let mut map = LayeredMap::default();
+        map.set_static_map(static_grid(5, 5, 0));
+
+        assert!(map.ingest_region_update(
+            update_from(
+                "robot_2/local_costmap",
+                MapRegionPatch::UPDATE_OBSTACLE,
+                vec![point(1.0, 1.0)]
+            ),
+            0,
+        ));
+
+        let mut clear = update(
+            MapRegionPatch::UPDATE_CLEAR,
+            vec![rectangle(0.0, 0.0, 2.0, 2.0)],
+        );
+        clear.source.header.stamp.sec = 2;
+        assert!(map.ingest_region_update(clear, NANOS_PER_SECOND));
+
+        let composed = map.compose().unwrap();
+        assert_eq!(composed.data[1 * 5 + 1], 100);
     }
 
     #[test]
