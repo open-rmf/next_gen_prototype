@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from math import atan2, cos, sin
-
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import (
@@ -34,93 +32,17 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from .scan_conversion import scan_regions
 
 
-def _yaw_from_quaternion(quaternion):
-    return atan2(
-        2.0 * (
-            quaternion.w * quaternion.z
-            + quaternion.x * quaternion.y
-        ),
-        1.0 - 2.0 * (
-            quaternion.y * quaternion.y
-            + quaternion.z * quaternion.z
-        ),
-    )
+def filter_obstacle_points(obstacle_points, self_filter_radius):
+    """Remove current scan returns that fall inside the robot body."""
+    if self_filter_radius <= 0.0:
+        return list(obstacle_points)
 
-
-class ObstacleMemory:
-    """Retain obstacle points across scan updates."""
-
-    def __init__(
-        self,
-        retention_sec=0.0,
-        resolution=0.1,
-        self_filter_radius=0.0,
-    ):
-        self.retention_sec = float(retention_sec)
-        self.resolution = float(resolution)
-        self.self_filter_radius = float(self_filter_radius)
-        self._points = {}
-
-    @property
-    def enabled(self):
-        return self.retention_sec != 0.0
-
-    def remember(self, obstacle_points, transform, now_sec):
-        filter_radius_squared = self.self_filter_radius ** 2
-        if self.self_filter_radius > 0.0:
-            obstacle_points = [
-                (x, y)
-                for x, y in obstacle_points
-                if x * x + y * y > filter_radius_squared
-            ]
-
-        if not self.enabled:
-            return list(obstacle_points)
-
-        yaw = _yaw_from_quaternion(transform.rotation)
-        cosine = cos(yaw)
-        sine = sin(yaw)
-        tx = transform.translation.x
-        ty = transform.translation.y
-
-        if self.retention_sec > 0.0:
-            oldest = now_sec - self.retention_sec
-            self._points = {
-                key: value
-                for key, value in self._points.items()
-                if value[2] > oldest
-            }
-
-        for local_x, local_y in obstacle_points:
-            global_x = tx + cosine * local_x - sine * local_y
-            global_y = ty + sine * local_x + cosine * local_y
-            key = (
-                round(global_x / self.resolution),
-                round(global_y / self.resolution),
-            )
-            self._points[key] = (global_x, global_y, now_sec)
-
-        if self.self_filter_radius > 0.0:
-            self._points = {
-                key: value
-                for key, value in self._points.items()
-                if (
-                    (value[0] - tx) ** 2
-                    + (value[1] - ty) ** 2
-                    > filter_radius_squared
-                )
-            }
-
-        # Region points are relative to the current robot pose.
-        remembered = []
-        for global_x, global_y, _ in self._points.values():
-            dx = global_x - tx
-            dy = global_y - ty
-            remembered.append((
-                cosine * dx + sine * dy,
-                -sine * dx + cosine * dy,
-            ))
-        return remembered
+    radius_squared = self_filter_radius ** 2
+    return [
+        (x, y)
+        for x, y in obstacle_points
+        if x * x + y * y > radius_squared
+    ]
 
 
 def make_scan_patches(clear_polygons, obstacle_points, ttl_sec):
@@ -164,15 +86,6 @@ class ScanRegionPublisher(Node):
         self.map_name = self.declare_parameter('map_name', 'warehouse').value
         self.scan_topic = self.declare_parameter('scan_topic', 'scan').value
         self.ttl_sec = self.declare_parameter('ttl_sec', 10.0).value
-        self.reset_source = self.declare_parameter(
-            'reset_source', False
-        ).value
-        self.obstacle_memory_sec = self.declare_parameter(
-            'obstacle_memory_sec', 0.0
-        ).value
-        self.obstacle_memory_resolution = self.declare_parameter(
-            'obstacle_memory_resolution', 0.1
-        ).value
         self.self_filter_radius = self.declare_parameter(
             'self_filter_radius', 0.0
         ).value
@@ -192,17 +105,10 @@ class ScanRegionPublisher(Node):
             raise ValueError('publish_period_sec must not be negative')
         if self.beam_stride < 1:
             raise ValueError('beam_stride must be at least one')
-        if self.obstacle_memory_resolution <= 0.0:
-            raise ValueError('obstacle_memory_resolution must be positive')
         if self.self_filter_radius < 0.0:
             raise ValueError('self_filter_radius must not be negative')
 
         self.source_id = f'{self.robot_name}/scan'
-        self.obstacle_memory = ObstacleMemory(
-            self.obstacle_memory_sec,
-            self.obstacle_memory_resolution,
-            self.self_filter_radius,
-        )
         self.last_publish_stamp_sec = None
         self.pending_scan = None
         self.publish_count = 0
@@ -231,7 +137,6 @@ class ScanRegionPublisher(Node):
             f'Converting {self.scan_topic} into region updates for '
             f'{self.robot_name} (stride={self.beam_stride}, '
             f'period={self.publish_period_sec:.2f}s, '
-            f'obstacle_memory={self.obstacle_memory_sec:.1f}s, '
             f'self_filter_radius={self.self_filter_radius:.2f}m)'
         )
 
@@ -283,10 +188,9 @@ class ScanRegionPublisher(Node):
             self.max_observation_range,
             self.beam_stride,
         )
-        obstacle_points = self.obstacle_memory.remember(
+        obstacle_points = filter_obstacle_points(
             obstacle_points,
-            transform.transform,
-            self.get_clock().now().nanoseconds / 1e9,
+            self.self_filter_radius,
         )
         update = self.make_update(transform, clear_polygons, obstacle_points)
         self.region_update_publisher.publish(update)
@@ -302,7 +206,6 @@ class ScanRegionPublisher(Node):
 
     def make_update(self, transform, clear_polygons, obstacle_points):
         update = MapRegionUpdate()
-        update.reset_source = self.reset_source
         update.source = MapObservationSource()
         # The Rust map server currently uses a system-time clock.
         # Keep TTL and update ordering in that clock while using the scan stamp for TF.

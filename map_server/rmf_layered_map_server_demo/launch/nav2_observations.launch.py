@@ -65,7 +65,6 @@ def generate_launch_description():
     beam_stride = LaunchConfiguration('beam_stride')
     publish_period_sec = LaunchConfiguration('publish_period_sec')
     ttl_sec = LaunchConfiguration('ttl_sec')
-    reset_source = LaunchConfiguration('reset_source')
     max_observation_range = LaunchConfiguration('max_observation_range')
 
     declarations = [
@@ -115,11 +114,6 @@ def generate_launch_description():
             'ttl_sec',
             default_value='10.0',
             description='Lifetime of each robot observation snapshot.',
-        ),
-        DeclareLaunchArgument(
-            'reset_source',
-            default_value='False',
-            description='Whether each snapshot replaces the source history.',
         ),
         DeclareLaunchArgument(
             'max_observation_range',
@@ -178,9 +172,6 @@ def generate_launch_description():
                         publish_period_sec, value_type=float
                     ),
                     'ttl_sec': ParameterValue(ttl_sec, value_type=float),
-                    'reset_source': ParameterValue(
-                        reset_source, value_type=bool
-                    ),
                     'max_observation_range': ParameterValue(
                         max_observation_range, value_type=float
                     ),

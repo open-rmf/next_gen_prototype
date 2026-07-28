@@ -68,7 +68,7 @@ def generate_replan_launch_description(scenario_name):
     use_global_rviz = LaunchConfiguration('use_global_rviz')
     spawn_delay_sec = LaunchConfiguration('spawn_delay_sec')
     scenario_timeout_sec = LaunchConfiguration('scenario_timeout_sec')
-    obstacle_memory_sec = LaunchConfiguration('obstacle_memory_sec')
+    ttl_sec = LaunchConfiguration('ttl_sec')
     self_filter_radius = LaunchConfiguration('self_filter_radius')
     demo_params_file = RewrittenYaml(
         source_file=params_file,
@@ -133,9 +133,9 @@ def generate_replan_launch_description(scenario_name):
             description='Timeout for observing a replan.',
         ),
         DeclareLaunchArgument(
-            'obstacle_memory_sec',
-            default_value='-1.0',
-            description='Obstacle retention in seconds; negative keeps points.',
+            'ttl_sec',
+            default_value='60.0',
+            description='Lifetime of observations that are not re-observed.',
         ),
         DeclareLaunchArgument(
             'self_filter_radius',
@@ -186,12 +186,7 @@ def generate_replan_launch_description(scenario_name):
                 'scan_topic': f'/{robot.name}/inner/scan',
                 'beam_stride': 1,
                 'publish_period_sec': 0.5,
-                'ttl_sec': 10.0,
-                'reset_source': True,
-                'obstacle_memory_sec': ParameterValue(
-                    obstacle_memory_sec, value_type=float
-                ),
-                'obstacle_memory_resolution': 0.1,
+                'ttl_sec': ParameterValue(ttl_sec, value_type=float),
                 'self_filter_radius': ParameterValue(
                     self_filter_radius, value_type=float
                 ),

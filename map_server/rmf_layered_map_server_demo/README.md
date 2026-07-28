@@ -27,7 +27,6 @@ By default, the demo opens three robot-local RViz windows and one combined-map v
 * Set `use_nav2_rviz:=False` or `use_global_rviz:=False` to disable either RViz view.
 * Set `move_robots:=False` to disable robot movement.
 * Set `spawn_clutter:=False` to use the unmodified warehouse world.
-* Set `reset_source:=True` to show only the latest scan from each robot.
 * Use `map` and `params_file` to override the warehouse map and shared Nav2 parameters.
 * `beam_stride:=1` and `publish_period_sec:=0.5` control scan sampling.
 * `max_observation_range:=2.5` and `ttl_sec:=10.0` control range and retention.
@@ -72,5 +71,5 @@ Useful launch arguments:
 * `use_global_rviz:=False` runs without the combined RViz view.
 * `spawn_delay_sec:=1.0` controls the delay after initial plans are received.
 * `scenario_timeout_sec:=180.0` controls how long the demo waits for replanning.
-* `obstacle_memory_sec:=-1.0` retains obstacle endpoints for the scanner's lifetime. Use `0.0` to disable memory or a positive value for finite retention.
+* `ttl_sec:=60.0` controls how long observations outside the current scan remain in the layered map. New clear rays remove stale same-source obstacles before the TTL expires.
 * `self_filter_radius:=0.22` excludes scan returns inside the robot body.
