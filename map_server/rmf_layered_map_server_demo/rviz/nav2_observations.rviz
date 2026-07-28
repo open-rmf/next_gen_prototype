@@ -6,8 +6,8 @@ Panels:
       Expanded:
         - /Global Options1
         - /Combined Global Map1
-        - /Region Contributions1
         - /Retained Robot Contributions1
+        - /Latest Robot Scan Regions1
         - /Scenario Robots, Goals, and Obstacle1
         - /Robot 0 Nav2 Path1
         - /Robot 1 Nav2 Path1
@@ -63,7 +63,7 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: Region Contributions
+      Name: Latest Robot Scan Regions
       Namespaces:
         {}
       Topic:
@@ -71,7 +71,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /map/region_markers
+        Value: /map/scan_region_markers
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true

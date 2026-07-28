@@ -43,7 +43,7 @@ ros2 launch rmf_layered_map_server_demo replan_obstacle.launch.py
 
 Two robots start with non-overlapping scan regions and separate goals. Once their initial plans are active, the demo spawns a red bar across both scan regions. The bar meets the right wall to form a dead end and leaves a detour around its left end.
 
-The global RViz view shows robot-colored poses, goals, region contributions, and Nav2 paths alongside the green RMF plans.
+The global RViz view shows the composed map, robot poses and goals, and Nav2 paths alongside the green RMF plans. RViz draws active per-robot obstacle cells from `/map/source_contributions` and separately shows each robot's latest free-space scan sectors.
 
 Use the warehouse scenario to reproduce the original two-aisle case:
 

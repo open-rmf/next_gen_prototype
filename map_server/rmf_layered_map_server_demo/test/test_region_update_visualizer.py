@@ -23,7 +23,7 @@ from rmf_prototype_msgs.msg import Region
 from visualization_msgs.msg import Marker
 
 
-def _update(stamp_sec=1, reset_source=True):
+def _update(stamp_sec=1):
     update = MapRegionUpdate()
     update.source.header.stamp.sec = stamp_sec
     update.source.header.frame_id = 'map'
@@ -34,7 +34,6 @@ def _update(stamp_sec=1, reset_source=True):
     update.source.robot_pose.position.y = 3.0
     update.source.robot_pose.orientation.w = 1.0
     update.source.default_ttl_sec = 4.0
-    update.reset_source = reset_source
     return update
 
 
@@ -115,7 +114,7 @@ def test_visualizes_clear_regions_with_a_lighter_source_color():
     assert clear_marker.points[0].z < obstacle_marker.points[0].z
 
 
-def test_reset_deletes_the_previous_source_markers_before_replacing_them():
+def test_new_update_replaces_previous_markers():
     state = RegionMarkerState()
     first = _update(stamp_sec=1)
     first_patch = MapRegionPatch()
@@ -133,9 +132,26 @@ def test_reset_deletes_the_previous_source_markers_before_replacing_them():
     markers = state.apply_update(replacement).markers
 
     assert [marker.action for marker in markers] == [Marker.DELETE, Marker.ADD]
-    assert markers[0].ns == markers[1].ns == 'robot0/scan'
     assert markers[0].id == markers[1].id == 0
     assert [(point.x, point.y) for point in markers[1].points] == [(3.0, 4.0)]
+
+
+def test_scan_region_mode_can_hide_raw_obstacles():
+    state = RegionMarkerState(show_obstacles=False)
+    update = _update(stamp_sec=1)
+    clear_patch = MapRegionPatch()
+    clear_patch.update_type = MapRegionPatch.UPDATE_CLEAR
+    clear_patch.regions = [
+        _region(Region.HINT_CONVEX_POLYGON, [0.0, 0.0, 1.0, -0.1, 1.0, 0.1]),
+    ]
+    obstacle_patch = MapRegionPatch()
+    obstacle_patch.update_type = MapRegionPatch.UPDATE_OBSTACLE
+    obstacle_patch.regions = [_region(Region.HINT_POINT, [1.0, 0.0])]
+    update.patches = [clear_patch, obstacle_patch]
+
+    markers = state.apply_update(update).markers
+
+    assert [marker.type for marker in markers] == [Marker.LINE_LIST]
 
 
 def test_older_update_does_not_replace_newer_visualization():
@@ -145,28 +161,3 @@ def test_older_update_does_not_replace_newer_visualization():
     markers = state.apply_update(_update(stamp_sec=1)).markers
 
     assert markers == []
-
-
-def test_non_reset_updates_retain_only_unexpired_marker_bookkeeping():
-    state = RegionMarkerState()
-    first = _update(stamp_sec=1, reset_source=False)
-    first_patch = MapRegionPatch()
-    first_patch.update_type = MapRegionPatch.UPDATE_OBSTACLE
-    first_patch.regions = [_region(Region.HINT_POINT, [1.0, 2.0])]
-    first.patches = [first_patch]
-    state.apply_update(first)
-
-    second = _update(stamp_sec=2, reset_source=False)
-    second_patch = MapRegionPatch()
-    second_patch.update_type = MapRegionPatch.UPDATE_OBSTACLE
-    second_patch.regions = [_region(Region.HINT_POINT, [3.0, 4.0])]
-    second.patches = [second_patch]
-    markers = state.apply_update(second).markers
-
-    assert [marker.action for marker in markers] == [Marker.ADD]
-    assert markers[0].id == 1
-    assert len(state.markers_by_source[('robot0/scan', 'warehouse')]) == 2
-
-    state.apply_update(_update(stamp_sec=6, reset_source=False))
-
-    assert state.markers_by_source[('robot0/scan', 'warehouse')] == []

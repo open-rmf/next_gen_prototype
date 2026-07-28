@@ -172,6 +172,10 @@ def generate_replan_launch_description(scenario_name):
         package='rmf_layered_map_server_demo',
         executable='region_update_visualizer',
         output='screen',
+        parameters=[{
+            'output_topic': '/map/scan_region_markers',
+            'show_obstacles': False,
+        }],
     )
     source_contribution_visualizer = Node(
         condition=IfCondition(use_global_rviz),

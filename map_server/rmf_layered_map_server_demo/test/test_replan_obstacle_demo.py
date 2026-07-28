@@ -90,7 +90,6 @@ def _region_update(robot_name):
     update.source.robot_name = robot_name
     update.source.map_name = 'single_room'
     update.source.robot_pose.orientation.w = 1.0
-    update.reset_source = True
     patch = MapRegionPatch()
     patch.update_type = MapRegionPatch.UPDATE_OBSTACLE
     region = Region()

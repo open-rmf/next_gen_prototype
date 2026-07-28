@@ -162,12 +162,16 @@ def _markers_from_patch(update, patch, first_id, color, default_ttl_sec):
 
 
 class RegionMarkerState:
-    """Convert region updates into persistent per-source RViz marker actions."""
+    """Convert region updates into per-source RViz marker actions."""
 
-    def __init__(self, default_ttl_sec=30.0):
+    def __init__(
+        self,
+        default_ttl_sec=30.0,
+        show_obstacles=True,
+    ):
         self.default_ttl_sec = default_ttl_sec
+        self.show_obstacles = show_obstacles
         self.markers_by_source = {}
-        self.next_ids = {}
         self.latest_stamps = {}
         self.source_colors = {}
 
@@ -195,29 +199,27 @@ class RegionMarkerState:
             )
             self.source_colors[key] = color
         marker_array = MarkerArray()
-        self.markers_by_source[key] = [
-            marker
-            for marker in self.markers_by_source.get(key, ())
-            if marker[3] is None or marker[3] > stamp_nsec
-        ]
 
-        if update.reset_source:
-            for namespace, marker_id, frame_id, _ in self.markers_by_source[key]:
-                marker = Marker()
-                marker.header.frame_id = frame_id
-                marker.ns = namespace
-                marker.id = marker_id
-                marker.action = Marker.DELETE
-                marker_array.markers.append(marker)
-            self.markers_by_source[key] = []
-            self.next_ids[key] = 0
+        # Marker TTL cannot hide a superseded scan immediately.
+        for namespace, marker_id, frame_id in self.markers_by_source.get(key, ()):
+            marker = Marker()
+            marker.header.frame_id = frame_id
+            marker.ns = namespace
+            marker.id = marker_id
+            marker.action = Marker.DELETE
+            marker_array.markers.append(marker)
 
-        next_id = self.next_ids.get(key, 0)
+        next_id = 0
         new_markers = []
         for patch in update.patches:
             if patch.update_type not in (
                 MapRegionPatch.UPDATE_CLEAR,
                 MapRegionPatch.UPDATE_OBSTACLE,
+            ):
+                continue
+            if (
+                patch.update_type == MapRegionPatch.UPDATE_OBSTACLE
+                and not self.show_obstacles
             ):
                 continue
             patch_markers = _markers_from_patch(
@@ -231,28 +233,21 @@ class RegionMarkerState:
             next_id += len(patch_markers)
 
         marker_array.markers.extend(new_markers)
-        self.next_ids[key] = next_id
-        self.markers_by_source[key].extend(
+        self.markers_by_source[key] = [
             (
                 marker.ns,
                 marker.id,
                 marker.header.frame_id,
-                stamp_nsec + marker.lifetime.sec * 1_000_000_000
-                + marker.lifetime.nanosec
-                if marker.lifetime.sec > 0 or marker.lifetime.nanosec > 0
-                else None,
             )
             for marker in new_markers
-        )
-
-        if new_markers or update.reset_source:
-            self.latest_stamps[key] = stamp_nsec
+        ]
+        self.latest_stamps[key] = stamp_nsec
 
         return marker_array
 
 
 class RegionUpdateVisualizer(Node):
-    """Visualize active map-region contributions as colored RViz markers."""
+    """Visualize map-region updates as colored RViz markers."""
 
     def __init__(self):
         super().__init__('region_update_visualizer')
@@ -265,12 +260,18 @@ class RegionUpdateVisualizer(Node):
         default_ttl_sec = self.declare_parameter(
             'default_ttl_sec', 30.0
         ).value
+        show_obstacles = self.declare_parameter(
+            'show_obstacles', True
+        ).value
 
         reliable_qos = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.RELIABLE,
         )
-        self.state = RegionMarkerState(default_ttl_sec)
+        self.state = RegionMarkerState(
+            default_ttl_sec,
+            show_obstacles,
+        )
         self.publisher = self.create_publisher(
             MarkerArray,
             output_topic,
