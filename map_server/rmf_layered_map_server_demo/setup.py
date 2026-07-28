@@ -52,6 +52,8 @@ setup(
             'rmf_layered_map_server_demo.region_update_visualizer:main',
             'scan_region_publisher = '
             'rmf_layered_map_server_demo.scan_region_publisher:main',
+            'source_contribution_visualizer = '
+            'rmf_layered_map_server_demo.source_contribution_visualizer:main',
         ],
     },
 )

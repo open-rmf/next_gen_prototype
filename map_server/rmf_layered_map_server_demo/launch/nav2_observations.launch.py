@@ -152,6 +152,12 @@ def generate_launch_description():
         executable='region_update_visualizer',
         output='screen',
     )
+    source_contribution_visualizer = Node(
+        condition=IfCondition(use_global_rviz),
+        package='rmf_layered_map_server_demo',
+        executable='source_contribution_visualizer',
+        output='screen',
+    )
 
     observation_nodes = []
     goal_nodes = []
@@ -234,6 +240,7 @@ def generate_launch_description():
         nav2_simulation,
         layered_map_server,
         region_visualizer,
+        source_contribution_visualizer,
         *observation_nodes,
         *goal_nodes,
         clutter_spawner,

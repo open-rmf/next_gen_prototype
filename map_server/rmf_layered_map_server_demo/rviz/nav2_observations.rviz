@@ -7,6 +7,7 @@ Panels:
         - /Global Options1
         - /Combined Global Map1
         - /Region Contributions1
+        - /Retained Robot Contributions1
         - /Scenario Robots, Goals, and Obstacle1
         - /Robot 0 Nav2 Path1
         - /Robot 1 Nav2 Path1
@@ -71,6 +72,18 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /map/region_markers
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Retained Robot Contributions
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map/source_contribution_markers
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
