@@ -1,0 +1,7 @@
+{
+    "hooks": [
+        "share/rmfcli/environment/rmf-argcomplete.bash",
+        "share/rmfcli/environment/rmf-argcomplete.fish",
+        "share/rmfcli/environment/rmf-argcomplete.zsh"
+    ]
+}
