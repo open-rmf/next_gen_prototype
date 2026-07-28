@@ -274,22 +274,18 @@ impl LayeredMap {
 
         let mut sources = Vec::new();
         for (source_key, source_cells) in source_entries {
-            let mut final_cells = HashMap::new();
-            for update_type in [DynamicUpdateType::Clear, DynamicUpdateType::Obstacle] {
-                for (cell_key, history) in source_cells {
-                    if cell_key.update_type != update_type {
-                        continue;
+            // Clear cells can be omitted because each snapshot replaces the previous one.
+            let mut cells = source_cells
+                .iter()
+                .filter_map(|(cell_key, history)| {
+                    if cell_key.update_type != DynamicUpdateType::Obstacle {
+                        return None;
                     }
-                    if let Some(cell) = history.last() {
-                        final_cells.insert(cell_key.cell_index, cell.occupancy_value);
-                    }
-                }
-            }
-            if final_cells.is_empty() {
-                continue;
-            }
-
-            let mut cells = final_cells.into_iter().collect::<Vec<_>>();
+                    history
+                        .last()
+                        .map(|cell| (cell_key.cell_index, cell.occupancy_value))
+                })
+                .collect::<Vec<_>>();
             cells.sort_by_key(|(cell_index, _)| *cell_index);
             let mut contribution = MapSourceContribution {
                 source: self
@@ -1315,7 +1311,7 @@ mod tests {
     }
 
     #[test]
-    fn source_snapshot_reports_authoritative_rasterized_contributions() {
+    fn source_snapshot_reports_active_obstacle_contributions() {
         let mut map = LayeredMap::default();
         map.set_static_map(static_grid(5, 5, 0));
 
@@ -1352,14 +1348,8 @@ mod tests {
             .iter()
             .find(|source| source.source.source_id == "robot_1/local_costmap")
             .unwrap();
-        let robot_1_cells = robot_1
-            .cell_indices
-            .iter()
-            .copied()
-            .zip(robot_1.occupancy_values.iter().copied())
-            .collect::<HashMap<_, _>>();
-        assert_eq!(robot_1_cells.get(&6), Some(&0));
-        assert_eq!(robot_1_cells.get(&18), Some(&100));
+        assert_eq!(robot_1.cell_indices, vec![18]);
+        assert_eq!(robot_1.occupancy_values, vec![100]);
 
         let robot_2 = snapshot
             .sources

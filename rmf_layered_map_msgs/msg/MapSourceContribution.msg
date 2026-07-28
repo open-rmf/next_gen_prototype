@@ -1,6 +1,6 @@
 # MapSourceContribution.msg
 
-# Source that owns these rasterized cell contributions.
+# Source that owns these rasterized obstacle cells.
 MapObservationSource source
 
 # Row-major indices into MapSourceSnapshot.info. Each index has a matching
