@@ -31,7 +31,7 @@ from launch.actions import (
     RegisterEventHandler,
 )
 from launch.conditions import IfCondition, UnlessCondition
-from launch.event_handlers import OnProcessExit, OnShutdown
+from launch.event_handlers import OnShutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, TextSubstitution
 from launch_ros.actions import Node
@@ -141,7 +141,6 @@ def generate_launch_description():
     # Define commands for launching the navigation instances
     bringup_cmd_group = []
     staged_groups = []
-    staged_init_nodes = []
     for robot_index, robot_name in enumerate(robots_list):
         init_pose = robots_list[robot_name]
         namespace = robot_name + '/inner'
@@ -220,7 +219,6 @@ def generate_launch_description():
             output='screen',
             remappings=[('/tf', 'tf'), ('/tf_static', 'tf_static')],
         )
-        staged_init_nodes.append(staged_init)
         staged_groups.append(
             make_group('False', IfCondition(staged_startup), staged_init)
         )
@@ -291,20 +289,7 @@ def generate_launch_description():
     for cmd in bringup_cmd_group:
         ld.add_action(cmd)
 
-    for staged_init, next_group in zip(
-        staged_init_nodes,
-        staged_groups[1:],
-    ):
-        ld.add_action(
-            RegisterEventHandler(
-                condition=IfCondition(staged_startup),
-                event_handler=OnProcessExit(
-                    target_action=staged_init,
-                    on_exit=[next_group],
-                ),
-            )
-        )
-    if staged_groups:
-        ld.add_action(staged_groups[0])
+    for group in staged_groups:
+        ld.add_action(group)
 
     return ld
