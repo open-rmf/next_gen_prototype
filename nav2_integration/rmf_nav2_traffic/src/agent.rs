@@ -114,10 +114,21 @@ fn create_amcl_pose_subscriber(
     ));
 }
 
-fn update_amcl_pose(mut agents: Query<(&mut AmclPose, &AmclPoseSubscription, &OdomPublisher)>) {
-    for (mut amcl_pose, amcl_pose_sub, odom_pub) in agents.iter_mut() {
+fn update_amcl_pose(
+    mut agents: Query<(
+        &mut Nav2Agent,
+        &mut AmclPose,
+        &AmclPoseSubscription,
+        &OdomPublisher,
+    )>,
+) {
+    for (mut agent, mut amcl_pose, amcl_pose_sub, odom_pub) in agents.iter_mut() {
         if let Some(amcl_pose_msg) = amcl_pose_sub.subscriber.data_callback() {
             amcl_pose.0 = amcl_pose_msg.clone();
+            agent.localized = true;
+        }
+        if !agent.localized {
+            continue;
         }
 
         let mut odom = Odometry::default();
