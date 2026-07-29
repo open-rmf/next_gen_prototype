@@ -71,5 +71,5 @@ Useful launch arguments:
 * `use_global_rviz:=False` runs without the combined RViz view.
 * `spawn_delay_sec:=1.0` controls the delay after initial plans are received.
 * `scenario_timeout_sec:=180.0` controls how long the demo waits for replanning.
-* `ttl_sec:=60.0` controls how long observations outside the current scan remain in the layered map. New clear rays remove stale same-source obstacles before the TTL expires.
+* `ttl_sec` controls how long observations outside the current scan remain in the layered map. It defaults to 60 seconds for the simple scenario and 210 seconds for the warehouse scenario. New clear rays remove stale same-source obstacles before the TTL expires.
 * `self_filter_radius:=0.22` excludes scan returns inside the robot body.

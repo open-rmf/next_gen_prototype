@@ -134,7 +134,7 @@ def generate_replan_launch_description(scenario_name):
         ),
         DeclareLaunchArgument(
             'ttl_sec',
-            default_value='60.0',
+            default_value=str(scenario_config.ttl_sec),
             description='Lifetime of observations that are not re-observed.',
         ),
         DeclareLaunchArgument(

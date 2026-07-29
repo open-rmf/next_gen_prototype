@@ -40,6 +40,7 @@ class ReplanScenario:
     world_name: str
     robots: tuple[RobotLayout, ...]
     scan_radius: float
+    ttl_sec: float
     bar_name: str
     bar_center: tuple[float, float]
     bar_size: tuple[float, float, float]
@@ -54,6 +55,7 @@ SIMPLE_SCENARIO = ReplanScenario(
         RobotLayout('robot1', (5.5, -4.5, pi / 2.0), (6.0, 4.0)),
     ),
     scan_radius=4.0,
+    ttl_sec=60.0,
     bar_name='simple_replan_bar',
     bar_center=(1.75, -1.5),
     bar_size=(15.5, 0.5, 1.0),
@@ -68,6 +70,7 @@ WAREHOUSE_SCENARIO = ReplanScenario(
         RobotLayout('robot1', (3.5, -21.0, pi / 2.0), (3.5, -15.0)),
     ),
     scan_radius=3.5,
+    ttl_sec=210.0,
     bar_name='warehouse_replan_bar',
     bar_center=(-2.5, -18.5),
     bar_size=(15.0, 0.5, 1.0),

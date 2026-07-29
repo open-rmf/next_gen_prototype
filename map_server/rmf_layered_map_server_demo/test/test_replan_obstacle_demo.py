@@ -192,3 +192,4 @@ def test_warehouse_scenario_layout():
     assert WAREHOUSE_SCENARIO.robots[1].pose[:2] == (3.5, -21.0)
     assert WAREHOUSE_SCENARIO.bar_center == (-2.5, -18.5)
     assert WAREHOUSE_SCENARIO.bar_size == (15.0, 0.5, 1.0)
+    assert WAREHOUSE_SCENARIO.ttl_sec == 210.0
