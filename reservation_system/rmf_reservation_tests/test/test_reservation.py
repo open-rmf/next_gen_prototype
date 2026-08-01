@@ -105,6 +105,7 @@ class TestReservation(unittest.TestCase):
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
         )
         discovery_pub = self.node.create_publisher(
             ParticipantList,

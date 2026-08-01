@@ -87,6 +87,7 @@ class TestSafeSets(unittest.TestCase):
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
         )
 
         # Per-robot message buffers and publishers.

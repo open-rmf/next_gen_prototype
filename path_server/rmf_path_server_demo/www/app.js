@@ -29,6 +29,7 @@ let pendingGoalReset = false;
 let eventSource = null;
 let mouseX = 0;
 let mouseY = 0;
+let hoveredRobotName = null;
 let mapData = null;
 let mapFitted = false;
 
@@ -344,7 +345,7 @@ function updateRobotListUI() {
 }
 
 // Delegate selection because robot rows are redrawn as state changes.
-document.getElementById('robot-list').addEventListener('pointerdown', event => {
+document.getElementById('robot-list')?.addEventListener('pointerdown', event => {
   const item = event.target.closest('.robot-item');
   if (!item) return;
   event.preventDefault();
@@ -382,6 +383,30 @@ canvas.addEventListener('mousemove', (e) => {
 
   const gridPos = toGrid(mouseX, mouseY);
   document.getElementById('coords-display').textContent = `X: ${gridPos.x} | Y: ${gridPos.y}`;
+
+  // Check hover over robots
+  hoveredRobotName = null;
+  for (const r of robots) {
+    const pix = toPixel(r.current_x, r.current_y);
+    const radius = Math.max(16, (r.radius || 0.49) * scale);
+    const dist = Math.hypot(mouseX - pix.x, mouseY - pix.y);
+    if (dist <= radius) {
+      hoveredRobotName = r.name;
+      break;
+    }
+  }
+
+  if (hoveredRobotName) {
+    canvas.style.cursor = 'pointer';
+  } else if (interactionMode === 'add-robot' || interactionMode === 'set-goal') {
+    canvas.style.cursor = 'crosshair';
+  } else {
+    canvas.style.cursor = 'default';
+  }
+});
+
+canvas.addEventListener('mouseleave', () => {
+  hoveredRobotName = null;
 });
 
 canvas.addEventListener('click', (e) => {
@@ -485,8 +510,9 @@ canvas.addEventListener('click', (e) => {
     // Select robot if clicked near one
     const clickedRobot = robots.find(r => {
       const pix = toPixel(r.current_x, r.current_y);
+      const radius = Math.max(16, (r.radius || 0.49) * scale);
       const dist = Math.hypot(mx - pix.x, my - pix.y);
-      return dist < 15; // within 15 pixels radius
+      return dist <= radius;
     });
 
     if (clickedRobot) {
@@ -496,7 +522,7 @@ canvas.addEventListener('click', (e) => {
 });
 
 // Setup Button Action Listeners
-document.getElementById('btn-add-robot').addEventListener('click', () => {
+document.getElementById('btn-add-robot')?.addEventListener('click', () => {
   if (systemMode === 'live') return;
   
   interactionMode = 'add-robot';
@@ -506,7 +532,7 @@ document.getElementById('btn-add-robot').addEventListener('click', () => {
   updateRobotListUI();
 });
 
-document.getElementById('btn-send').addEventListener('click', () => {
+document.getElementById('btn-send')?.addEventListener('click', () => {
   if (systemMode === 'live' || robots.length === 0) return;
 
   systemMode = 'live';
@@ -529,35 +555,6 @@ document.getElementById('btn-send').addEventListener('click', () => {
     .catch(err => console.error('Failed to start scenario:', err));
 });
 
-document.getElementById('btn-reset').addEventListener('click', () => {
-  // 1. Trigger server reset over backend REST API
-  fetch('/reset')
-    .then(res => res.json())
-    .then(data => console.log('Reset response:', data))
-    .catch(err => console.error('Reset request failed:', err));
-
-  // 2. Close EventSource and reopen to clean SSE state
-  if (eventSource) {
-    eventSource.close();
-  }
-
-  // 3. Clear UI States
-  robots = [];
-  selectedRobotName = null;
-  interactionMode = 'normal';
-  systemMode = 'setup';
-
-  document.getElementById('mode-badge').textContent = 'Setup Mode';
-  document.getElementById('mode-badge').classList.remove('live');
-  document.getElementById('btn-add-robot').disabled = false;
-  document.getElementById('btn-add-robot').classList.remove('active');
-  showInstruction(null);
-  
-  // Re-init SSE stream connection
-  initSSE();
-  fetchConfig();
-  fetchReservationConfig();
-});
 
 // Helper to draw dependency arrow with optional dash animation
 function drawDependencyArrow(ctx, fromX, fromY, toX, toY, isBlocking) {
@@ -1073,6 +1070,55 @@ function drawGrid() {
     ctx.textBaseline = 'bottom';
     ctx.fillText(`R_${r.idNum}`, pix.x, pix.y - 12);
   });
+
+  // 7. Draw hover tooltip when hovering over a robot
+  if (hoveredRobotName) {
+    const r = robots.find(robot => robot.name === hoveredRobotName);
+    if (r) {
+      const pix = toPixel(r.current_x, r.current_y);
+      const footprintRadius = (r.radius || 0.49) * scale;
+      const tooltipText = 'Click to set a different goal';
+
+      ctx.save();
+      ctx.font = '500 11px Outfit';
+      const textMetrics = ctx.measureText(tooltipText);
+      const textWidth = textMetrics.width;
+      const paddingX = 10;
+      const boxWidth = textWidth + paddingX * 2;
+      const boxHeight = 24;
+
+      // Position tooltip above the robot
+      let boxX = pix.x - boxWidth / 2;
+      let boxY = pix.y - footprintRadius - boxHeight - 12;
+
+      // Ensure tooltip stays within canvas bounds
+      if (boxY < 8) {
+        boxY = pix.y + footprintRadius + 12;
+      }
+      boxX = Math.max(8, Math.min(canvas.width - boxWidth - 8, boxX));
+
+      // Draw glassmorphic background box with robot color glow
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = r.color;
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+      ctx.strokeStyle = r.color;
+      ctx.lineWidth = 1.2;
+
+      ctx.beginPath();
+      ctx.roundRect(boxX, boxY, boxWidth, boxHeight, 6);
+      ctx.fill();
+      ctx.stroke();
+
+      // Draw text
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(tooltipText, boxX + boxWidth / 2, boxY + boxHeight / 2);
+
+      ctx.restore();
+    }
+  }
 }
 
 let lastCanvasDisplaySize = -1;
