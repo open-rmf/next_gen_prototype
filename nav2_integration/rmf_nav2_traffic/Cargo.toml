@@ -17,6 +17,7 @@ include = true
 install_to_share = ["config"]
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 bevy = "0.16"
 bevy_ecs = "0.16"

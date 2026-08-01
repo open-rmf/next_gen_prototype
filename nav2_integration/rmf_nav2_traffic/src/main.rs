@@ -1,17 +1,26 @@
 use bevy::{log::LogPlugin, prelude::*};
+use clap::Parser;
 use nav2_traffic::*;
 use std::fs;
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let config_path = args
-        .windows(2)
-        .find(|w| w[0] == "-c" || w[0] == "--config")
-        .map(|w| w[1].clone())
-        .expect("Missing -c or --config argument");
+#[derive(Parser)]
+#[command(author, version, about = "RMF Nav2 Traffic manager")]
+struct Cli {
+    /// Path to the YAML config file
+    #[arg(short = 'c', long)]
+    config: std::path::PathBuf,
 
-    let config_contents = fs::read_to_string(&config_path).expect("Failed to read config file");
-    let config: AgentConfig = serde_yaml::from_str(&config_contents).expect("Failed to parse config YAML");
+    /// Absorb any trailing arguments appended by ROS 2 launch (e.g. --ros-args)
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    _ros_args: Vec<String>,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    let config_contents = fs::read_to_string(&cli.config).expect("Failed to read config file");
+    let config: AgentConfig =
+        serde_yaml::from_str(&config_contents).expect("Failed to parse config YAML");
 
     let mut configured_agents = ConfiguredAgents { names: vec![] };
     for agent_name in config.agents.keys() {
