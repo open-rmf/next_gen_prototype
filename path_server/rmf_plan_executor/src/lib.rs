@@ -526,7 +526,7 @@ impl PlanExecutor {
         let safe_zone = SafeZone {
             incremental_target: DestinationConstraints {
                 regions: vec![rmf_prototype_msgs::msg::TargetRegion {
-                    tolerance: 0.1,
+                    tolerance: 0.2,
                     region: rmf_prototype_msgs::msg::Region {
                         points: vec![target_x, target_y],
                         hint: rmf_prototype_msgs::msg::Region::HINT_POINT,
