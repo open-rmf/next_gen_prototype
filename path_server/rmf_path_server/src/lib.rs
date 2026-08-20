@@ -18,7 +18,7 @@ use ros_env::{
     nav_msgs::msg::{OccupancyGrid, Odometry},
     rmf_prototype_msgs::{
         self,
-        msg::{Destination, Plan, PlanId, TrafficDependency, Waypoint},
+        msg::{Destination, Plan, PlanError, PlanId, TrafficDependency, Waypoint},
     },
 };
 use std::{
@@ -129,6 +129,19 @@ impl<P: MapfPlanner> PlanServer<P> {
     pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) {
         self.latest_pose_estimate
             .insert(robot_id.to_string(), msg.clone());
+    }
+
+    pub fn handle_plan_error(&mut self, robot_id: &str, msg: PlanError) {
+        if msg.error.code == PlanError::CODE_PATH_BLOCKED {
+            rclrs::log_warn!(
+                self.node.logger(),
+                "Received CODE_PATH_BLOCKED for robot {}. Enqueuing replan...",
+                robot_id
+            );
+            if let Some(dest) = self.active_destinations.get(robot_id).cloned() {
+                self.replan_queue.push((robot_id.to_string(), dest));
+            }
+        }
     }
 
     pub fn replan(&mut self) {
@@ -472,6 +485,7 @@ impl<P: MapfPlanner> PlanServer<P> {
 pub struct RobotPathConnections<P: MapfPlanner> {
     pub _destination_subscription: rclrs::WorkerSubscription<Destination, PlanServer<P>>,
     pub _odom_subscription: rclrs::WorkerSubscription<Odometry, PlanServer<P>>,
+    pub _plan_error_subscription: rclrs::WorkerSubscription<PlanError, PlanServer<P>>,
 }
 
 pub struct DiscoveryServer<P: MapfPlanner> {
@@ -607,11 +621,34 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
                     }
                 };
 
+                let robot_id_clone3 = robot_id.to_string();
+                let plan_error_topic = robot_id.to_string() + "/plan/error";
+                let plan_error_sub = match server
+                    .destinations_worker
+                    .create_subscription::<PlanError, _>(
+                        plan_error_topic.as_str(),
+                        move |dest_server: &mut PlanServer<P>, error_msg: PlanError| {
+                            dest_server.handle_plan_error(&robot_id_clone3, error_msg);
+                        },
+                    ) {
+                    Ok(sub) => sub,
+                    Err(err) => {
+                        rclrs::log_error!(
+                            server.node.logger(),
+                            "Failed to create plan error subscription on DestinationsWorker for {}: {:?}",
+                            robot_id,
+                            err
+                        );
+                        return;
+                    }
+                };
+
                 server.active_robots.insert(
                     robot_id.to_string(),
                     RobotPathConnections {
                         _destination_subscription: destination_sub,
                         _odom_subscription: odom_sub,
+                        _plan_error_subscription: plan_error_sub,
                     },
                 );
             }

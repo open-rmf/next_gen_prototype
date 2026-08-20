@@ -23,22 +23,24 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
+    GroupAction,
     IncludeLaunchDescription,
     OpaqueFunction,
     RegisterEventHandler,
 )
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.event_handlers import OnShutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetRemap
 
 
 def generate_launch_description():
     # Get the launch directory
     bringup_dir = get_package_share_directory('nav2_bringup')
     launch_dir = os.path.join(bringup_dir, 'launch')
+    prototype_bringup_dir = get_package_share_directory('sp_demo_nav2_bringup')
     sim_dir = get_package_share_directory('nav2_minimal_tb3_sim')
 
     # Create the launch configuration variables
@@ -51,6 +53,8 @@ def generate_launch_description():
     autostart = LaunchConfiguration('autostart')
     use_composition = LaunchConfiguration('use_composition')
     use_respawn = LaunchConfiguration('use_respawn')
+    use_navigation = LaunchConfiguration('use_navigation')
+    clock_topic = LaunchConfiguration('clock_topic')
 
     # Launch configuration variables specific to simulation
     rviz_config_file = LaunchConfiguration('rviz_config_file')
@@ -120,6 +124,18 @@ def generate_launch_description():
         'use_respawn',
         default_value='False',
         description='Whether to respawn if a node crashes. Applied when composition is disabled.',
+    )
+
+    declare_use_navigation_cmd = DeclareLaunchArgument(
+        'use_navigation',
+        default_value='True',
+        description='Whether to enable the Nav2 planning and control stack',
+    )
+
+    declare_clock_topic_cmd = DeclareLaunchArgument(
+        'clock_topic',
+        default_value='/clock',
+        description='ROS topic for the Gazebo clock bridge',
     )
 
     declare_rviz_config_file_cmd = DeclareLaunchArgument(
@@ -194,6 +210,7 @@ def generate_launch_description():
 
     bringup_cmd = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, 'bringup_launch.py')),
+        condition=IfCondition(use_navigation),
         launch_arguments={
             'namespace': namespace,
             'use_namespace': use_namespace,
@@ -204,6 +221,29 @@ def generate_launch_description():
             'autostart': autostart,
             'use_composition': use_composition,
             'use_respawn': use_respawn,
+            'use_navigation': use_navigation,
+        }.items(),
+    )
+    localization_cmd = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(
+                prototype_bringup_dir,
+                'launch',
+                'bringup_launch.py',
+            )
+        ),
+        condition=UnlessCondition(use_navigation),
+        launch_arguments={
+            'namespace': namespace,
+            'use_namespace': use_namespace,
+            'slam': slam,
+            'map': map_yaml_file,
+            'use_sim_time': use_sim_time,
+            'params_file': params_file,
+            'autostart': autostart,
+            'use_composition': use_composition,
+            'use_respawn': use_respawn,
+            'use_navigation': 'False',
         }.items(),
     )
     # The SDF file for the world is a xacro file because we wanted to
@@ -236,19 +276,22 @@ def generate_launch_description():
         launch_arguments={'gz_args': ['-v4 -g ']}.items(),
     )
 
-    gz_robot = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(sim_dir, 'launch', 'spawn_tb3.launch.py')),
-        launch_arguments={'namespace': namespace,
-                          'use_sim_time': use_sim_time,
-                          'robot_name': robot_name,
-                          'robot_sdf': robot_sdf,
-                          'x_pose': pose['x'],
-                          'y_pose': pose['y'],
-                          'z_pose': pose['z'],
-                          'roll': pose['R'],
-                          'pitch': pose['P'],
-                          'yaw': pose['Y']}.items())
+    gz_robot = GroupAction([
+        SetRemap(src='/clock', dst=clock_topic),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(sim_dir, 'launch', 'spawn_tb3.launch.py')),
+            launch_arguments={'namespace': namespace,
+                              'use_sim_time': use_sim_time,
+                              'robot_name': robot_name,
+                              'robot_sdf': robot_sdf,
+                              'x_pose': pose['x'],
+                              'y_pose': pose['y'],
+                              'z_pose': pose['z'],
+                              'roll': pose['R'],
+                              'pitch': pose['P'],
+                              'yaw': pose['Y']}.items())
+    ])
 
     # Create the launch description and populate
     ld = LaunchDescription()
@@ -272,6 +315,8 @@ def generate_launch_description():
     ld.add_action(declare_robot_name_cmd)
     ld.add_action(declare_robot_sdf_cmd)
     ld.add_action(declare_use_respawn_cmd)
+    ld.add_action(declare_use_navigation_cmd)
+    ld.add_action(declare_clock_topic_cmd)
 
     ld.add_action(world_sdf_xacro)
     ld.add_action(remove_temp_sdf_file)
@@ -283,5 +328,6 @@ def generate_launch_description():
     ld.add_action(start_robot_state_publisher_cmd)
     ld.add_action(rviz_cmd)
     ld.add_action(bringup_cmd)
+    ld.add_action(localization_cmd)
 
     return ld

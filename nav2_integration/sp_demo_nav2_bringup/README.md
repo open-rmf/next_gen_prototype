@@ -24,13 +24,12 @@ This is how to launch multi-robot simulation with simple command line. Please se
 
 #### Cloned
 
-This allows to bring up multiple robots, cloning a single robot N times at different positions in the map. The parameter are loaded from `nav2_multirobot_params_all.yaml` file by default.
-The multiple robots that consists of name and initial pose in YAML format will be set on the command-line. The format for each robot is `robot_name={x: 0.0, y: 0.0, yaw: 0.0, roll: 0.0, pitch: 0.0, yaw: 0.0}`.
+This launch file clones one robot at multiple poses and loads `nav2_multirobot_params_all.yaml` by default. Pass each robot as `robot_name={x: 0.0, y: 0.0, z: 0.0, roll: 0.0, pitch: 0.0, yaw: 0.0}`.
 
-Please refer to below examples.
+Set `staged_startup:=True` to start robots sequentially. Each stack waits for odometry and transforms before localization, initial-pose, and navigation activation.
 
 ```shell
-ros2 launch nav2_bringup cloned_multi_tb3_simulation_launch.py robots:="robot1={x: 1.0, y: 1.0, yaw: 1.5707}; robot2={x: 1.0, y: 1.0, yaw: 1.5707}"
+ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py robots:="robot1={x: 1.0, y: 1.0, yaw: 1.5707}; robot2={x: 1.0, y: 1.0, yaw: 1.5707}"
 ```
 
 #### Unique
