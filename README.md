@@ -96,6 +96,9 @@ colcon test --packages-select rmf_path_server_test --event-handlers console_dire
 
 ## Running Interactive Web Demonstration
 
+> [!NOTE]
+> This provides a lightweight visualization of how `next_gen_prototype` utilizes `mapf` to guide multiple robot agents towards their goal while managing their traffic.
+
 https://github.com/user-attachments/assets/d5793eee-515d-49a9-a92c-9926617b48ed
 
 
@@ -107,3 +110,10 @@ ros2 launch rmf_path_server_demo demo.launch.py
 2. Click **Add Robot** to drop active participants onto the canvas.
 3. Select a robot and click a cell to place its goal.
 4. Click **Send Scenario** to observe multi-agent trajectory generation and live execution progress.
+
+## Running Nav2 Integration Demonstration
+
+> [!NOTE]
+> This shows users how `next_gen_prototype`'s prototype messages and traffic management design is used for multi-robot coordinations through [Nav2](https://docs.nav2.org/) navigation system.
+
+Follow instructions in [nav2_integration/README.md](./nav2_integration/README.md).
