@@ -48,12 +48,21 @@ on discourse.
 </details>
 
 <details>
-   <summary><b>Method 2: Using a container (click here)</b></summary>
+   <summary><b>Method 2: Using distrobox (click here)</b></summary>
 
 > We pre-build base containers with all the dependencies you can use `rocker`, `distrobox`, `podman` or any other oci compliant tool to get a base dev environment. For the purposes of this set of instructions we use distrobox:
 > ```bash
 > distrobox create --image ghcr.io/open-rmf/ros2_rust_base:jazzy -n ros2_rust_base
 > distrobox enter ros2_rust_base
+> ```
+</details>
+
+<details>
+   <summary><b>Method 3: Using docker container (click here)</b></summary>
+
+> If you prefer to build the base Docker image from scratch. Please use the following command:
+> ```bash
+> docker build -t ros2_rust_base:jazzy -f docker/Dockerfile.base .
 > ```
 </details>
 
