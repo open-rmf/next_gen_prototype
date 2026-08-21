@@ -62,7 +62,7 @@ on discourse.
 
 > If you prefer to build the base Docker image from scratch. Please use the following command:
 > ```bash
-> docker build -t ros2_rust_base:jazzy -f docker/Dockerfile.base .
+> docker build --load -t ros2_rust_base:jazzy -f docker/Dockerfile.base .
 > ```
 </details>
 
@@ -94,7 +94,7 @@ Verify core scenario coordination and robust following behavior:
 colcon test --packages-select rmf_path_server_test --event-handlers console_direct+
 ```
 
-## Running the Interactive Web Demonstration
+## Running Interactive Web Demonstration
 
 https://github.com/user-attachments/assets/d5793eee-515d-49a9-a92c-9926617b48ed
 
