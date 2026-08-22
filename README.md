@@ -10,7 +10,8 @@ on discourse.
 
 # Setup & Building
 
-:warning: As this is a project under construction, these instructions are likely to change rapidly.
+> [!WARNING] 
+> As this is a project under construction, these instructions are likely to change rapidly.
 
 ## Pre-requisites
 
