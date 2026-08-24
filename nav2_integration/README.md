@@ -96,7 +96,7 @@ graph TD
 Follow the steps below to use pre-made `docker/Dockerfile.base` to run the demo containerized without fuss:  
 
 <details>
-   <summary><b>Click here.</b></summary>
+   <summary><b>Click here 🐳.</b></summary>
 
 ```bash
 docker build --load -t ros2_rust_nav2_tb4_sim:jazzy -f docker/Dockerfile.base .
@@ -153,7 +153,7 @@ ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py   robots:
 ```
 
 <details>
-   <summary><b>Click here if running in docker container (GPU + X11).</b></summary>
+   <summary><b>Click here if running in docker container (GPU + X11) 🐳.</b></summary>
 
 ```bash
 xhost +local:docker
@@ -173,7 +173,7 @@ robots:=\"robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};\
 </details>
 
 <details>
-   <summary><b>Click here if running in docker container (GPU + Wayland).</b></summary>
+   <summary><b>Click here if running in docker container (GPU + Wayland) 🐳.</b></summary>
 
 ```bash
 xhost +local:docker
@@ -193,7 +193,7 @@ bash -c "source /nav2_traffic_ws/install/setup.bash && \
 </details>
 
 <details>
-   <summary><b>Click here if running in docker container (CPU).</b></summary>
+   <summary><b>Click here if running in docker container (CPU) 🐳.</b></summary>
 
 ```bash
 xhost +local:docker
@@ -217,7 +217,7 @@ ros2 launch rmf_path_server_demo demo_nav2.launch.py robots:="robot0 robot1"
 ```
 
 <details>
-   <summary><b>Click here if running in docker container.</b></summary>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
 
 ```bash
 docker exec -it ros2_rust_nav2_tb4_sim_c bash -c "source /nav2_traffic_ws/install/setup.bash && ros2 launch rmf_path_server_demo demo_nav2.launch.py robots:=\"robot0 robot1\""
@@ -242,7 +242,7 @@ ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
 }"
 ```
 <details>
-   <summary><b>Click here if running in docker container.</b></summary>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
 
 ```bash
 docker exec -it ros2_rust_nav2_tb4_sim_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
@@ -278,7 +278,7 @@ ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
 ```
 
 <details>
-   <summary><b>Click here if running in docker container.</b></summary>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
 
 ```bash
 docker exec -it ros2_rust_nav2_tb4_sim_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
