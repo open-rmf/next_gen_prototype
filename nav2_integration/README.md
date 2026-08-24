@@ -93,13 +93,13 @@ graph TD
 
 ### Docker Setup
 
-Follow the steps below to use pre-made `docker/Dockerfile.nav2` to run the demo containerized without fuss:  
+Follow the steps below to use pre-made `docker/Dockerfile.base` to run the demo containerized without fuss:  
 
 <details>
    <summary><b>Click here.</b></summary>
 
 ```bash
-docker build --load -t ros2_rust_nav2_tb4_sim:jazzy -f docker/Dockerfile.nav2 .
+docker build --load -t ros2_rust_nav2_tb4_sim:jazzy -f docker/Dockerfile.base .
 ```
 
 </details>
