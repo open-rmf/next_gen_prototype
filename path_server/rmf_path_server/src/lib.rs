@@ -18,7 +18,10 @@ use ros_env::{
     nav_msgs::msg::{OccupancyGrid, Odometry},
     rmf_prototype_msgs::{
         self,
-        msg::{Destination, Plan, PlanId, Region, TargetRegion, TrafficDependency, Waypoint},
+        msg::{
+            ControlPoint, Curve, Destination, Plan, PlanId, Region, TargetRegion,
+            TrafficDependency, Trajectory, Waypoint,
+        },
     },
 };
 use std::{
@@ -508,6 +511,50 @@ impl<P: MapfPlanner> PlanServer<P> {
         if let Some(action) = target_action {
             if let Some(last_wp) = waypoints.last_mut() {
                 last_wp.arrival_action = action.to_string();
+            }
+        }
+
+        // For any docking waypoints, populate departure_trajectory
+        let num_waypoints = waypoints.len();
+        for i in 0..num_waypoints {
+            let arrival_act = waypoints[i].arrival_action.clone();
+            let is_docking = !arrival_act.is_empty()
+                && (arrival_act.starts_with("dock") || arrival_act.contains("dock"));
+            if is_docking && waypoints[i].departure_trajectory.is_empty() {
+                let [dock_x, dock_y] = waypoints[i].position;
+                let depart_pos = if i + 1 < num_waypoints {
+                    waypoints[i + 1].position
+                } else if i > 0 {
+                    waypoints[i - 1].position
+                } else {
+                    [dock_x, dock_y]
+                };
+                // TODO(arjoc) parameterize it
+                let departure_duration = 1.0f32;
+                let departure_curve = Curve {
+                    degree: 1,
+                    control_points: vec![
+                        ControlPoint {
+                            position: [dock_x, dock_y],
+                            weight: 1.0,
+                        },
+                        ControlPoint {
+                            position: depart_pos,
+                            weight: 1.0,
+                        },
+                    ],
+                    knots: vec![0.0, 0.0, departure_duration, departure_duration],
+                };
+
+                let departure_traj = Trajectory {
+                    curve: departure_curve,
+                    initial_progress_level: waypoints[i].progress,
+                    final_progress_level: waypoints[i].progress + departure_duration,
+                    maps: waypoints[i].maps.clone(),
+                    keys: Vec::new(),
+                };
+
+                waypoints[i].departure_trajectory = vec![departure_traj];
             }
         }
 

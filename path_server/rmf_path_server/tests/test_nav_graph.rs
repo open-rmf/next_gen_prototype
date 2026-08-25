@@ -263,6 +263,16 @@ fn test_path_server_graphkey_destination_dock_action() -> Result<(), Box<dyn std
                     "Expected arrival_action 'dock_conveyor_r1_c1' on the final waypoint"
                 );
                 assert_eq!(last_wp.position, [0.0, 1.5]);
+
+                // Verify departure trajectory is populated
+                assert!(
+                    !last_wp.departure_trajectory.is_empty(),
+                    "Expected departure_trajectory to be populated on docking waypoint"
+                );
+                let dep_traj = &last_wp.departure_trajectory[0];
+                assert_eq!(dep_traj.curve.control_points.len(), 2);
+                assert_eq!(dep_traj.curve.control_points[0].position, [0.0, 1.5]);
+                assert_eq!(dep_traj.curve.control_points[1].position, [0.0, 2.0]);
                 return Ok(());
             }
         }
