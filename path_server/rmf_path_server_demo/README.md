@@ -9,9 +9,13 @@ The demo can be run in two modes:
 ### 1. Direct Path Server Mode (Default)
 In this mode, the dashboard bypasses any destination allocation logic and sends destination goals directly to the path server.
 
-Run the launch file:
+Run the launch file (PIBT by default, or CCBS):
 ```bash
+# Default (PIBT)
 ros2 launch rmf_path_server_demo demo.launch.py
+
+# Switch to CCBS planner
+ros2 launch rmf_path_server_demo demo.launch.py planner:=ccbs
 ```
 - Open `http://localhost:8080` in your web browser.
 - **Add Robot**: Click "Add Robot" and place robots on the grid canvas.
@@ -25,7 +29,7 @@ selected goal as a `Destination` message to the path planner.
 
 Run the launch file:
 ```bash
-ros2 launch rmf_path_server_demo demo_destination_server.launch.py
+ros2 launch rmf_path_server_demo demo_destination_server.launch.py planner:=ccbs
 ```
 
 The launch file defaults to `destination_server:=reservation`. Use
@@ -44,12 +48,19 @@ full comparison.
 - **Send**: Click "Send Scenario" to submit goals for resolution and start planning.
 - The canvas will highlight the chosen goals in solid colors and fade out the unused alternatives.
 
-### 3. Map Server Mode (Grid Map Testing)
-In this mode, the launch file also spins up a ROS 2 `map_server` loaded with a custom 20x20 grid map (`demo_grid.png`) and activates it. The dashboard subscribes to `/map` and visualizes it as a background layer.
+### 3. Map Server Mode (Pre-existing Grid Map Testing)
+In this mode, the launch file spins up a ROS 2 `map_server` loaded with a custom 20x20 grid map (`demo_grid.png` / `demo_grid.yaml`) and activates it. The dashboard subscribes to `/map` and visualizes it as a background layer, and the path server incorporates the map into collision-free planning.
 
 Run the launch file:
 ```bash
-ros2 launch rmf_path_server_demo demo_map.launch.py
+# Run with CCBS planner and pre-existing map
+ros2 launch rmf_path_server_demo demo_map.launch.py planner:=ccbs
+
+# Run with PIBT planner and pre-existing map
+ros2 launch rmf_path_server_demo demo_map.launch.py planner:=pibt-grid-world
+
+# Run with a custom map yaml file
+ros2 launch rmf_path_server_demo demo_map.launch.py planner:=ccbs map_file:=/path/to/custom_grid.yaml
 ```
 - Open `http://localhost:8080` in your web browser.
 - The canvas will automatically fit to the 20x20 grid map.

@@ -22,15 +22,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut executor = context.create_basic_executor();
     let node = Arc::new(executor.create_node("path_server")?);
 
+    let param_planner = node
+        .declare_parameter("planner")
+        .default(Arc::<str>::from("pibt-grid-world"))
+        .mandatory()
+        .ok()
+        .map(|p| p.get().to_string());
+
     let args: Vec<String> = env::args().collect();
-    let planner_name = args
+    let cli_planner = args
         .iter()
         .position(|arg| arg == "--planner")
         .and_then(|i| args.get(i + 1).cloned())
         .or_else(|| {
             args.iter()
                 .find_map(|arg| arg.strip_prefix("--planner=").map(String::from))
-        })
+        });
+
+    let planner_name = cli_planner
+        .or(param_planner)
         .unwrap_or_else(|| "pibt-grid-world".to_string());
 
     let planner: Box<dyn MapfPlanner> = match planner_name.to_lowercase().as_str() {
@@ -38,9 +48,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rclrs::log!(node.logger(), "Using CCBS planner");
             Box::new(CcbsPlanner::default())
         }
-        "pibt-grid-world" | _ => {
+        "pibt-grid-world" | "pibt" => {
             rclrs::log!(node.logger(), "Using PIBT grid world planner");
             Box::new(PibtPlanner::default())
+        }
+        other => {
+            return Err(format!(
+                "Unknown planner '{}'. Available options: 'pibt-grid-world', 'ccbs'",
+                other
+            )
+            .into());
         }
     };
 

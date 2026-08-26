@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use hetpibt::external_tracks_pibt::PiBTWithExternalTracks;
-use mapf::graph::occupancy::Cell;
-use mapf::motion::se2::Point;
+use mapf::motion::{Motion, TimePoint};
 use mapf::negotiation::{negotiate, Agent, Scenario};
 use mapf_post::na::Isometry2;
 use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
@@ -286,19 +285,37 @@ impl MapfPlanner for Arc<dyn MapfPlanner> {
 #[derive(Clone)]
 pub struct CcbsPlanner {
     pub queue_length_limit: Option<usize>,
+    pub cell_size: Option<f64>,
+    pub discretization_timestep: Option<f64>,
 }
 
 impl Default for CcbsPlanner {
     fn default() -> Self {
         Self {
             queue_length_limit: Some(100_000),
+            cell_size: None,
+            discretization_timestep: Some(1.0),
         }
     }
 }
 
 impl CcbsPlanner {
     pub fn new(queue_length_limit: Option<usize>) -> Self {
-        Self { queue_length_limit }
+        Self {
+            queue_length_limit,
+            cell_size: None,
+            discretization_timestep: Some(1.0),
+        }
+    }
+
+    pub fn with_cell_size(mut self, cell_size: f64) -> Self {
+        self.cell_size = Some(cell_size);
+        self
+    }
+
+    pub fn with_discretization_timestep(mut self, timestep: f64) -> Self {
+        self.discretization_timestep = Some(timestep);
+        self
     }
 }
 
@@ -307,7 +324,7 @@ impl MapfPlanner for CcbsPlanner {
         &self,
         starts: &HashMap<String, Odometry>,
         goals: &HashMap<String, Destination>,
-        _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
+        footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
         map: &Map,
         _cancellation: Arc<AtomicBool>,
@@ -316,10 +333,18 @@ impl MapfPlanner for CcbsPlanner {
             return Ok(Vec::new());
         }
 
-        let cell_size = if map.grid.info.resolution > 0.0 {
+        let cell_size = self.cell_size.unwrap_or_else(|| {
+            if map.grid.info.resolution >= 0.2 {
+                map.grid.info.resolution as f64
+            } else {
+                1.0
+            }
+        });
+
+        let map_res = if map.grid.info.resolution > 0.0 {
             map.grid.info.resolution as f64
         } else {
-            1.0
+            cell_size
         };
 
         let origin_x = map.grid.info.origin.position.x as f64;
@@ -333,12 +358,34 @@ impl MapfPlanner for CcbsPlanner {
                 for y in 0..h {
                     let ros_val = map.grid.data[y * w + x];
                     if ros_val > 50 || ros_val == -1 {
-                        occupancy.entry(y as i64).or_default().push(x as i64);
+                        let wx = origin_x + x as f64 * map_res;
+                        let wy = origin_y + y as f64 * map_res;
+                        let cx = ((wx - origin_x) / cell_size).round() as i64;
+                        let cy = ((wy - origin_y) / cell_size).round() as i64;
+                        occupancy.entry(cy).or_default().push(cx);
                     }
                 }
             }
+
+            // Mark a boundary ring of cells just outside the grid bounds as occupied
+            // so agents do not navigate outside the mapped area.
+            let max_cx = ((w as f64 * map_res) / cell_size).round() as i64 - 1;
+            let max_cy = ((h as f64 * map_res) / cell_size).round() as i64 - 1;
+            let min_cx = 0i64;
+            let min_cy = 0i64;
+
+            for cx in (min_cx - 1)..=(max_cx + 1) {
+                occupancy.entry(min_cy - 1).or_default().push(cx);
+                occupancy.entry(max_cy + 1).or_default().push(cx);
+            }
+            for cy in min_cy..=max_cy {
+                occupancy.entry(cy).or_default().push(min_cx - 1);
+                occupancy.entry(cy).or_default().push(max_cx + 1);
+            }
+
             for row in occupancy.values_mut() {
                 row.sort_unstable();
+                row.dedup();
             }
         }
 
@@ -360,13 +407,11 @@ impl MapfPlanner for CcbsPlanner {
 
             let sx_world = odom.pose.pose.position.x as f64;
             let sy_world = odom.pose.pose.position.y as f64;
-            let sx_local = sx_world - origin_x;
-            let sy_local = sy_world - origin_y;
+            let start_cx = ((sx_world - origin_x) / cell_size).round() as i64;
+            let start_cy = ((sy_world - origin_y) / cell_size).round() as i64;
 
             let q = &odom.pose.pose.orientation;
             let yaw = 2.0 * f64::atan2(q.z as f64, q.w as f64);
-
-            let start_cell = Cell::from_point(Point::new(sx_local, sy_local), cell_size);
 
             let gx_world: f64;
             let gy_world: f64;
@@ -388,17 +433,29 @@ impl MapfPlanner for CcbsPlanner {
                 )));
             }
 
-            let gx_local = gx_world - origin_x;
-            let gy_local = gy_world - origin_y;
-            let goal_cell = Cell::from_point(Point::new(gx_local, gy_local), cell_size);
+            let goal_cx = ((gx_world - origin_x) / cell_size).round() as i64;
+            let goal_cy = ((gy_world - origin_y) / cell_size).round() as i64;
+
+            let radius = footprints
+                .get(id)
+                .and_then(|shape| {
+                    if let Some(ball) = shape.as_ball() {
+                        Some(ball.radius as f64)
+                    } else {
+                        let aabb = shape.compute_local_aabb();
+                        Some((aabb.maxs.x.max(aabb.maxs.y)) as f64)
+                    }
+                })
+                .filter(|r| *r > 0.0)
+                .unwrap_or(0.45);
 
             agents.insert(
                 id.clone(),
                 Agent {
-                    start: [start_cell.x, start_cell.y],
+                    start: [start_cx, start_cy],
                     yaw,
-                    goal: [goal_cell.x, goal_cell.y],
-                    radius: 0.45,
+                    goal: [goal_cx, goal_cy],
+                    radius,
                     speed: 0.75,
                     spin: 60.0_f64.to_radians(),
                 },
@@ -424,6 +481,20 @@ impl MapfPlanner for CcbsPlanner {
                 }
             };
 
+        let time_step = self.discretization_timestep.unwrap_or(1.0);
+        let max_finish_time = solution_node
+            .proposals
+            .values()
+            .map(|p| p.meta.trajectory.finish_motion_time().as_secs_f64())
+            .fold(0.0f64, f64::max);
+
+        let num_steps = if max_finish_time > 0.0 {
+            (max_finish_time / time_step).ceil() as usize + 1
+        } else {
+            1
+        }
+        .max(2);
+
         let mut trajectories = vec![Vec::new(); robot_ids.len()];
 
         for (agent_idx, id) in robot_ids.iter().enumerate() {
@@ -445,10 +516,18 @@ impl MapfPlanner for CcbsPlanner {
                 ))
             })?;
 
-            for wp in proposal.meta.trajectory.iter() {
-                let world_x = (wp.position.translation.x + origin_x) as f32;
-                let world_y = (wp.position.translation.y + origin_y) as f32;
-                let angle = wp.position.rotation.angle() as f32;
+            let motion = proposal.meta.trajectory.motion();
+
+            for step in 0..num_steps {
+                let t = (step as f64 * time_step).min(max_finish_time);
+                let time_point = TimePoint::from_secs_f64(t);
+                let pos = motion
+                    .compute_position(&time_point)
+                    .unwrap_or_else(|_| proposal.meta.trajectory.finish_motion().position);
+
+                let world_x = (pos.translation.x + origin_x - 0.5 * cell_size) as f32;
+                let world_y = (pos.translation.y + origin_y - 0.5 * cell_size) as f32;
+                let angle = pos.rotation.angle() as f32;
 
                 trajectories[agent_idx].push(Isometry2::new(
                     mapf_post::na::Vector2::new(world_x, world_y),

@@ -15,16 +15,32 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
 
 def generate_launch_description():
     package_name = 'rmf_path_server_demo'
-    
-    # Map file path
-    map_yaml_file = os.path.join(
+
+    # Default map file path
+    default_map_file = os.path.join(
         get_package_share_directory(package_name),
         'maps',
-        'demo_grid.yaml'
+        'demo_grid.yaml',
+    )
+
+    declare_planner = DeclareLaunchArgument(
+        'planner',
+        default_value='pibt-grid-world',
+        description='MAPF Planner to use: pibt-grid-world or ccbs',
+        choices=['pibt-grid-world', 'pibt', 'ccbs'],
+    )
+
+    declare_map_file = DeclareLaunchArgument(
+        'map_file',
+        default_value=default_map_file,
+        description='Full path to map yaml file to load',
     )
 
     # 1. Start the RMF path server
@@ -32,7 +48,9 @@ def generate_launch_description():
         package='rmf_path_server',
         executable='rmf_path_server',
         name='rmf_path_server',
-        output='both'
+        output='both',
+        parameters=[{'planner': LaunchConfiguration('planner')}],
+        arguments=['--planner', LaunchConfiguration('planner')],
     )
 
     # 2. Start the web spawner & web dashboard hosting server (REST & SSE Bridge)
@@ -40,7 +58,7 @@ def generate_launch_description():
         package='rmf_path_server_demo',
         executable='robot_spawner',
         name='robot_spawner',
-        output='both'
+        output='both',
     )
 
     # 3. Start the plan executor
@@ -48,7 +66,7 @@ def generate_launch_description():
         package='rmf_plan_executor',
         executable='rmf_plan_executor',
         name='rmf_plan_executor',
-        output='both'
+        output='both',
     )
 
     # 4. Start the map server
@@ -57,7 +75,7 @@ def generate_launch_description():
         executable='map_server',
         name='map_server',
         output='screen',
-        parameters=[{'yaml_filename': map_yaml_file}]
+        parameters=[{'yaml_filename': LaunchConfiguration('map_file')}],
     )
 
     # 5. Start the lifecycle manager to activate the map server
@@ -69,14 +87,16 @@ def generate_launch_description():
         parameters=[{
             'use_sim_time': False,
             'autostart': True,
-            'node_names': ['map_server']
-        }]
+            'node_names': ['map_server'],
+        }],
     )
 
     return LaunchDescription([
+        declare_planner,
+        declare_map_file,
         path_server,
         robot_spawner,
         plan_executor,
         map_server,
-        lifecycle_manager
+        lifecycle_manager,
     ])
