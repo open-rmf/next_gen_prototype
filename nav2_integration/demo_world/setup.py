@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'set_init = demo_world.localization_init:main',
+            'staged_nav2_init = demo_world.staged_nav2_init:main',
             'robot_client = demo_world.path_reporter:main',
         ],
     },
