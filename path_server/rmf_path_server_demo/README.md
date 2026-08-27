@@ -49,12 +49,15 @@ full comparison.
 - The canvas will highlight the chosen goals in solid colors and fade out the unused alternatives.
 
 ### 3. Map Server Mode (Pre-existing Grid Map Testing)
-In this mode, the launch file spins up a ROS 2 `map_server` loaded with a custom 20x20 grid map (`demo_grid.png` / `demo_grid.yaml`) and activates it. The dashboard subscribes to `/map` and visualizes it as a background layer, and the path server incorporates the map into collision-free planning.
+In this mode, the launch file spins up a ROS 2 `map_server` loaded with a pre-existing grid map (`demo_grid.yaml` at 1.0m, or `demo_grid_0_1m.yaml` at 0.1m) and activates it. The dashboard subscribes to `/map` and visualizes it as a background layer, and the path server incorporates the map and footprint sizes into collision-free planning.
 
 Run the launch file:
 ```bash
-# Run with CCBS planner and pre-existing map
+# Run with CCBS planner and default 1.0m map (demo_grid.yaml)
 ros2 launch rmf_path_server_demo demo_map.launch.py planner:=ccbs
+
+# Run with CCBS planner and 0.1m fine-resolution map (demo_grid_0_1m.yaml) to test footprint sizes
+ros2 launch rmf_path_server_demo demo_map.launch.py planner:=ccbs map:=demo_grid_0_1m
 
 # Run with PIBT planner and pre-existing map
 ros2 launch rmf_path_server_demo demo_map.launch.py planner:=pibt-grid-world
@@ -63,8 +66,8 @@ ros2 launch rmf_path_server_demo demo_map.launch.py planner:=pibt-grid-world
 ros2 launch rmf_path_server_demo demo_map.launch.py planner:=ccbs map_file:=/path/to/custom_grid.yaml
 ```
 - Open `http://localhost:8080` in your web browser.
-- The canvas will automatically fit to the 20x20 grid map.
-- You can add robots and set goals as in the default mode, and see the map obstacles (a box in the center) drawn on the canvas.
+- The canvas will automatically fit to the loaded grid map.
+- You can add robots and set goals as in the default mode, and observe robots with different footprint sizes taking appropriate clearances around obstacles and through passages.
 
 ## Reservation Config Visualization
 

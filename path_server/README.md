@@ -22,14 +22,14 @@ ros2 launch rmf_path_server_demo demo.launch.py planner:=ccbs
 
 ### 2. Map Demo (With Pre-existing Map)
 
-To run the demo with a pre-existing 20x20 grid map (`demo_grid.yaml` / `demo_grid.png`) and obstacle layer:
+To run the demo with a pre-existing grid map:
 
 ```bash
-# Default (PIBT) with pre-existing map
-ros2 launch rmf_path_server_demo demo_map.launch.py
-
-# Using CCBS planner with pre-existing map
+# Default (1.0m resolution demo_grid.yaml)
 ros2 launch rmf_path_server_demo demo_map.launch.py planner:=ccbs
+
+# 0.1m fine-resolution demo map (demo_grid_0_1m.yaml) for footprint clearance testing
+ros2 launch rmf_path_server_demo demo_map.launch.py planner:=ccbs map:=demo_grid_0_1m
 
 # Using custom map file
 ros2 launch rmf_path_server_demo demo_map.launch.py planner:=ccbs map_file:=/path/to/map.yaml

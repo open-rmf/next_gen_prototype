@@ -334,7 +334,7 @@ impl MapfPlanner for CcbsPlanner {
         }
 
         let cell_size = self.cell_size.unwrap_or_else(|| {
-            if map.grid.info.resolution >= 0.2 {
+            if map.grid.info.resolution > 0.0 {
                 map.grid.info.resolution as f64
             } else {
                 1.0
@@ -390,6 +390,16 @@ impl MapfPlanner for CcbsPlanner {
         }
 
         let mut agents = std::collections::BTreeMap::new();
+        let (min_cx, max_cx, min_cy, max_cy) = if w > 0 && h > 0 {
+            (
+                0i64,
+                ((w as f64 * map_res) / cell_size).round() as i64 - 1,
+                0i64,
+                ((h as f64 * map_res) / cell_size).round() as i64 - 1,
+            )
+        } else {
+            (i64::MIN, i64::MAX, i64::MIN, i64::MAX)
+        };
 
         for id in robot_ids {
             let odom = starts.get(id).ok_or_else(|| {
@@ -407,8 +417,19 @@ impl MapfPlanner for CcbsPlanner {
 
             let sx_world = odom.pose.pose.position.x as f64;
             let sy_world = odom.pose.pose.position.y as f64;
-            let start_cx = ((sx_world - origin_x) / cell_size).round() as i64;
-            let start_cy = ((sy_world - origin_y) / cell_size).round() as i64;
+            let mut start_cx = ((sx_world - origin_x) / cell_size).round() as i64;
+            let mut start_cy = ((sy_world - origin_y) / cell_size).round() as i64;
+
+            if w > 0 && h > 0 {
+                start_cx = start_cx.clamp(min_cx, max_cx);
+                start_cy = start_cy.clamp(min_cy, max_cy);
+
+                // If the robot's current position coincides with an occupied cell,
+                // unmark it so the robot can plan out of the collision state.
+                if let Some(row) = occupancy.get_mut(&start_cy) {
+                    row.retain(|&x| x != start_cx);
+                }
+            }
 
             let q = &odom.pose.pose.orientation;
             let yaw = 2.0 * f64::atan2(q.z as f64, q.w as f64);
@@ -433,8 +454,36 @@ impl MapfPlanner for CcbsPlanner {
                 )));
             }
 
-            let goal_cx = ((gx_world - origin_x) / cell_size).round() as i64;
-            let goal_cy = ((gy_world - origin_y) / cell_size).round() as i64;
+            let mut goal_cx = ((gx_world - origin_x) / cell_size).round() as i64;
+            let mut goal_cy = ((gy_world - origin_y) / cell_size).round() as i64;
+
+            if w > 0 && h > 0 {
+                goal_cx = goal_cx.clamp(min_cx, max_cx);
+                goal_cy = goal_cy.clamp(min_cy, max_cy);
+
+                // If the goal is occupied, search for the nearest free cell.
+                let is_occupied = |x: i64, y: i64| -> bool {
+                    occupancy.get(&y).map_or(false, |row| row.contains(&x))
+                };
+
+                if is_occupied(goal_cx, goal_cy) {
+                    'search: for r in 1i64..=10i64 {
+                        for dx in -r..=r {
+                            for dy in -r..=r {
+                                if dx.abs() == r || dy.abs() == r {
+                                    let nx = (goal_cx + dx).clamp(min_cx, max_cx);
+                                    let ny = (goal_cy + dy).clamp(min_cy, max_cy);
+                                    if !is_occupied(nx, ny) {
+                                        goal_cx = nx;
+                                        goal_cy = ny;
+                                        break 'search;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             let radius = footprints
                 .get(id)

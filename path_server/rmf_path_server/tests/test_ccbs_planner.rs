@@ -432,3 +432,217 @@ fn test_ccbs_multi_agent_schedule() {
         );
     }
 }
+
+#[test]
+fn test_ccbs_planner_boundary_spawn() {
+    // 20x20 grid with origin [-10.0, -10.0] (matching demo_grid.yaml)
+    let mut occupancy_grid = OccupancyGrid::default();
+    occupancy_grid.info.resolution = 1.0;
+    occupancy_grid.info.width = 20;
+    occupancy_grid.info.height = 20;
+    occupancy_grid.info.origin.position.x = -10.0;
+    occupancy_grid.info.origin.position.y = -10.0;
+    occupancy_grid.data = vec![0; 400];
+
+    let map = Map {
+        grid: occupancy_grid,
+    };
+
+    let mut starts = HashMap::new();
+    // Robot 1 spawned at boundary (2.0, 10.0)
+    let mut odom1 = Odometry::default();
+    odom1.pose.pose.position.x = 2.0;
+    odom1.pose.pose.position.y = 10.0;
+    starts.insert("robot_1".to_string(), odom1);
+
+    // Robot 2 spawned at boundary (-10.0, -2.0)
+    let mut odom2 = Odometry::default();
+    odom2.pose.pose.position.x = -10.0;
+    odom2.pose.pose.position.y = -2.0;
+    starts.insert("robot_2".to_string(), odom2);
+
+    let mut goals = HashMap::new();
+    let mut dest1 = Destination::default();
+    dest1
+        .constraints
+        .regions
+        .push(ros_env::rmf_prototype_msgs::msg::TargetRegion {
+            region: ros_env::rmf_prototype_msgs::msg::Region {
+                points: vec![7.0, 4.0],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    goals.insert("robot_1".to_string(), dest1);
+
+    let mut dest2 = Destination::default();
+    dest2
+        .constraints
+        .regions
+        .push(ros_env::rmf_prototype_msgs::msg::TargetRegion {
+            region: ros_env::rmf_prototype_msgs::msg::Region {
+                points: vec![4.0, -2.0],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    goals.insert("robot_2".to_string(), dest2);
+
+    let footprints = HashMap::new();
+    let robot_ids = vec!["robot_1".to_string(), "robot_2".to_string()];
+    let planner = CcbsPlanner::default();
+
+    let result = planner.plan(
+        &starts,
+        &goals,
+        &footprints,
+        &robot_ids,
+        &map,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert!(
+        result.is_ok(),
+        "Planning for boundary-spawned robots failed: {:?}",
+        result.err()
+    );
+    let trajectories = result.unwrap();
+    assert_eq!(trajectories.len(), 2);
+    assert!(!trajectories[0].is_empty());
+    assert!(!trajectories[1].is_empty());
+}
+
+#[test]
+fn test_ccbs_planner_fine_resolution_footprints() {
+    // 100x100 grid with 0.1m resolution = 10m x 10m map
+    let mut occupancy_grid = OccupancyGrid::default();
+    occupancy_grid.info.resolution = 0.1;
+    occupancy_grid.info.width = 100;
+    occupancy_grid.info.height = 100;
+    occupancy_grid.info.origin.position.x = -5.0;
+    occupancy_grid.info.origin.position.y = -5.0;
+    occupancy_grid.data = vec![0; 10000];
+
+    // Build vertical dividing wall at x = 50 (world x = 0.0m)
+    // with narrow gap at y: 20..27 (0.7m opening) and wide gap at y: 70..85 (1.5m opening)
+    for y in 0..100 {
+        if !(20..=27).contains(&y) && !(70..=85).contains(&y) {
+            for x in 49..=51 {
+                occupancy_grid.data[y * 100 + x] = 100;
+            }
+        }
+    }
+
+    let map = Map {
+        grid: occupancy_grid,
+    };
+
+    // Small robot with radius 0.25m (fits in 0.7m gap)
+    let mut starts_small = HashMap::new();
+    let mut odom_small = Odometry::default();
+    odom_small.pose.pose.position.x = -3.0;
+    odom_small.pose.pose.position.y = -2.6;
+    starts_small.insert("small_bot".to_string(), odom_small);
+
+    let mut goals_small = HashMap::new();
+    let mut dest_small = Destination::default();
+    dest_small
+        .constraints
+        .regions
+        .push(ros_env::rmf_prototype_msgs::msg::TargetRegion {
+            region: ros_env::rmf_prototype_msgs::msg::Region {
+                points: vec![3.0, -2.6],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    goals_small.insert("small_bot".to_string(), dest_small);
+
+    let mut footprints_small = HashMap::new();
+    footprints_small.insert(
+        "small_bot".to_string(),
+        Arc::new(Ball::new(0.25)) as Arc<dyn mapf_post::shape::Shape>,
+    );
+
+    let planner = CcbsPlanner::default();
+    let res_small = planner.plan(
+        &starts_small,
+        &goals_small,
+        &footprints_small,
+        &["small_bot".to_string()],
+        &map,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert!(
+        res_small.is_ok(),
+        "Small bot planning failed: {:?}",
+        res_small.err()
+    );
+    let traj_small = res_small.unwrap();
+    assert!(!traj_small[0].is_empty());
+    // Small robot path stays in negative y region, passing through the narrow gap near y = -2.6
+    let max_y_small = traj_small[0]
+        .iter()
+        .map(|p| p.translation.y)
+        .fold(f32::MIN, f32::max);
+    assert!(
+        max_y_small < 0.0,
+        "Small robot should pass through the narrow gap directly (max_y={})",
+        max_y_small
+    );
+
+    // Large robot with radius 0.55m (cannot fit in 0.7m gap, must detour to wide gap at y = 2.5)
+    let mut starts_large = HashMap::new();
+    let mut odom_large = Odometry::default();
+    odom_large.pose.pose.position.x = -3.0;
+    odom_large.pose.pose.position.y = -2.6;
+    starts_large.insert("large_bot".to_string(), odom_large);
+
+    let mut goals_large = HashMap::new();
+    let mut dest_large = Destination::default();
+    dest_large
+        .constraints
+        .regions
+        .push(ros_env::rmf_prototype_msgs::msg::TargetRegion {
+            region: ros_env::rmf_prototype_msgs::msg::Region {
+                points: vec![3.0, -2.6],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    goals_large.insert("large_bot".to_string(), dest_large);
+
+    let mut footprints_large = HashMap::new();
+    footprints_large.insert(
+        "large_bot".to_string(),
+        Arc::new(Ball::new(0.55)) as Arc<dyn mapf_post::shape::Shape>,
+    );
+
+    let res_large = planner.plan(
+        &starts_large,
+        &goals_large,
+        &footprints_large,
+        &["large_bot".to_string()],
+        &map,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert!(
+        res_large.is_ok(),
+        "Large bot planning failed: {:?}",
+        res_large.err()
+    );
+    let traj_large = res_large.unwrap();
+    assert!(!traj_large[0].is_empty());
+    // Large robot must detour up to positive y (around y = +2.5..+3.0) to pass through the wide gap
+    let max_y_large = traj_large[0]
+        .iter()
+        .map(|p| p.translation.y)
+        .fold(f32::MIN, f32::max);
+    assert!(
+        max_y_large > 1.5,
+        "Large robot must detour to the wide gap (max_y={})",
+        max_y_large
+    );
+}
