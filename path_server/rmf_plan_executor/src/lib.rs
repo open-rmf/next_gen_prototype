@@ -22,7 +22,7 @@ use ros_env::builtin_interfaces;
 use ros_env::geometry_msgs::msg::Pose;
 use ros_env::nav2_msgs;
 use ros_env::nav2_msgs::msg::Costmap;
-use ros_env::nav_msgs::msg::Odometry;
+use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
 use ros_env::rmf_prototype_msgs;
 use ros_env::rmf_prototype_msgs::msg::{
     DestinationConstraints, Plan, PlanRelease, SafeZone, SafeZoneId, TargetOrientation,
@@ -129,6 +129,28 @@ impl PlanExecutor {
             grid_height: config.grid_height,
             grid_resolution: config.grid_resolution,
             grid_origin: config.grid_origin,
+        }
+    }
+
+    pub fn handle_map(&mut self, msg: OccupancyGrid) {
+        if msg.info.width > 0 && msg.info.height > 0 && msg.info.resolution > 0.0 {
+            rclrs::log!(
+                self.node.logger(),
+                "PlanExecutor reconfiguring grid from map: width={}, height={}, resolution={}, origin=({}, {})",
+                msg.info.width,
+                msg.info.height,
+                msg.info.resolution,
+                msg.info.origin.position.x,
+                msg.info.origin.position.y
+            );
+            self.grid_width = msg.info.width;
+            self.grid_height = msg.info.height;
+            self.grid_resolution = msg.info.resolution;
+            self.grid_origin = msg.info.origin;
+            self.grid = Arc::new(Grid2D::new(
+                vec![vec![0; self.grid_height as usize]; self.grid_width as usize],
+                self.grid_resolution,
+            ));
         }
     }
 
@@ -677,5 +699,38 @@ mod tests {
         assert_eq!(builder_config.grid_height, 200);
         assert_eq!(builder_config.grid_resolution, 0.2);
         assert_eq!(builder_config.grid_origin, custom_origin);
+    }
+
+    #[test]
+    fn test_handle_map() {
+        use crate::PlanExecutor;
+        use rclrs::{Context, CreateBasicExecutor};
+        use ros_env::nav_msgs::msg::OccupancyGrid;
+
+        if let Ok(context) = Context::default_from_env() {
+            let executor = context.create_basic_executor();
+            if let Ok(node) = executor.create_node("test_handle_map_node") {
+                let mut plan_executor = PlanExecutor::new(node);
+                assert_eq!(plan_executor.grid_width, 20);
+                assert_eq!(plan_executor.grid_height, 20);
+                assert_eq!(plan_executor.grid_resolution, 1.0);
+
+                let mut map_msg = OccupancyGrid::default();
+                map_msg.info.width = 150;
+                map_msg.info.height = 200;
+                map_msg.info.resolution = 0.05;
+                map_msg.info.origin.position.x = -15.0;
+                map_msg.info.origin.position.y = -10.0;
+                map_msg.info.origin.orientation.w = 1.0;
+
+                plan_executor.handle_map(map_msg);
+
+                assert_eq!(plan_executor.grid_width, 150);
+                assert_eq!(plan_executor.grid_height, 200);
+                assert_eq!(plan_executor.grid_resolution, 0.05);
+                assert_eq!(plan_executor.grid_origin.position.x, -15.0);
+                assert_eq!(plan_executor.grid_origin.position.y, -10.0);
+            }
+        }
     }
 }

@@ -15,7 +15,7 @@
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use rmf_plan_executor::{PlanExecutor, PlanExecutorConfig};
 use ros_env::geometry_msgs::msg::Pose;
-use ros_env::nav_msgs::msg::Odometry;
+use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
 use ros_env::rmf_prototype_msgs::msg::{ParticipantList, Plan};
 use std::collections::HashMap;
 use std::env;
@@ -151,6 +151,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create the executor worker
     let executor_worker = node.create_worker(PlanExecutor::with_config(node.clone(), config));
+
+    // Subscribe to map to auto-reconfigure grid size, resolution, and origin
+    let _map_subscription = executor_worker.create_subscription::<OccupancyGrid, _>(
+        "/map".transient_local().reliable(),
+        move |executor: &mut PlanExecutor, msg: OccupancyGrid| {
+            executor.handle_map(msg);
+        },
+    )?;
 
     // Create the discovery worker
     let discovery_worker = node.create_worker(ExecutorDiscoveryServer::new(
