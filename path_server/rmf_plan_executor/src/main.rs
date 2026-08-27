@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
-use rmf_plan_executor::PlanExecutor;
+use rmf_plan_executor::{PlanExecutor, PlanExecutorConfig};
+use ros_env::geometry_msgs::msg::Pose;
 use ros_env::nav_msgs::msg::Odometry;
 use ros_env::rmf_prototype_msgs::msg::{ParticipantList, Plan};
 use std::collections::HashMap;
+use std::env;
 
 struct RobotConnections {
     _odom_subscription: rclrs::WorkerSubscription<Odometry, PlanExecutor>,
@@ -44,8 +46,111 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut executor = context.create_basic_executor();
     let node = executor.create_node("plan_executor")?;
 
+    let param_grid_width = node
+        .declare_parameter("grid_width")
+        .default(20i64)
+        .mandatory()
+        .map(|p| p.get() as u32)
+        .unwrap_or(20);
+
+    let param_grid_height = node
+        .declare_parameter("grid_height")
+        .default(20i64)
+        .mandatory()
+        .map(|p| p.get() as u32)
+        .unwrap_or(20);
+
+    let param_grid_resolution = node
+        .declare_parameter("grid_resolution")
+        .default(1.0f64)
+        .mandatory()
+        .map(|p| p.get() as f32)
+        .unwrap_or(1.0);
+
+    let param_grid_size = node
+        .declare_parameter("grid_size")
+        .default(1.0f64)
+        .mandatory()
+        .map(|p| p.get() as f32)
+        .unwrap_or(1.0);
+
+    let param_grid_origin_x = node
+        .declare_parameter("grid_origin_x")
+        .default(0.0f64)
+        .mandatory()
+        .map(|p| p.get())
+        .unwrap_or(0.0);
+
+    let param_grid_origin_y = node
+        .declare_parameter("grid_origin_y")
+        .default(0.0f64)
+        .mandatory()
+        .map(|p| p.get())
+        .unwrap_or(0.0);
+
+    let args: Vec<String> = env::args().collect();
+    let get_cli_arg = |flag: &str| -> Option<String> {
+        args.iter()
+            .position(|arg| arg == flag)
+            .and_then(|i| args.get(i + 1).cloned())
+            .or_else(|| {
+                let prefix = format!("{}=", flag);
+                args.iter()
+                    .find_map(|arg| arg.strip_prefix(&prefix).map(String::from))
+            })
+    };
+
+    let grid_width = get_cli_arg("--grid-width")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(param_grid_width);
+
+    let grid_height = get_cli_arg("--grid-height")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(param_grid_height);
+
+    let grid_resolution = get_cli_arg("--grid-resolution")
+        .or_else(|| get_cli_arg("--grid-size"))
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or_else(|| {
+            if param_grid_size != 1.0 && param_grid_resolution == 1.0 {
+                param_grid_size
+            } else {
+                param_grid_resolution
+            }
+        });
+
+    let grid_origin_x = get_cli_arg("--grid-origin-x")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(param_grid_origin_x);
+
+    let grid_origin_y = get_cli_arg("--grid-origin-y")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(param_grid_origin_y);
+
+    let mut origin = Pose::default();
+    origin.position.x = grid_origin_x;
+    origin.position.y = grid_origin_y;
+    origin.orientation.w = 1.0;
+
+    let config = PlanExecutorConfig {
+        grid_width,
+        grid_height,
+        grid_resolution,
+        grid_origin: origin,
+    };
+
+    rclrs::log!(
+        node.logger(),
+        "PlanExecutor initialized with grid: width={}, height={}, resolution={}, origin=({}, {})",
+        config.grid_width,
+        config.grid_height,
+        config.grid_resolution,
+        config.grid_origin.position.x,
+        config.grid_origin.position.y
+    );
+
     // Create the executor worker
-    let executor_worker = node.create_worker(PlanExecutor::new(node.clone()));
+    let executor_worker = node.create_worker(PlanExecutor::with_config(node.clone(), config));
 
     // Create the discovery worker
     let discovery_worker = node.create_worker(ExecutorDiscoveryServer::new(

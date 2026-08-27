@@ -42,6 +42,54 @@ pub struct RobotState {
     pub last_incremental_target_wp: Option<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanExecutorConfig {
+    pub grid_width: u32,
+    pub grid_height: u32,
+    pub grid_resolution: f32,
+    pub grid_origin: Pose,
+}
+
+impl Default for PlanExecutorConfig {
+    fn default() -> Self {
+        let mut origin = Pose::default();
+        origin.orientation.w = 1.0;
+        Self {
+            grid_width: 20,
+            grid_height: 20,
+            grid_resolution: 1.0,
+            grid_origin: origin,
+        }
+    }
+}
+
+impl PlanExecutorConfig {
+    pub fn new(grid_width: u32, grid_height: u32, grid_resolution: f32, grid_origin: Pose) -> Self {
+        Self {
+            grid_width,
+            grid_height,
+            grid_resolution,
+            grid_origin,
+        }
+    }
+
+    pub fn with_grid_size(mut self, width: u32, height: u32) -> Self {
+        self.grid_width = width;
+        self.grid_height = height;
+        self
+    }
+
+    pub fn with_resolution(mut self, resolution: f32) -> Self {
+        self.grid_resolution = resolution;
+        self
+    }
+
+    pub fn with_origin(mut self, origin: Pose) -> Self {
+        self.grid_origin = origin;
+        self
+    }
+}
+
 pub struct PlanExecutor {
     pub node: Node,
     // TODO(arjoc) The use of BTreeMap here is to make sure robts are ordered by their names
@@ -59,18 +107,28 @@ pub struct PlanExecutor {
 
 impl PlanExecutor {
     pub fn new(node: Node) -> Self {
-        let mut origin = Pose::default();
-        origin.orientation.w = 1.0;
+        Self::with_config(node, PlanExecutorConfig::default())
+    }
+
+    pub fn new_with_config(node: Node, config: PlanExecutorConfig) -> Self {
+        Self::with_config(node, config)
+    }
+
+    pub fn with_config(node: Node, config: PlanExecutorConfig) -> Self {
+        let grid = Arc::new(Grid2D::new(
+            vec![vec![0; config.grid_height as usize]; config.grid_width as usize],
+            config.grid_resolution,
+        ));
         Self {
             node,
             active_robots: BTreeMap::new(),
             plan_release_publishers: HashMap::new(),
             safezone_publishers: HashMap::new(),
-            grid: Arc::new(Grid2D::new(vec![vec![0; 20]; 20], 1.0)),
-            grid_width: 20,
-            grid_height: 20,
-            grid_resolution: 1.0,
-            grid_origin: origin,
+            grid,
+            grid_width: config.grid_width,
+            grid_height: config.grid_height,
+            grid_resolution: config.grid_resolution,
+            grid_origin: config.grid_origin,
         }
     }
 
@@ -587,5 +645,37 @@ mod tests {
             "After waiting at 10.0 (2nd time): index is {}",
             follower.get_semantic_waypoint().trajectory_index
         );
+    }
+
+    #[test]
+    fn test_plan_executor_config_default_and_builders() {
+        use crate::PlanExecutorConfig;
+        use ros_env::geometry_msgs::msg::Pose;
+
+        let config = PlanExecutorConfig::default();
+        assert_eq!(config.grid_width, 20);
+        assert_eq!(config.grid_height, 20);
+        assert_eq!(config.grid_resolution, 1.0);
+        assert_eq!(config.grid_origin.orientation.w, 1.0);
+
+        let mut custom_origin = Pose::default();
+        custom_origin.position.x = -10.0;
+        custom_origin.position.y = -5.0;
+        custom_origin.orientation.w = 1.0;
+
+        let custom_config = PlanExecutorConfig::new(50, 60, 0.5, custom_origin.clone());
+        assert_eq!(custom_config.grid_width, 50);
+        assert_eq!(custom_config.grid_height, 60);
+        assert_eq!(custom_config.grid_resolution, 0.5);
+        assert_eq!(custom_config.grid_origin.position.x, -10.0);
+
+        let builder_config = PlanExecutorConfig::default()
+            .with_grid_size(100, 200)
+            .with_resolution(0.2)
+            .with_origin(custom_origin.clone());
+        assert_eq!(builder_config.grid_width, 100);
+        assert_eq!(builder_config.grid_height, 200);
+        assert_eq!(builder_config.grid_resolution, 0.2);
+        assert_eq!(builder_config.grid_origin, custom_origin);
     }
 }
