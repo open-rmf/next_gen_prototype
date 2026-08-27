@@ -191,11 +191,14 @@ impl PlanExecutor {
     }
 
     fn get_agent_index(&self, robot_id: &str) -> Option<usize> {
-        self.active_robots.keys().position(|k| k == robot_id) // TODO(arjoc): Peak tier AI-SLOP code.
+        let mut sorted_names: Vec<String> = self.active_robots.keys().cloned().collect();
+        sorted_names.sort();
+        sorted_names.iter().position(|k| k == robot_id)
     }
 
     fn reindex_followers(&mut self) {
-        let sorted_names: Vec<String> = self.active_robots.keys().cloned().collect();
+        let mut sorted_names: Vec<String> = self.active_robots.keys().cloned().collect();
+        sorted_names.sort();
         for (agent_idx, name) in sorted_names.iter().enumerate() {
             let robot_state = self.active_robots.get_mut(name).unwrap();
             if let Some(plan) = &robot_state.plan {
@@ -218,6 +221,20 @@ impl PlanExecutor {
                 }
 
                 robot_state.waypoint_follower = Some(follower);
+            } else if let Some(odom) = &robot_state.latest_odom {
+                let current_x = odom.pose.pose.position.x as f32;
+                let current_y = odom.pose.pose.position.y as f32;
+                let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
+                let mut follower = WaypointFollower::from_trajectory(
+                    agent_idx,
+                    mapf_post::Trajectory {
+                        poses: vec![position],
+                    },
+                );
+                follower.update_position_estimate(&position, 0.5);
+                robot_state.waypoint_follower = Some(follower);
+            } else {
+                robot_state.waypoint_follower = None;
             }
         }
     }
@@ -273,9 +290,13 @@ impl PlanExecutor {
                 before,
                 after
             );
+        } else {
+            self.reindex_followers();
         }
 
-        if !self.ready_to_execute() {
+        // Only robots with an active plan need to compute and publish PlanRelease & SafeZone
+        let robot_state = &self.active_robots[robot_id];
+        if robot_state.plan.is_none() {
             return;
         }
 
@@ -396,19 +417,19 @@ impl PlanExecutor {
         let mut max_y = f32::MIN;
 
         for r_state in self.active_robots.values() {
-            let r_plan = r_state.plan.as_ref().unwrap();
-            let r_odom = r_state.latest_odom.as_ref().unwrap();
-
-            min_x = min_x.min(r_odom.pose.pose.position.x as f32);
-            min_y = min_y.min(r_odom.pose.pose.position.y as f32);
-            max_x = max_x.max(r_odom.pose.pose.position.x as f32);
-            max_y = max_y.max(r_odom.pose.pose.position.y as f32);
-
-            for wp in &r_plan.waypoints {
-                min_x = min_x.min(wp.position[0]);
-                min_y = min_y.min(wp.position[1]);
-                max_x = max_x.max(wp.position[0]);
-                max_y = max_y.max(wp.position[1]);
+            if let Some(r_odom) = &r_state.latest_odom {
+                min_x = min_x.min(r_odom.pose.pose.position.x as f32);
+                min_y = min_y.min(r_odom.pose.pose.position.y as f32);
+                max_x = max_x.max(r_odom.pose.pose.position.x as f32);
+                max_y = max_y.max(r_odom.pose.pose.position.y as f32);
+            }
+            if let Some(r_plan) = &r_state.plan {
+                for wp in &r_plan.waypoints {
+                    min_x = min_x.min(wp.position[0]);
+                    min_y = min_y.min(wp.position[1]);
+                    max_x = max_x.max(wp.position[0]);
+                    max_y = max_y.max(wp.position[1]);
+                }
             }
         }
 
@@ -446,34 +467,62 @@ impl PlanExecutor {
         let mut footprints = Vec::new();
         let mut current_positions = Vec::new();
 
-        for (r_name, r_state) in &self.active_robots {
-            let r_plan = r_state.plan.as_ref().unwrap();
-            let r_odom = r_state.latest_odom.as_ref().unwrap();
+        let mut sorted_names: Vec<String> = self.active_robots.keys().cloned().collect();
+        sorted_names.sort();
 
-            let traj_poses: Vec<Isometry2<f32>> = r_plan
-                .waypoints
-                .iter()
-                .map(|wp| {
-                    Isometry2::new(
-                        Vector2::new(
-                            wp.position[0] - self.grid_origin.position.x as f32,
-                            wp.position[1] - self.grid_origin.position.y as f32,
-                        ),
-                        0.0,
-                    )
-                })
-                .collect();
+        for r_name in &sorted_names {
+            let r_state = &self.active_robots[r_name];
+            let traj_poses: Vec<Isometry2<f32>> = if let Some(r_plan) = &r_state.plan {
+                r_plan
+                    .waypoints
+                    .iter()
+                    .map(|wp| {
+                        Isometry2::new(
+                            Vector2::new(
+                                wp.position[0] - self.grid_origin.position.x as f32,
+                                wp.position[1] - self.grid_origin.position.y as f32,
+                            ),
+                            0.0,
+                        )
+                    })
+                    .collect()
+            } else if let Some(r_odom) = &r_state.latest_odom {
+                vec![Isometry2::new(
+                    Vector2::new(
+                        r_odom.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
+                        r_odom.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
+                    ),
+                    0.0,
+                )]
+            } else {
+                continue;
+            };
+
             trajectories.push(mapf_post::Trajectory { poses: traj_poses });
             footprints.push(Arc::new(mapf_post::shape::Ball::new(r_state.radius))
                 as Arc<dyn mapf_post::shape::Shape>);
 
-            let semantic_position = semantic_waypoints.get(r_name).cloned().unwrap();
-            current_positions.push(CurrentPosition {
-                semantic_position,
-                real_position: (
+            let semantic_position =
+                semantic_waypoints
+                    .get(r_name)
+                    .cloned()
+                    .unwrap_or(mapf_post::SemanticWaypoint {
+                        agent: trajectories.len() - 1,
+                        trajectory_index: 0,
+                    });
+
+            let real_position = if let Some(r_odom) = &r_state.latest_odom {
+                (
                     r_odom.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
                     r_odom.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
-                ),
+                )
+            } else {
+                (0.0, 0.0)
+            };
+
+            current_positions.push(CurrentPosition {
+                semantic_position,
+                real_position,
             });
         }
 
@@ -552,21 +601,6 @@ impl PlanExecutor {
             self.safezone_publishers
                 .insert(robot_id.to_string(), publisher);
         }
-    }
-
-    fn ready_to_execute(&self) -> bool {
-        if self.active_robots.is_empty() {
-            return false;
-        }
-        for state in self.active_robots.values() {
-            if state.plan.is_none()
-                || state.latest_odom.is_none()
-                || state.waypoint_follower.is_none()
-            {
-                return false;
-            }
-        }
-        true
     }
 
     pub fn to_costmap_msg(
@@ -730,6 +764,60 @@ mod tests {
                 assert_eq!(plan_executor.grid_resolution, 0.05);
                 assert_eq!(plan_executor.grid_origin.position.x, -15.0);
                 assert_eq!(plan_executor.grid_origin.position.y, -10.0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_uncommanded_robot_execution() {
+        use crate::PlanExecutor;
+        use rclrs::{Context, CreateBasicExecutor};
+        use ros_env::nav_msgs::msg::Odometry;
+        use ros_env::rmf_prototype_msgs::msg::{Plan, Waypoint};
+
+        if let Ok(context) = Context::default_from_env() {
+            let executor = context.create_basic_executor();
+            if let Ok(node) = executor.create_node("test_uncommanded_robot_node") {
+                let mut plan_executor = PlanExecutor::new(node);
+
+                // Add two robots
+                plan_executor.handle_robot_added("robot_1", 0.5);
+                plan_executor.handle_robot_added("robot_2", 0.5);
+
+                // Send odometry for both robots
+                let mut odom1 = Odometry::default();
+                odom1.pose.pose.position.x = 0.0;
+                odom1.pose.pose.position.y = 0.0;
+                plan_executor.handle_odometry("robot_1", odom1.clone());
+
+                let mut odom2 = Odometry::default();
+                odom2.pose.pose.position.x = 5.0;
+                odom2.pose.pose.position.y = 5.0;
+                plan_executor.handle_odometry("robot_2", odom2.clone());
+
+                // Only give a plan to robot_1. robot_2 remains uncommanded!
+                let mut plan1 = Plan::default();
+                let mut wp0 = Waypoint::default();
+                wp0.position = vec![0.0, 0.0].try_into().unwrap();
+                let mut wp1 = Waypoint::default();
+                wp1.position = vec![2.0, 0.0].try_into().unwrap();
+                plan1.waypoints = vec![wp0, wp1];
+
+                plan_executor.handle_plan("robot_1", plan1);
+
+                // robot_1 odometry arrives: it should execute without error even though robot_2 has no plan!
+                plan_executor.handle_odometry("robot_1", odom1);
+
+                // Verify robot_1 published plan release and safe zone
+                assert!(plan_executor
+                    .plan_release_publishers
+                    .contains_key("robot_1"));
+                assert!(plan_executor.safezone_publishers.contains_key("robot_1"));
+
+                // robot_2 has no plan, so it does not create publishers
+                assert!(!plan_executor
+                    .plan_release_publishers
+                    .contains_key("robot_2"));
             }
         }
     }
