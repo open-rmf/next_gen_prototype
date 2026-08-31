@@ -81,7 +81,8 @@ class MockRobotSimNode(Node):
         discovery_qos = QoSProfile(
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            history=HistoryPolicy.KEEP_LAST
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
         )
 
         reliable_transient_qos = QoSProfile(
@@ -95,7 +96,7 @@ class MockRobotSimNode(Node):
         self.odom_pub = self.create_publisher(
             Odometry,
             f'{self.robot_name}/odom',
-            qos_profile=reliable_transient_qos
+            qos_profile=10
         )
 
         self.progress_pub = self.create_publisher(

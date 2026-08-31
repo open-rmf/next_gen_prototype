@@ -51,10 +51,11 @@ graph TD
 - **`async_request_new_goal`**: An asynchronous service that sends a new `NavigateToPose` goal to Nav2.
 - **`update_goal_client`**: Updates the `InnerNavigationClient` component with the new goal handle.
 - **`async_monitor_ongoing_navigation`**: Monitors the progress of the navigation goal, handling feedback and final results (Succeeded, Aborted, Cancelled).
-- **`process_navigation_result`**: Processes the final result of the navigation request. If aborted, it prepares to retry by requesting a new goal; otherwise, it passes the result for cleanup.
+- **`process_navigation_result`**: Publishes `CODE_PATH_BLOCKED` for an aborted current goal and ignores results from superseded goals.
 - **`cleanup_goal_client`**: Cleans up the goal client state in the component upon completion or failure.
 - **`log_inner_navigation_error`**: Logs any errors encountered during goal cancellation or request.
 
+An unchanged incremental target is resent when it belongs to a new plan, while cancellation or abort results from an older goal cannot trigger another replan.
 
 ## NavigationServices Workflow Diagram
 

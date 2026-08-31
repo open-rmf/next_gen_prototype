@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rmf_layered_map_server_demo</name>
+  <version>0.0.1</version>
+  <description>Demo launch tools for the RMF layered map server.</description>
+  <maintainer email="arjoc@intrinsic.ai">Arjo Chakravarty</maintainer>
+  <license>Apache License 2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>action_msgs</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>lifecycle_msgs</exec_depend>
+  <exec_depend>gz_tools_vendor</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>nav2_common</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>rmf_layered_map_msgs</exec_depend>
+  <exec_depend>rmf_layered_map_server</exec_depend>
+  <exec_depend>rmf_nav2_traffic</exec_depend>
+  <exec_depend>rmf_path_server</exec_depend>
+  <exec_depend>rmf_path_visualizer</exec_depend>
+  <exec_depend>rmf_plan_executor</exec_depend>
+  <exec_depend>rmf_simple_destination_server</exec_depend>
+  <exec_depend>rmf_prototype_msgs</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>sp_demo_nav2_bringup</exec_depend>
+  <exec_depend>tf2_ros_py</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

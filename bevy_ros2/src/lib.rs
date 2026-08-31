@@ -75,7 +75,7 @@ impl<T: MessageIDL + Debug> RosSubscription<T> {
 
         let subscriber = node
             .create_subscription(
-                topic.clone().reliable().transient_local().keep_all(),
+                topic.clone().reliable().transient_local().keep_last(10),
                 move |msg: T| {
                     debug!("Received a message on [{}]: {:?}", topic, msg);
                     *data_clone.lock().unwrap() = Some(msg.clone());
@@ -110,7 +110,7 @@ impl<T: MessageIDL + Debug> RosPublisher<T> {
 
     pub fn new_transient_local(node: &Arc<NodeState>, topic: String) -> Self {
         let publisher = node
-            .create_publisher(topic.reliable().transient_local().keep_all())
+            .create_publisher(topic.reliable().transient_local().keep_last(10))
             .unwrap();
 
         Self { publisher }

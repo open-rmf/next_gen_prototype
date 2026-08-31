@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+const MIN_PLANNING_RESOLUTION: f32 = 1.0;
+
 #[derive(Clone, Debug, Default)]
 pub struct Map {
     pub grid: OccupancyGrid,
@@ -81,6 +83,44 @@ impl PibtPlanner {
     }
 }
 
+fn planning_grid(grid: &OccupancyGrid) -> (usize, usize, f32, f32, f32, Vec<Vec<usize>>) {
+    let source_width = grid.info.width as usize;
+    let source_height = grid.info.height as usize;
+    let source_resolution = grid.info.resolution;
+    let resolution = source_resolution.max(MIN_PLANNING_RESOLUTION);
+    let width = ((source_width as f32 * source_resolution) / resolution)
+        .ceil()
+        .max(1.0) as usize;
+    let height = ((source_height as f32 * source_resolution) / resolution)
+        .ceil()
+        .max(1.0) as usize;
+    let mut cells = vec![vec![0; height]; width];
+
+    for source_x in 0..source_width {
+        for source_y in 0..source_height {
+            let value = grid
+                .data
+                .get(source_y * source_width + source_x)
+                .copied()
+                .unwrap_or(-1);
+            if value > 50 || value == -1 {
+                let x = ((source_x as f32 * source_resolution) / resolution).floor() as usize;
+                let y = ((source_y as f32 * source_resolution) / resolution).floor() as usize;
+                cells[x.min(width - 1)][y.min(height - 1)] = 1;
+            }
+        }
+    }
+
+    (
+        width,
+        height,
+        resolution,
+        grid.info.origin.position.x as f32,
+        grid.info.origin.position.y as f32,
+        cells,
+    )
+}
+
 impl MapfPlanner for PibtPlanner {
     fn plan(
         &self,
@@ -99,20 +139,7 @@ impl MapfPlanner for PibtPlanner {
             map.grid.info.width > 0 && map.grid.info.height > 0 && map.grid.info.resolution > 0.0;
 
         let (width, height, resolution, offset_x, offset_y, grid) = if use_map {
-            let w = map.grid.info.width as usize;
-            let h = map.grid.info.height as usize;
-            let r = map.grid.info.resolution;
-            let ox = map.grid.info.origin.position.x as f32;
-            let oy = map.grid.info.origin.position.y as f32;
-
-            let mut g = vec![vec![0; h]; w];
-            for x in 0..w {
-                for y in 0..h {
-                    let ros_val = map.grid.data[y * w + x];
-                    g[x][y] = if ros_val > 50 || ros_val == -1 { 1 } else { 0 };
-                }
-            }
-            (w, h, r, ox, oy, g)
+            planning_grid(&map.grid)
         } else {
             let mut min_x = f32::MAX;
             let mut min_y = f32::MAX;
@@ -586,5 +613,47 @@ impl MapfPlanner for CcbsPlanner {
         }
 
         Ok(trajectories)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fine_occupancy_cells_are_conservatively_downsampled() {
+        let mut map = OccupancyGrid::default();
+        map.info.resolution = 0.25;
+        map.info.width = 8;
+        map.info.height = 4;
+        map.info.origin.position.x = -1.0;
+        map.info.origin.position.y = -2.0;
+        map.data = vec![0; 32];
+        map.data[2 * 8 + 5] = 100;
+
+        let (width, height, resolution, offset_x, offset_y, cells) = planning_grid(&map);
+
+        assert_eq!(width, 2);
+        assert_eq!(height, 1);
+        assert_eq!(resolution, 1.0);
+        assert_eq!(offset_x, -1.0);
+        assert_eq!(offset_y, -2.0);
+        assert_eq!(cells, vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn native_grid_is_kept_when_it_is_already_coarse() {
+        let mut map = OccupancyGrid::default();
+        map.info.resolution = 2.0;
+        map.info.width = 2;
+        map.info.height = 2;
+        map.data = vec![0, 100, 0, 0];
+
+        let (width, height, resolution, _, _, cells) = planning_grid(&map);
+
+        assert_eq!(width, 2);
+        assert_eq!(height, 2);
+        assert_eq!(resolution, 2.0);
+        assert_eq!(cells, vec![vec![0, 0], vec![1, 0]]);
     }
 }

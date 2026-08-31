@@ -1,9 +1,9 @@
 # Path Server
 
-This folder contains a path server implementation. It works by triggering a replan any time a new destination event comes in. The replan should only include robots that are actively moving.
+This folder contains the path server and plan executor. The path server plans for new destinations and replans active robots that report `PlanError.CODE_PATH_BLOCKED`.
 
 Planners supported:
-- `pibt-grid-world` (default): Grid-world PIBT with external tracks
+- `pibt-grid-world` (default): Grid-world PIBT with external tracks (conservatively downsamples maps finer than `1.0 m`)
 - `ccbs`: Continuous Conflict-Based Search (CCBS) with SIPP single-agent routing
 
 ## Path Server Demo Dashboard

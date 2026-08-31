@@ -1,4 +1,4 @@
-use crate::Nav2Agent;
+use crate::{safe_zone::PlanErrorPublisher, Nav2Agent};
 use bevy::prelude::*;
 use bevy_ros2::{RclrsExecutorCommands, RclrsNode, RosActionClient};
 use crossflow::{prelude::*, service::Service};
@@ -40,6 +40,7 @@ impl InnerNavigationTarget {
 pub struct ActiveInnerGoal {
     pub goal_client: GoalClient<NavigateToPose>,
     pub safe_zone_id: SafeZoneId,
+    superseded: bool,
 }
 
 impl ActiveInnerGoal {
@@ -47,6 +48,7 @@ impl ActiveInnerGoal {
         Self {
             goal_client,
             safe_zone_id,
+            superseded: false,
         }
     }
 
@@ -60,6 +62,14 @@ impl ActiveInnerGoal {
 
     pub fn id(&self) -> &SafeZoneId {
         &self.safe_zone_id
+    }
+
+    pub fn is_superseded(&self) -> bool {
+        self.superseded
+    }
+
+    pub fn mark_superseded(&mut self) {
+        self.superseded = true;
     }
 }
 
@@ -377,7 +387,7 @@ fn await_external_cancellation(
     srv: ContinuousService<(), (), StreamOf<CancelInnerNavigation>>,
     mut orders: ContinuousQuery<(), (), StreamOf<CancelInnerNavigation>>,
     mut cancel_requests: EventReader<CancelInnerForAgent>,
-    inner_nav_clients: Query<&InnerNavigationClient>,
+    mut inner_nav_clients: Query<&mut InnerNavigationClient>,
 ) {
     let Some(mut orders) = orders.get_mut(&srv.key) else {
         return;
@@ -391,14 +401,14 @@ fn await_external_cancellation(
             "Received external cancellation request for agent {:?}",
             request.agent.index()
         );
-        let Some(existing_goal) = inner_nav_clients
-            .get(request.agent)
-            .ok()
-            .and_then(|inner_client| inner_client.goal().as_ref())
-        else {
+        let Ok(mut inner_client) = inner_nav_clients.get_mut(request.agent) else {
             continue;
         };
-        let client = existing_goal.client();
+        let Some(existing_goal) = inner_client.goal_mut().as_mut() else {
+            continue;
+        };
+        existing_goal.mark_superseded();
+        let client = existing_goal.client().clone();
         orders.for_each(|order| {
             order.streams().send(CancelInnerNavigation {
                 agent: request.agent,
@@ -423,16 +433,15 @@ enum CheckExistingGoalResult {
 /// workflow can proceed to request a new goal without cancellation.
 fn check_existing_goal(
     Blocking { request, .. }: Blocking<InnerNavigationRequest>,
-    inner_nav_clients: Query<&InnerNavigationClient>,
+    mut inner_nav_clients: Query<&mut InnerNavigationClient>,
 ) -> Result<CheckExistingGoalResult, InnerNavigationError> {
     // TODO(@xiyuoh) Create a replan mechanism instead of cancelling goal on every
     // new request
     let mut replan_and_cancel = false;
-    let Some(existing_goal) = inner_nav_clients
-        .get(request.agent)
-        .ok()
-        .and_then(|inner_client| inner_client.goal().as_ref())
-    else {
+    let Ok(mut inner_client) = inner_nav_clients.get_mut(request.agent) else {
+        return Ok(CheckExistingGoalResult::NoExistingGoal(request));
+    };
+    let Some(existing_goal) = inner_client.goal_mut().as_mut() else {
         // No existing goal, proceed to request for new goal
         return Ok(CheckExistingGoalResult::NoExistingGoal(request));
     };
@@ -453,14 +462,15 @@ fn check_existing_goal(
         replan_and_cancel = true;
     }
 
-    let client = existing_goal.client();
-
     if replan_and_cancel {
+        // Do not treat cancellation of this goal as a new blockage.
+        existing_goal.mark_superseded();
+        let client = existing_goal.client().clone();
         return Ok(CheckExistingGoalResult::ReplanAndCancel(
             CancelInnerNavigation {
                 agent: request.agent,
                 new_request: Some(request),
-                cancel_client: client.clone(),
+                cancel_client: client,
             },
         ));
     }
@@ -725,6 +735,7 @@ fn process_navigation_result(
     }: Blocking<InnerNavigationResult>,
     mut cancelling_inner: Query<&mut CancellingInnerNavigation>,
     inner_nav_clients: Query<&InnerNavigationClient>,
+    plan_error_publishers: Query<&PlanErrorPublisher>,
 ) -> Result<InnerNavigationRequest, InnerNavigationResult> {
     match result {
         Ok(_) => return Err(result),
@@ -734,26 +745,50 @@ fn process_navigation_result(
                     return Err(result);
                 };
                 let target = &handle.request;
-                let target_pose = target.target_pose.clone();
+                let active_goal = inner_nav_clients
+                    .get(target.agent)
+                    .ok()
+                    .and_then(|inner_client| inner_client.goal().as_ref());
 
-                if let Ok(inner_nav_client) = inner_nav_clients.get(target.agent) {
-                    if let Some(active_goal) = inner_nav_client.goal() {
-                        if active_goal.id() != &target.safe_zone_id {
-                            debug!(
-                                "[{:?}] Aborted goal is stale, not retrying",
+                if !should_publish_path_blocked(
+                    &target.safe_zone_id,
+                    active_goal.map(|goal| (goal.id(), goal.is_superseded())),
+                ) {
+                    info!(
+                        "[{:?}] Ignoring stale Nav2 abort {:?}",
+                        target.agent.index(),
+                        target.safe_zone_id,
+                    );
+                    return Err(result);
+                }
+
+                if let Ok(publisher) = plan_error_publishers.get(target.agent) {
+                    let plan_error = ros_env::rmf_prototype_msgs::msg::PlanError {
+                        error: ros_env::rmf_prototype_msgs::msg::Error {
+                            code: ros_env::rmf_prototype_msgs::msg::PlanError::CODE_PATH_BLOCKED,
+                            message: format!(
+                                "Nav2 goal aborted for agent {:?}: path blocked within safe zone",
                                 target.agent.index()
-                            );
-                            return Err(result);
-                        }
+                            ),
+                            parameters: String::new(),
+                        },
+                        plan_id: handle.request.safe_zone_id.plan_id.clone(),
+                    };
+                    if let Err(e) = publisher.publisher.publish(plan_error) {
+                        error!(
+                            "Failed to publish PlanError for agent {:?}: {:?}",
+                            target.agent.index(),
+                            e
+                        );
+                    } else {
+                        warn!(
+                            "[{:?}] Goal aborted by Nav2! Published PlanError CODE_PATH_BLOCKED to ~/plan/error.",
+                            target.agent.index()
+                        );
                     }
                 }
 
-                debug!("[{:?}] Goal aborted. Retrying", target.agent.index());
-                return Ok(InnerNavigationRequest {
-                    agent: target.agent,
-                    safe_zone_id: target.safe_zone_id.clone(),
-                    target_pose,
-                });
+                return Err(result);
             }
             InnerNavigationErrorKind::GoalCancelledError => {
                 // Only mark cancellation success for external cancellation
@@ -772,6 +807,16 @@ fn process_navigation_result(
         },
     }
     return Err(result);
+}
+
+fn should_publish_path_blocked(
+    completed_goal_id: &SafeZoneId,
+    active_goal: Option<(&SafeZoneId, bool)>,
+) -> bool {
+    matches!(
+        active_goal,
+        Some((active_goal_id, false)) if active_goal_id == completed_goal_id
+    )
 }
 
 /// Clears existing goal clients for this agent after verifying that the
@@ -803,9 +848,8 @@ fn cleanup_goal_client(
         if is_current {
             inner_nav_client.reset_goal();
         } else {
-            warn!(
-                "[{:?}] Found an incompatible SafeZoneId {:?} while attempting
-                to cleanup goal client!",
+            debug!(
+                "[{:?}] Ignoring stale Nav2 goal cleanup {:?}",
                 handle.request.agent.index(),
                 handle.request.safe_zone_id,
             );
@@ -815,5 +859,67 @@ fn cleanup_goal_client(
             "[{:?}] InnerNavigationClient not found!",
             handle.request.agent.index()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn safe_zone_id(session: u8, plan_version: u64, safe_zone_version: u64) -> SafeZoneId {
+        let mut id = SafeZoneId::default();
+        id.plan_id.destination_session.uuid[0] = session;
+        id.plan_id.plan_version = plan_version;
+        id.safe_zone_version = safe_zone_version;
+        id
+    }
+
+    #[test]
+    fn current_abort_publishes_path_blocked() {
+        let completed = safe_zone_id(1, 3, 7);
+
+        assert!(should_publish_path_blocked(
+            &completed,
+            Some((&completed, false)),
+        ));
+    }
+
+    #[test]
+    fn intentionally_superseded_abort_is_ignored() {
+        let completed = safe_zone_id(1, 3, 7);
+
+        assert!(!should_publish_path_blocked(
+            &completed,
+            Some((&completed, true)),
+        ));
+    }
+
+    #[test]
+    fn abort_from_older_plan_is_ignored() {
+        let completed = safe_zone_id(1, 3, 7);
+        let active = safe_zone_id(1, 4, 1);
+
+        assert!(!should_publish_path_blocked(
+            &completed,
+            Some((&active, false)),
+        ));
+    }
+
+    #[test]
+    fn abort_from_older_safe_zone_is_ignored() {
+        let completed = safe_zone_id(1, 3, 7);
+        let active = safe_zone_id(1, 3, 8);
+
+        assert!(!should_publish_path_blocked(
+            &completed,
+            Some((&active, false)),
+        ));
+    }
+
+    #[test]
+    fn abort_without_an_active_goal_is_ignored() {
+        let completed = safe_zone_id(1, 3, 7);
+
+        assert!(!should_publish_path_blocked(&completed, None));
     }
 }

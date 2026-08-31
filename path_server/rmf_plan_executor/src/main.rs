@@ -172,7 +172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/destination/discovery"
             .transient_local()
             .reliable()
-            .keep_all(),
+            .keep_last(10),
         move |executor: &mut PlanExecutor, msg: ParticipantList| {
             let (added, removed) = tracker.update(&msg);
             for robot_id in removed {
@@ -204,7 +204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let plan_topic = robot_id.to_string() + "/plan";
 
                 let odom_sub = match server.executor_worker.create_subscription::<Odometry, _>(
-                    odom_topic.as_str(),
+                    odom_topic.as_str().reliable(),
                     move |executor: &mut PlanExecutor, msg: Odometry| {
                         executor.handle_odometry(&robot_id_clone, msg);
                     },

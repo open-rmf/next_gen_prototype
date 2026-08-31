@@ -72,7 +72,7 @@ fn test_map_subscription() -> Result<(), Box<dyn std::error::Error>> {
 
     let robot_id = "robot1";
     let odom_topic = format!("{}/odom", robot_id);
-    let odom_pub = test_node.create_publisher::<Odometry>(odom_topic.as_str())?;
+    let odom_pub = test_node.create_publisher::<Odometry>(odom_topic.as_str().reliable())?;
     let dest_topic = format!("{}/destination", robot_id);
     let dest_pub = test_node
         .create_publisher::<Destination>(dest_topic.as_str().transient_local().reliable())?;

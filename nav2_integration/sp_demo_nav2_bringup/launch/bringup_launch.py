@@ -49,6 +49,7 @@ def generate_launch_description():
     use_respawn = LaunchConfiguration('use_respawn')
     log_level = LaunchConfiguration('log_level')
     use_localization = LaunchConfiguration('use_localization')
+    use_navigation = LaunchConfiguration('use_navigation')
 
     # Map fully qualified names to relative ones so the node's namespace can be prepended.
     # In case of the transforms (tf), currently, there doesn't seem to be a better alternative
@@ -103,6 +104,11 @@ def generate_launch_description():
     declare_use_localization_cmd = DeclareLaunchArgument(
         'use_localization', default_value='True',
         description='Whether to enable localization or not'
+    )
+
+    declare_use_navigation_cmd = DeclareLaunchArgument(
+        'use_navigation', default_value='True',
+        description='Whether to enable the Nav2 planning and control stack'
     )
 
     declare_use_sim_time_cmd = DeclareLaunchArgument(
@@ -186,6 +192,7 @@ def generate_launch_description():
                 PythonLaunchDescriptionSource(
                     os.path.join(launch_dir, 'navigation_launch.py')
                 ),
+                condition=IfCondition(use_navigation),
                 launch_arguments={
                     'namespace': namespace,
                     'use_sim_time': use_sim_time,
@@ -217,6 +224,7 @@ def generate_launch_description():
     ld.add_action(declare_use_respawn_cmd)
     ld.add_action(declare_log_level_cmd)
     ld.add_action(declare_use_localization_cmd)
+    ld.add_action(declare_use_navigation_cmd)
 
     # Add the actions to launch all of the navigation nodes
     ld.add_action(bringup_cmd_group)
