@@ -13,16 +13,27 @@
 # limitations under the License.
 
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
+    declare_planner = DeclareLaunchArgument(
+        'planner',
+        default_value='pibt-grid-world',
+        description='MAPF Planner to use: pibt-grid-world or ccbs',
+        choices=['pibt-grid-world', 'pibt', 'ccbs'],
+    )
+
     # 1. Start the RMF path server
     path_server = Node(
         package='rmf_path_server',
         executable='rmf_path_server',
         name='rmf_path_server',
-        output='both'
+        output='both',
+        parameters=[{'planner': LaunchConfiguration('planner')}],
+        arguments=['--planner', LaunchConfiguration('planner')],
     )
 
     # 2. Start the web spawner & web dashboard hosting server (REST & SSE Bridge)
@@ -30,7 +41,7 @@ def generate_launch_description():
         package='rmf_path_server_demo',
         executable='robot_spawner',
         name='robot_spawner',
-        output='both'
+        output='both',
     )
 
     # 3. Start the plan executor
@@ -38,11 +49,12 @@ def generate_launch_description():
         package='rmf_plan_executor',
         executable='rmf_plan_executor',
         name='rmf_plan_executor',
-        output='both'
+        output='both',
     )
 
     return LaunchDescription([
+        declare_planner,
         path_server,
         robot_spawner,
-        plan_executor
+        plan_executor,
     ])

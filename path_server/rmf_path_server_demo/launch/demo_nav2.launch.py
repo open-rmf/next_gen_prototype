@@ -32,6 +32,7 @@ def generate_launch_description():
     )
     config_file = LaunchConfiguration('config_file')
     destination_server = LaunchConfiguration('destination_server')
+    planner = LaunchConfiguration('planner')
     declare_destination_server = DeclareLaunchArgument(
         'destination_server',
         default_value='reservation',
@@ -46,13 +47,21 @@ def generate_launch_description():
         description='Reservation config the destination server loads '
                     '(*.yaml, *.site.json, or *.building.yaml).',
     )
+    declare_planner = DeclareLaunchArgument(
+        'planner',
+        default_value='pibt-grid-world',
+        description='MAPF Planner to use: pibt-grid-world or ccbs',
+        choices=['pibt-grid-world', 'pibt', 'ccbs'],
+    )
 
     # 1. Start the RMF path server
     path_server = Node(
         package='rmf_path_server',
         executable='rmf_path_server',
         name='rmf_path_server',
-        output='both'
+        output='both',
+        parameters=[{'planner': planner}],
+        arguments=['--planner', planner],
     )
 
     # 2. Start the visualizer node
@@ -104,6 +113,7 @@ def generate_launch_description():
     return LaunchDescription([
         declare_destination_server,
         declare_config_file,
+        declare_planner,
         path_server,
         visualizer_node,
         simple_destination_server,
