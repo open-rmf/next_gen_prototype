@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             upper: Some(f32::MAX as f64),
             step: None,
         })
-        .description("Minimum PIBT grid-cell size in metres")
+        .description("Minimum PiBT grid cell size in meters")
         .read_only()?;
     let planner = PibtPlanner::with_grid_resolution(100, planning_grid_resolution.get())?;
 
