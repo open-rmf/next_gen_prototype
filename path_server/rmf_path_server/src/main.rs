@@ -13,10 +13,7 @@
 // limitations under the License.
 
 use rclrs::{Context, CreateBasicExecutor, ParameterRange, SpinOptions};
-use rmf_path_server::{
-    start_path_server_with_robot_footprint_radius, PibtPlanner, DEFAULT_PLANNING_GRID_RESOLUTION,
-    DEFAULT_ROBOT_FOOTPRINT_RADIUS,
-};
+use rmf_path_server::{start_path_server, PibtPlanner, DEFAULT_PLANNING_GRID_RESOLUTION};
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,23 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .description("Minimum PIBT grid-cell size in metres")
         .read_only()?;
-    let robot_footprint_radius = node
-        .declare_parameter("robot_footprint_radius")
-        .default(DEFAULT_ROBOT_FOOTPRINT_RADIUS)
-        .range(ParameterRange {
-            lower: Some(f32::MIN_POSITIVE as f64),
-            upper: Some(f32::MAX as f64),
-            step: None,
-        })
-        .description("Circular robot footprint radius in metres used for conflict checking")
-        .read_only()?;
     let planner = PibtPlanner::with_grid_resolution(100, planning_grid_resolution.get())?;
 
-    let _path_server_guard = start_path_server_with_robot_footprint_radius(
-        Arc::clone(&node),
-        planner,
-        robot_footprint_radius.get() as f32,
-    )?;
+    let _path_server_guard = start_path_server(Arc::clone(&node), planner)?;
 
     rclrs::log!(
         node.logger(),

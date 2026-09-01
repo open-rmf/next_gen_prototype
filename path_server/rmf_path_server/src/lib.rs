@@ -29,8 +29,6 @@ use std::{
 pub mod planner;
 pub use planner::{Map, MapfPlanner, MockPlanner, PibtPlanner, DEFAULT_PLANNING_GRID_RESOLUTION};
 
-pub const DEFAULT_ROBOT_FOOTPRINT_RADIUS: f64 = 0.49;
-
 pub struct PlanSuccess {
     pub session_id: u64,
     pub basic_plan: Vec<Vec<Isometry2<f32>>>,
@@ -61,7 +59,6 @@ pub struct PlanServer<P: MapfPlanner> {
     pub footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
     pub active_plan_ids: HashMap<String, PlanId>,
     pub map: Arc<Map>,
-    pub default_robot_footprint_radius: f32,
 }
 
 impl<P: MapfPlanner> PlanServer<P> {
@@ -69,20 +66,6 @@ impl<P: MapfPlanner> PlanServer<P> {
         node: Node,
         planner: P,
         footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
-    ) -> Self {
-        Self::with_robot_footprint_radius(
-            node,
-            planner,
-            footprints,
-            DEFAULT_ROBOT_FOOTPRINT_RADIUS as f32,
-        )
-    }
-
-    pub fn with_robot_footprint_radius(
-        node: Node,
-        planner: P,
-        footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
-        default_robot_footprint_radius: f32,
     ) -> Self {
         let (plan_sender, plan_receiver) = std::sync::mpsc::channel();
         Self {
@@ -101,7 +84,6 @@ impl<P: MapfPlanner> PlanServer<P> {
             footprints,
             active_plan_ids: HashMap::new(),
             map: Arc::new(Map::default()),
-            default_robot_footprint_radius,
         }
     }
 
@@ -361,7 +343,6 @@ impl<P: MapfPlanner> PlanServer<P> {
         let footprints_clone = Arc::clone(&self.footprints);
         let sender_clone = self.plan_sender.clone();
         let map_clone = self.map.clone();
-        let default_robot_footprint_radius = self.default_robot_footprint_radius;
 
         std::thread::spawn(move || {
             if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
@@ -374,8 +355,8 @@ impl<P: MapfPlanner> PlanServer<P> {
                     .iter()
                     .map(|id| {
                         let radius = match guard.as_ref() {
-                            Ok(map) => *map.get(id).unwrap_or(&default_robot_footprint_radius),
-                            Err(_) => default_robot_footprint_radius,
+                            Ok(map) => *map.get(id).unwrap_or(&0.49),
+                            Err(_) => 0.49,
                         };
                         (
                             id.clone(),
@@ -538,28 +519,12 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
     node: rclrs::Node,
     planner: P,
 ) -> Result<PathServerRunning<P>, Box<dyn std::error::Error>> {
-    start_path_server_with_robot_footprint_radius(
-        node,
-        planner,
-        DEFAULT_ROBOT_FOOTPRINT_RADIUS as f32,
-    )
-}
-
-pub fn start_path_server_with_robot_footprint_radius<P: MapfPlanner + 'static>(
-    node: rclrs::Node,
-    planner: P,
-    robot_footprint_radius: f32,
-) -> Result<PathServerRunning<P>, Box<dyn std::error::Error>> {
     let footprints = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let footprints_clone = Arc::clone(&footprints);
 
     // Create the Destinations worker
-    let destinations_worker = node.create_worker(PlanServer::with_robot_footprint_radius(
-        node.clone(),
-        planner,
-        footprints,
-        robot_footprint_radius,
-    ));
+    let destinations_worker =
+        node.create_worker(PlanServer::new(node.clone(), planner, footprints));
 
     let map_subscription = destinations_worker.create_subscription::<OccupancyGrid, _>(
         "/map".transient_local().reliable(),
@@ -591,7 +556,7 @@ pub fn start_path_server_with_robot_footprint_radius<P: MapfPlanner + 'static>(
                   msg: rmf_prototype_msgs::msg::ParticipantList| {
                 if let Ok(mut map) = footprints_clone2.lock() {
                     for p in msg.participants {
-                        map.insert(p.name, robot_footprint_radius);
+                        map.insert(p.name, 0.49);
                     }
                 }
             },
