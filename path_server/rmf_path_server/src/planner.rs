@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-pub const DEFAULT_PLANNING_GRID_RESOLUTION: f64 = 1.0;
+pub(crate) const DEFAULT_PLANNING_GRID_RESOLUTION: f64 = 1.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct Map {

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use rclrs::{Context, CreateBasicExecutor, ParameterRange, SpinOptions};
-use rmf_path_server::{start_path_server, PibtPlanner, DEFAULT_PLANNING_GRID_RESOLUTION};
+use rmf_path_server::{start_path_server, PibtPlanner};
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let planning_grid_resolution = node
         .declare_parameter("planning_grid_resolution")
-        .default(DEFAULT_PLANNING_GRID_RESOLUTION)
+        .default(PibtPlanner::default().grid_resolution as f64)
         .range(ParameterRange {
             lower: Some(f32::MIN_POSITIVE as f64),
             upper: Some(f32::MAX as f64),
