@@ -20,14 +20,14 @@ import socketserver
 import subprocess
 import sys
 import threading
-import time
+from urllib.parse import parse_qs, urlparse
 
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import Point
-from nav_msgs.msg import Odometry, OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rmf_next_gen_reservation_msgs.msg import ReservationConfig
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
@@ -40,7 +40,6 @@ from rmf_prototype_msgs.msg import (
     Region,
     TargetRegion,
 )
-from rmf_next_gen_reservation_msgs.msg import ReservationConfig
 
 
 # Global node reference for the HTTP request handler to access
@@ -53,12 +52,12 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
-    def log_message(self, format, *args):
+    def log_message(self, fmt, *args):
         # Direct server logs to ROS logger instead of stderr
         if spawner_node:
-            spawner_node.get_logger().info(f"HTTP: {format % args}")
+            spawner_node.get_logger().info(f'HTTP: {fmt % args}')
         else:
-            super().log_message(format, *args)
+            super().log_message(fmt, *args)
 
     def do_GET(self):
         global spawner_node
@@ -79,15 +78,15 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
                 while True:
                     try:
                         data = q.get(timeout=5.0)
-                        self.wfile.write(f"data: {data}\n\n".encode('utf-8'))
+                        self.wfile.write(f'data: {data}\n\n'.encode('utf-8'))
                         self.wfile.flush()
                     except queue.Empty:
                         # Send keep-alive comment to prevent connection timeouts
-                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.write(b': keep-alive\n\n')
                         self.wfile.flush()
             except Exception as e:
                 if spawner_node:
-                    spawner_node.get_logger().info(f"SSE Client disconnected: {e}")
+                    spawner_node.get_logger().info(f'SSE Client disconnected: {e}')
             finally:
                 if spawner_node:
                     spawner_node.remove_client(q)
@@ -95,7 +94,6 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         elif self.path.startswith('/spawn'):
             # Parse query parameters
-            from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
             name = query.get('name', [''])[0]
             x = float(query.get('x', [0.0])[0])
@@ -103,9 +101,9 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
 
             if spawner_node and name:
                 spawner_node.spawn_robot(name, x, y)
-                self.send_ok_response({"status": "spawned", "name": name, "radius": 0.49})
+                self.send_ok_response({'status': 'spawned', 'name': name, 'radius': 0.49})
             else:
-                self.send_error_response("Missing name or spawner node inactive")
+                self.send_error_response('Missing name or spawner node inactive')
             return
 
         elif self.path.startswith('/reservation_config'):
@@ -119,11 +117,10 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
             return
         elif self.path.startswith('/config'):
             use_dest = spawner_node.use_destination_server if spawner_node else False
-            self.send_ok_response({"default_radius": 0.49, "use_destination_server": use_dest})
+            self.send_ok_response({'default_radius': 0.49, 'use_destination_server': use_dest})
             return
 
         elif self.path.startswith('/destination'):
-            from urllib.parse import urlparse, parse_qs
             query = parse_qs(urlparse(self.path).query)
             name = query.get('name', [''])[0]
             x_str = query.get('x', [''])[0]
@@ -133,25 +130,25 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
                 xs = [float(val) for val in x_str.split(',')] if x_str else []
                 ys = [float(val) for val in y_str.split(',')] if y_str else []
                 spawner_node.set_goals(name, xs, ys)
-                self.send_ok_response({"status": "goals_set", "name": name})
+                self.send_ok_response({'status': 'goals_set', 'name': name})
             else:
-                self.send_error_response("Missing name or spawner node inactive")
+                self.send_error_response('Missing name or spawner node inactive')
             return
 
         elif self.path.startswith('/send_scenario'):
             if spawner_node:
                 spawner_node.send_scenario()
-                self.send_ok_response({"status": "scenario_sent"})
+                self.send_ok_response({'status': 'scenario_sent'})
             else:
-                self.send_error_response("Spawner node inactive")
+                self.send_error_response('Spawner node inactive')
             return
 
         elif self.path.startswith('/reset'):
             if spawner_node:
                 spawner_node.reset_scenario()
-                self.send_ok_response({"status": "reset"})
+                self.send_ok_response({'status': 'reset'})
             else:
-                self.send_error_response("Spawner node inactive")
+                self.send_error_response('Spawner node inactive')
             return
 
         # Otherwise serve static files
@@ -169,13 +166,13 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        self.wfile.write(json.dumps({"error": message}).encode('utf-8'))
+        self.wfile.write(json.dumps({'error': message}).encode('utf-8'))
 
 
 class RobotSpawnerNode(Node):
     def __init__(self):
         super().__init__('robot_spawner')
-        self.get_logger().info("Initializing Robot Spawner & HTTP Bridge Node...")
+        self.get_logger().info('Initializing Robot Spawner & HTTP Bridge Node...')
 
         # Parameters
         self.declare_parameter('use_destination_server', False)
@@ -245,25 +242,26 @@ class RobotSpawnerNode(Node):
             share_dir = get_package_share_directory('rmf_path_server_demo')
             self.web_dir = os.path.join(share_dir, 'www')
         except Exception as e:
-            self.get_logger().error(f"Failed to locate share directory: {e}")
-            self.web_dir = "./www"
+            self.get_logger().error(f'Failed to locate share directory: {e}')
+            self.web_dir = './www'
 
         # Start the HTTP server
         self.start_http_server(port=self.port)
 
     def start_http_server(self, port):
         def serve():
-            handler = lambda *args, **kwargs: DemoRequestHandler(
-                *args, directory=self.web_dir, **kwargs
-            )
+            def handler(*args, **kwargs):
+                return DemoRequestHandler(
+                    *args, directory=self.web_dir, **kwargs
+                )
             try:
-                with ThreadingHTTPServer(("", port), handler) as httpd:
+                with ThreadingHTTPServer(('', port), handler) as httpd:
                     self.get_logger().info(
-                        f"Web server running on http://localhost:{port}/ serving {self.web_dir}"
+                        f'Web server running on http://localhost:{port}/ serving {self.web_dir}'
                     )
                     httpd.serve_forever()
             except Exception as e:
-                self.get_logger().error(f"HTTP Server error: {e}")
+                self.get_logger().error(f'HTTP Server error: {e}')
 
         self.web_thread = threading.Thread(target=serve, daemon=True)
         self.web_thread.start()
@@ -272,13 +270,15 @@ class RobotSpawnerNode(Node):
     def add_client(self, q):
         with self.sse_clients_lock:
             self.sse_clients.append(q)
-            self.get_logger().info(f"New SSE Client registered. Total clients: {len(self.sse_clients)}")
+            self.get_logger().info(
+                f'New SSE Client registered. Total clients: {len(self.sse_clients)}')
 
     def remove_client(self, q):
         with self.sse_clients_lock:
             if q in self.sse_clients:
                 self.sse_clients.remove(q)
-                self.get_logger().info(f"SSE Client removed. Total clients: {len(self.sse_clients)}")
+                self.get_logger().info(
+                    f'SSE Client removed. Total clients: {len(self.sse_clients)}')
 
     def broadcast(self, data):
         with self.sse_clients_lock:
@@ -292,24 +292,24 @@ class RobotSpawnerNode(Node):
     def reservation_config_callback(self, msg):
         def region_to_dict(region):
             return {
-                "hint": int(region.hint),
-                "points": [float(point) for point in region.points],
+                'hint': int(region.hint),
+                'points': [float(point) for point in region.points],
             }
 
         config = {
-            "type": "reservation_config",
-            "grid_size": float(msg.grid_size),
-            "safe_sets": [
+            'type': 'reservation_config',
+            'grid_size': float(msg.grid_size),
+            'safe_sets': [
                 {
-                    "name": safe_set.name,
-                    "region": region_to_dict(safe_set.region),
+                    'name': safe_set.name,
+                    'region': region_to_dict(safe_set.region),
                 }
                 for safe_set in msg.safe_sets
             ],
-            "parking_spots": [
+            'parking_spots': [
                 {
-                    "name": spot.name,
-                    "region": region_to_dict(spot.region),
+                    'name': spot.name,
+                    'region': region_to_dict(spot.region),
                 }
                 for spot in msg.parking_spots
             ],
@@ -324,29 +324,30 @@ class RobotSpawnerNode(Node):
     def map_callback(self, msg):
         data_list = list(msg.data)
         map_dict = {
-            "type": "map",
-            "info": {
-                "resolution": float(msg.info.resolution),
-                "width": int(msg.info.width),
-                "height": int(msg.info.height),
-                "origin": {
-                    "position": {
-                        "x": float(msg.info.origin.position.x),
-                        "y": float(msg.info.origin.position.y),
-                        "z": float(msg.info.origin.position.z)
+            'type': 'map',
+            'info': {
+                'resolution': float(msg.info.resolution),
+                'width': int(msg.info.width),
+                'height': int(msg.info.height),
+                'origin': {
+                    'position': {
+                        'x': float(msg.info.origin.position.x),
+                        'y': float(msg.info.origin.position.y),
+                        'z': float(msg.info.origin.position.z)
                     },
-                    "orientation": {
-                        "x": float(msg.info.origin.orientation.x),
-                        "y": float(msg.info.origin.orientation.y),
-                        "z": float(msg.info.origin.orientation.z),
-                        "w": float(msg.info.origin.orientation.w)
+                    'orientation': {
+                        'x': float(msg.info.origin.orientation.x),
+                        'y': float(msg.info.origin.orientation.y),
+                        'z': float(msg.info.origin.orientation.z),
+                        'w': float(msg.info.origin.orientation.w)
                     }
                 }
             },
-            "data": data_list
+            'data': data_list
         }
         self.current_map = map_dict
         self.broadcast(json.dumps(map_dict))
+
     # Spawns a mock simulator node
     def spawn_robot(self, name, x, y):
         if name in self.active_processes:
@@ -388,7 +389,7 @@ class RobotSpawnerNode(Node):
             self.subscribe_to_destination_error(name)
 
         except Exception as e:
-            self.get_logger().error(f"Failed to spawn robot process: {e}")
+            self.get_logger().error(f'Failed to spawn robot process: {e}')
 
     def subscribe_to_odom(self, name):
         if name in self.odom_subs:
@@ -401,10 +402,10 @@ class RobotSpawnerNode(Node):
             x = msg.pose.pose.position.x
             y = msg.pose.pose.position.y
             data = json.dumps({
-                "type": "odom",
-                "name": r_name,
-                "x": x,
-                "y": y
+                'type': 'odom',
+                'name': r_name,
+                'x': x,
+                'y': y
             })
             self.broadcast(data)
 
@@ -427,19 +428,19 @@ class RobotSpawnerNode(Node):
                 blockers = []
                 for blocker in wp.departure_blockers:
                     blockers.append({
-                        "name": blocker.name,
-                        "required_progress": float(blocker.required_progress)
+                        'name': blocker.name,
+                        'required_progress': float(blocker.required_progress)
                     })
                 wps.append({
-                    "x": float(wp.position[0]),
-                    "y": float(wp.position[1]),
-                    "progress": float(wp.progress),
-                    "departure_blockers": blockers
+                    'x': float(wp.position[0]),
+                    'y': float(wp.position[1]),
+                    'progress': float(wp.progress),
+                    'departure_blockers': blockers
                 })
             data = json.dumps({
-                "type": "plan",
-                "name": r_name,
-                "waypoints": wps
+                'type': 'plan',
+                'name': r_name,
+                'waypoints': wps
             })
             self.broadcast(data)
 
@@ -458,9 +459,9 @@ class RobotSpawnerNode(Node):
 
         def progress_callback(msg, r_name=name):
             data = json.dumps({
-                "type": "progress",
-                "name": r_name,
-                "progress": float(msg.progress)
+                'type': 'progress',
+                'name': r_name,
+                'progress': float(msg.progress)
             })
             self.broadcast(data)
 
@@ -481,18 +482,19 @@ class RobotSpawnerNode(Node):
             try:
                 if msg.constraints.regions:
                     region = msg.constraints.regions[0].region
-                    if region.hint == Region.HINT_AXIS_ALIGNED_RECTANGLE and len(region.points) >= 2:
+                    if (region.hint == Region.HINT_AXIS_ALIGNED_RECTANGLE
+                            and len(region.points) >= 2):
                         gx = region.points[0]
                         gy = region.points[1]
                         data = json.dumps({
-                            "type": "active_destination",
-                            "name": r_name,
-                            "x": gx,
-                            "y": gy
+                            'type': 'active_destination',
+                            'name': r_name,
+                            'x': gx,
+                            'y': gy
                         })
                         self.broadcast(data)
             except Exception as e:
-                self.get_logger().error(f"Error parsing destination message: {e}")
+                self.get_logger().error(f'Error parsing destination message: {e}')
 
         self.destination_subs[name] = self.create_subscription(
             Destination,
@@ -510,10 +512,10 @@ class RobotSpawnerNode(Node):
 
         def error_callback(msg, r_name=name):
             data = json.dumps({
-                "type": "destination_error",
-                "name": r_name,
-                "code": int(msg.error.code),
-                "message": msg.error.message,
+                'type': 'destination_error',
+                'name': r_name,
+                'code': int(msg.error.code),
+                'message': msg.error.message,
             })
             self.get_logger().warn(
                 f"Destination rejected for '{r_name}': {msg.error.message}")
@@ -588,7 +590,10 @@ class RobotSpawnerNode(Node):
             goal_msg.cost_bias = [0.0] * len(goals)
 
             self.dest_goal_publishers[name].publish(goal_msg)
-            self.get_logger().info(f"Published DestinationGoal for '{name}' with {len(goals)} options, session {goal_msg.session.uuid}")
+            self.get_logger().info(
+                f"Published DestinationGoal for '{name}' with {len(goals)} options, "
+                f'session {goal_msg.session.uuid}'
+            )
 
         else:
             gx, gy = goals[0]
@@ -608,10 +613,13 @@ class RobotSpawnerNode(Node):
             dest_msg.constraints = constraint
 
             self.dest_publishers[name].publish(dest_msg)
-            self.get_logger().info(f"Published Destination for '{name}' to ({gx}, {gy}) with UUID {dest_msg.session.uuid}")
+            self.get_logger().info(
+                f"Published Destination for '{name}' to ({gx}, {gy}) with UUID "
+                f'{dest_msg.session.uuid}'
+            )
 
     def send_scenario(self):
-        self.get_logger().info("Broadcasting scenario goals and discovery...")
+        self.get_logger().info('Broadcasting scenario goals and discovery...')
 
         # 1. Publish discovery list containing all active robots
         discovery_msg = ParticipantList()
@@ -654,8 +662,9 @@ class RobotSpawnerNode(Node):
             0.1, publish_initial_goals_when_ready)
 
     def reset_scenario(self):
-        self.get_logger().info("Resetting scenario, shutting down all simulator processes...")
-        
+        self.get_logger().info(
+            'Resetting scenario, shutting down all simulator processes...')
+
         # Stop discovery timer
         if self.discovery_timer:
             self.discovery_timer.cancel()
@@ -676,7 +685,11 @@ class RobotSpawnerNode(Node):
 
         # Also run a clean pkill to kill any orphaned or untracked mock robot sims
         try:
-            subprocess.run(['pkill', '-f', 'rmf_mock_robot_sim'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ['pkill', '-f', 'rmf_mock_robot_sim'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
         except Exception:
             pass
 
@@ -718,7 +731,7 @@ class RobotSpawnerNode(Node):
             self.destroy_publisher(pub)
         self.dest_goal_publishers.clear()
 
-        self.get_logger().info("Reset complete.")
+        self.get_logger().info('Reset complete.')
 
     def shutdown(self):
         self.reset_scenario()

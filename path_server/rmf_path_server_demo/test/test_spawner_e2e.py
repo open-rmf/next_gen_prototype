@@ -125,7 +125,8 @@ class TestRobotSpawnerE2E(unittest.TestCase):
         scenario_res = self.client.send_scenario()
         self.assertEqual(scenario_res.get('status'), 'scenario_sent')
 
-        # 8. Spin and verify that robot_spawner component responded and both robots reach target positions
+        # 8. Spin and verify that robot_spawner component responded and both robots
+        # reach target positions
         start_time = time.time()
         timeout = 30.0
         r1_reached = False
@@ -151,13 +152,15 @@ class TestRobotSpawnerE2E(unittest.TestCase):
 
         self.client.stop_sse_listener()
 
+        r1_last = r1_odoms[-1] if r1_odoms else 'None'
         self.assertTrue(
             r1_reached,
-            f'robot_1 did not reach target (5.0, 0.0). Last pos: {r1_odoms[-1] if r1_odoms else "None"}'
+            f'robot_1 did not reach target (5.0, 0.0). Last pos: {r1_last}'
         )
+        r2_last = r2_odoms[-1] if r2_odoms else 'None'
         self.assertTrue(
             r2_reached,
-            f'robot_2 did not reach target (8.0, 0.0). Last pos: {r2_odoms[-1] if r2_odoms else "None"}'
+            f'robot_2 did not reach target (8.0, 0.0). Last pos: {r2_last}'
         )
 
         # Check that SSE listener received odom events from robot_spawner
