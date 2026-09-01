@@ -13,13 +13,21 @@
 // limitations under the License.
 
 use rclrs::{Context, CreateBasicExecutor, ParameterRange, SpinOptions};
-use rmf_path_server::{start_path_server, PibtPlanner};
+use rmf_path_server::{start_path_server, CcbsPlanner, MapfPlanner, PibtPlanner};
+use std::env;
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let context = Context::default_from_env().unwrap();
     let mut executor = context.create_basic_executor();
     let node = Arc::new(executor.create_node("path_server")?);
+
+    let param_planner = node
+        .declare_parameter("planner")
+        .default(Arc::<str>::from("pibt-grid-world"))
+        .mandatory()
+        .ok()
+        .map(|p| p.get().to_string());
 
     let planning_grid_resolution = node
         .declare_parameter("planning_grid_resolution")
@@ -29,9 +37,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             upper: Some(f32::MAX as f64),
             step: None,
         })
-        .description("Minimum PiBT grid cell size in meters")
+        .description("Minimum planning grid cell size in meters")
         .read_only()?;
-    let planner = PibtPlanner::with_grid_resolution(100, planning_grid_resolution.get())?;
+
+    let args: Vec<String> = env::args().collect();
+    let cli_planner = args
+        .iter()
+        .position(|arg| arg == "--planner")
+        .and_then(|i| args.get(i + 1).cloned())
+        .or_else(|| {
+            args.iter()
+                .find_map(|arg| arg.strip_prefix("--planner=").map(String::from))
+        });
+
+    let planner_name = cli_planner
+        .or(param_planner)
+        .unwrap_or_else(|| "pibt-grid-world".to_string());
+
+    let res = planning_grid_resolution.get();
+
+    let planner: Box<dyn MapfPlanner> = match planner_name.to_lowercase().as_str() {
+        "ccbs" => {
+            rclrs::log!(node.logger(), "Using CCBS planner with cell size {}", res);
+            let ccbs = CcbsPlanner::default().with_cell_size(res);
+            Box::new(ccbs)
+        }
+        "pibt-grid-world" | "pibt" => {
+            rclrs::log!(
+                node.logger(),
+                "Using PIBT grid world planner with resolution {}",
+                res
+            );
+            Box::new(PibtPlanner::with_grid_resolution(100, res)?)
+        }
+        other => {
+            return Err(format!(
+                "Unknown planner '{}'. Available options: 'pibt-grid-world', 'ccbs'",
+                other
+            )
+            .into());
+        }
+    };
 
     let _path_server_guard = start_path_server(Arc::clone(&node), planner)?;
 

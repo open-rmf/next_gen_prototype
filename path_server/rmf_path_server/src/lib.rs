@@ -27,7 +27,7 @@ use std::{
 };
 
 pub mod planner;
-pub use planner::{Map, MapfPlanner, MockPlanner, PibtPlanner};
+pub use planner::{CcbsPlanner, Map, MapfPlanner, MockPlanner, PibtPlanner};
 
 pub struct PlanSuccess {
     pub session_id: u64,

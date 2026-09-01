@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use hetpibt::external_tracks_pibt::PiBTWithExternalTracks;
+use mapf::motion::{Motion, TimePoint};
+use mapf::negotiation::{negotiate, Agent, Scenario};
 use mapf_post::na::Isometry2;
 use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
 use ros_env::rmf_prototype_msgs::msg::Destination;
@@ -41,6 +43,36 @@ pub trait MapfPlanner: Send + Sync + 'static {
         map: &Map,
         cancellation: Arc<AtomicBool>,
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>>;
+}
+
+impl MapfPlanner for Box<dyn MapfPlanner> {
+    fn plan(
+        &self,
+        starts: &HashMap<String, Odometry>,
+        goals: &HashMap<String, Destination>,
+        footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
+        robot_ids: &[String],
+        map: &Map,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
+        self.as_ref()
+            .plan(starts, goals, footprints, robot_ids, map, cancellation)
+    }
+}
+
+impl MapfPlanner for Arc<dyn MapfPlanner> {
+    fn plan(
+        &self,
+        starts: &HashMap<String, Odometry>,
+        goals: &HashMap<String, Destination>,
+        footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
+        robot_ids: &[String],
+        map: &Map,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
+        self.as_ref()
+            .plan(starts, goals, footprints, robot_ids, map, cancellation)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -297,6 +329,315 @@ impl MapfPlanner for PibtPlanner {
                 let world_x = pos.0 as f32 * resolution + offset_x;
                 let world_y = pos.1 as f32 * resolution + offset_y;
                 trajectories[agent_idx].push(Isometry2::translation(world_x, world_y));
+            }
+        }
+
+        Ok(trajectories)
+    }
+}
+
+#[derive(Clone)]
+pub struct CcbsPlanner {
+    pub queue_length_limit: Option<usize>,
+    pub cell_size: Option<f64>,
+    pub discretization_timestep: Option<f64>,
+}
+
+impl Default for CcbsPlanner {
+    fn default() -> Self {
+        Self {
+            queue_length_limit: Some(100_000),
+            cell_size: None,
+            discretization_timestep: Some(1.0),
+        }
+    }
+}
+
+impl CcbsPlanner {
+    pub fn new(queue_length_limit: Option<usize>) -> Self {
+        Self {
+            queue_length_limit,
+            cell_size: None,
+            discretization_timestep: Some(1.0),
+        }
+    }
+
+    pub fn with_cell_size(mut self, cell_size: f64) -> Self {
+        self.cell_size = Some(cell_size);
+        self
+    }
+
+    pub fn with_discretization_timestep(mut self, timestep: f64) -> Self {
+        self.discretization_timestep = Some(timestep);
+        self
+    }
+}
+
+impl MapfPlanner for CcbsPlanner {
+    fn plan(
+        &self,
+        starts: &HashMap<String, Odometry>,
+        goals: &HashMap<String, Destination>,
+        footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
+        robot_ids: &[String],
+        map: &Map,
+        _cancellation: Arc<AtomicBool>,
+    ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
+        if robot_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let cell_size = self.cell_size.unwrap_or_else(|| {
+            if map.grid.info.resolution > 0.0 {
+                map.grid.info.resolution as f64
+            } else {
+                DEFAULT_PLANNING_GRID_RESOLUTION
+            }
+        });
+
+        let map_res = if map.grid.info.resolution > 0.0 {
+            map.grid.info.resolution as f64
+        } else {
+            cell_size
+        };
+
+        let origin_x = map.grid.info.origin.position.x as f64;
+        let origin_y = map.grid.info.origin.position.y as f64;
+
+        let mut occupancy: HashMap<i64, Vec<i64>> = HashMap::new();
+        let w = map.grid.info.width as usize;
+        let h = map.grid.info.height as usize;
+
+        if w > 0 && h > 0 {
+            let threshold = 50i8;
+
+            for y in 0..h {
+                for x in 0..w {
+                    let idx = y * w + x;
+                    let val = map.grid.data.get(idx).copied().unwrap_or(0);
+                    if val > threshold || val < 0 {
+                        let wx = origin_x + (x as f64 + 0.5) * map_res;
+                        let wy = origin_y + (y as f64 + 0.5) * map_res;
+                        let cx = ((wx - origin_x) / cell_size).round() as i64;
+                        let cy = ((wy - origin_y) / cell_size).round() as i64;
+                        occupancy.entry(cy).or_default().push(cx);
+                    }
+                }
+            }
+
+            let min_cx = 0i64;
+            let max_cx = ((w as f64 * map_res) / cell_size).round() as i64 - 1;
+            let min_cy = 0i64;
+            let max_cy = ((h as f64 * map_res) / cell_size).round() as i64 - 1;
+
+            for cx in min_cx..=max_cx {
+                occupancy.entry(min_cy - 1).or_default().push(cx);
+                occupancy.entry(max_cy + 1).or_default().push(cx);
+            }
+            for cy in min_cy..=max_cy {
+                occupancy.entry(cy).or_default().push(min_cx - 1);
+                occupancy.entry(cy).or_default().push(max_cx + 1);
+            }
+
+            for row in occupancy.values_mut() {
+                row.sort_unstable();
+                row.dedup();
+            }
+        }
+
+        let mut agents = std::collections::BTreeMap::new();
+        let (min_cx, max_cx, min_cy, max_cy) = if w > 0 && h > 0 {
+            (
+                0i64,
+                ((w as f64 * map_res) / cell_size).round() as i64 - 1,
+                0i64,
+                ((h as f64 * map_res) / cell_size).round() as i64 - 1,
+            )
+        } else {
+            (i64::MIN, i64::MAX, i64::MIN, i64::MAX)
+        };
+
+        for id in robot_ids {
+            let odom = starts.get(id).ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "Missing start odometry for agent {}",
+                    id
+                ))
+            })?;
+            let dest = goals.get(id).ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "Missing goal destination for agent {}",
+                    id
+                ))
+            })?;
+
+            let sx_world = odom.pose.pose.position.x as f64;
+            let sy_world = odom.pose.pose.position.y as f64;
+            let mut start_cx = ((sx_world - origin_x) / cell_size).round() as i64;
+            let mut start_cy = ((sy_world - origin_y) / cell_size).round() as i64;
+
+            if w > 0 && h > 0 {
+                start_cx = start_cx.clamp(min_cx, max_cx);
+                start_cy = start_cy.clamp(min_cy, max_cy);
+
+                // If the robot's current position coincides with an occupied cell,
+                // unmark it so the robot can plan out of the collision state.
+                if let Some(row) = occupancy.get_mut(&start_cy) {
+                    row.retain(|&x| x != start_cx);
+                }
+            }
+
+            let q = &odom.pose.pose.orientation;
+            let yaw = 2.0 * f64::atan2(q.z as f64, q.w as f64);
+
+            let gx_world: f64;
+            let gy_world: f64;
+
+            if let Some(region) = dest.constraints.regions.first() {
+                if region.region.points.len() >= 2 {
+                    gx_world = region.region.points[0] as f64;
+                    gy_world = region.region.points[1] as f64;
+                } else {
+                    return Err(Box::<dyn std::error::Error>::from(format!(
+                        "Destination for agent {} has invalid region points",
+                        id
+                    )));
+                }
+            } else {
+                return Err(Box::<dyn std::error::Error>::from(format!(
+                    "Destination for agent {} has no target regions",
+                    id
+                )));
+            }
+
+            let mut goal_cx = ((gx_world - origin_x) / cell_size).round() as i64;
+            let mut goal_cy = ((gy_world - origin_y) / cell_size).round() as i64;
+
+            if w > 0 && h > 0 {
+                goal_cx = goal_cx.clamp(min_cx, max_cx);
+                goal_cy = goal_cy.clamp(min_cy, max_cy);
+
+                // If the goal is occupied, search for the nearest free cell.
+                let is_occupied = |x: i64, y: i64| -> bool {
+                    occupancy.get(&y).map_or(false, |row| row.contains(&x))
+                };
+
+                if is_occupied(goal_cx, goal_cy) {
+                    'search: for r in 1i64..=10i64 {
+                        for dx in -r..=r {
+                            for dy in -r..=r {
+                                if dx.abs() == r || dy.abs() == r {
+                                    let nx = (goal_cx + dx).clamp(min_cx, max_cx);
+                                    let ny = (goal_cy + dy).clamp(min_cy, max_cy);
+                                    if !is_occupied(nx, ny) {
+                                        goal_cx = nx;
+                                        goal_cy = ny;
+                                        break 'search;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let radius = footprints
+                .get(id)
+                .and_then(|shape| {
+                    if let Some(ball) = shape.as_ball() {
+                        Some(ball.radius as f64)
+                    } else {
+                        let aabb = shape.compute_local_aabb();
+                        Some((aabb.maxs.x.max(aabb.maxs.y)) as f64)
+                    }
+                })
+                .filter(|r| *r > 0.0)
+                .unwrap_or(0.45);
+
+            agents.insert(
+                id.clone(),
+                Agent {
+                    start: [start_cx, start_cy],
+                    yaw,
+                    goal: [goal_cx, goal_cy],
+                    radius,
+                    speed: 0.75,
+                    spin: 60.0_f64.to_radians(),
+                },
+            );
+        }
+
+        let scenario = Scenario {
+            agents,
+            obstacles: Vec::new(),
+            occupancy,
+            cell_size,
+            camera_bounds: None,
+        };
+
+        let (solution_node, _node_history, name_map) =
+            match negotiate(&scenario, self.queue_length_limit) {
+                Ok(solution) => solution,
+                Err(err) => {
+                    return Err(Box::<dyn std::error::Error>::from(format!(
+                        "CCBS negotiation failed: {:?}",
+                        err
+                    )));
+                }
+            };
+
+        let time_step = self.discretization_timestep.unwrap_or(1.0);
+        let max_finish_time = solution_node
+            .proposals
+            .values()
+            .map(|p| p.meta.trajectory.finish_motion_time().as_secs_f64())
+            .fold(0.0f64, f64::max);
+
+        let num_steps = if max_finish_time > 0.0 {
+            (max_finish_time / time_step).ceil() as usize + 1
+        } else {
+            1
+        }
+        .max(2);
+
+        let mut trajectories = vec![Vec::new(); robot_ids.len()];
+
+        for (agent_idx, id) in robot_ids.iter().enumerate() {
+            let internal_idx = name_map
+                .iter()
+                .find(|(_, name)| *name == id)
+                .map(|(idx, _)| *idx)
+                .ok_or_else(|| {
+                    Box::<dyn std::error::Error>::from(format!(
+                        "Failed to find name map entry for agent {}",
+                        id
+                    ))
+                })?;
+
+            let proposal = solution_node.proposals.get(&internal_idx).ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "Missing proposal solution for agent {}",
+                    id
+                ))
+            })?;
+
+            let motion = proposal.meta.trajectory.motion();
+
+            for step in 0..num_steps {
+                let t = (step as f64 * time_step).min(max_finish_time);
+                let time_point = TimePoint::from_secs_f64(t);
+                let pos = motion
+                    .compute_position(&time_point)
+                    .unwrap_or_else(|_| proposal.meta.trajectory.finish_motion().position);
+
+                let world_x = (pos.translation.x + origin_x - 0.5 * cell_size) as f32;
+                let world_y = (pos.translation.y + origin_y - 0.5 * cell_size) as f32;
+                let angle = pos.rotation.angle() as f32;
+
+                trajectories[agent_idx].push(Isometry2::new(
+                    mapf_post::na::Vector2::new(world_x, world_y),
+                    angle,
+                ));
             }
         }
 
