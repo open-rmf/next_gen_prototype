@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-const MIN_PLANNING_RESOLUTION: f32 = 1.0;
+pub(crate) const DEFAULT_PLANNING_GRID_RESOLUTION: f64 = 1.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct Map {
@@ -67,25 +67,51 @@ impl MapfPlanner for MockPlanner {
 #[derive(Clone)]
 pub struct PibtPlanner {
     pub max_time: usize,
+    pub grid_resolution: f32,
 }
 
 impl Default for PibtPlanner {
     fn default() -> Self {
-        Self { max_time: 100 }
+        Self {
+            max_time: 100,
+            grid_resolution: DEFAULT_PLANNING_GRID_RESOLUTION as f32,
+        }
     }
 }
 
 impl PibtPlanner {
     pub fn new(max_time: usize) -> Self {
-        Self { max_time }
+        Self {
+            max_time,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_grid_resolution(max_time: usize, grid_resolution: f64) -> Result<Self, String> {
+        if !grid_resolution.is_finite()
+            || grid_resolution <= 0.0
+            || grid_resolution > f32::MAX as f64
+        {
+            return Err(format!(
+                "planning_grid_resolution must be finite and positive, got {grid_resolution}"
+            ));
+        }
+
+        Ok(Self {
+            max_time,
+            grid_resolution: grid_resolution as f32,
+        })
     }
 }
 
-fn planning_grid(grid: &OccupancyGrid) -> (usize, usize, f32, f32, f32, Vec<Vec<usize>>) {
+fn planning_grid(
+    grid: &OccupancyGrid,
+    minimum_resolution: f32,
+) -> (usize, usize, f32, f32, f32, Vec<Vec<usize>>) {
     let source_width = grid.info.width as usize;
     let source_height = grid.info.height as usize;
     let source_resolution = grid.info.resolution;
-    let resolution = source_resolution.max(MIN_PLANNING_RESOLUTION);
+    let resolution = source_resolution.max(minimum_resolution);
     let width = ((source_width as f32 * source_resolution) / resolution)
         .ceil()
         .max(1.0) as usize;
@@ -137,7 +163,7 @@ impl MapfPlanner for PibtPlanner {
             map.grid.info.width > 0 && map.grid.info.height > 0 && map.grid.info.resolution > 0.0;
 
         let (width, height, resolution, offset_x, offset_y, grid) = if use_map {
-            planning_grid(&map.grid)
+            planning_grid(&map.grid, self.grid_resolution)
         } else {
             let mut min_x = f32::MAX;
             let mut min_y = f32::MAX;
@@ -190,18 +216,19 @@ impl MapfPlanner for PibtPlanner {
                 max_y = 0.0;
             }
 
+            let resolution = self.grid_resolution;
             let padding = 10.0;
-            let ox = min_x.floor() - padding;
-            let oy = min_y.floor() - padding;
+            let ox = (min_x / resolution).floor() * resolution - padding;
+            let oy = (min_y / resolution).floor() * resolution - padding;
 
-            let w = (max_x.ceil() - ox + padding) as usize;
-            let h = (max_y.ceil() - oy + padding) as usize;
+            let w = ((max_x - ox + padding) / resolution).ceil() as usize;
+            let h = ((max_y - oy + padding) / resolution).ceil() as usize;
 
             let w = w.max(1);
             let h = h.max(1);
 
             let g = vec![vec![0; h]; w];
-            (w, h, 1.0f32, ox, oy, g)
+            (w, h, resolution, ox, oy, g)
         };
 
         let mut grid_starts = Vec::new();
@@ -292,7 +319,8 @@ mod tests {
         map.data = vec![0; 32];
         map.data[2 * 8 + 5] = 100;
 
-        let (width, height, resolution, offset_x, offset_y, cells) = planning_grid(&map);
+        let (width, height, resolution, offset_x, offset_y, cells) =
+            planning_grid(&map, DEFAULT_PLANNING_GRID_RESOLUTION as f32);
 
         assert_eq!(width, 2);
         assert_eq!(height, 1);
@@ -310,11 +338,34 @@ mod tests {
         map.info.height = 2;
         map.data = vec![0, 100, 0, 0];
 
-        let (width, height, resolution, _, _, cells) = planning_grid(&map);
+        let (width, height, resolution, _, _, cells) =
+            planning_grid(&map, DEFAULT_PLANNING_GRID_RESOLUTION as f32);
 
         assert_eq!(width, 2);
         assert_eq!(height, 2);
         assert_eq!(resolution, 2.0);
         assert_eq!(cells, vec![vec![0, 0], vec![1, 0]]);
+    }
+
+    #[test]
+    fn configured_grid_resolution_is_used() {
+        let mut map = OccupancyGrid::default();
+        map.info.resolution = 0.25;
+        map.info.width = 8;
+        map.info.height = 8;
+        map.data = vec![0; 64];
+
+        let (width, height, resolution, _, _, _) = planning_grid(&map, 0.5);
+
+        assert_eq!(width, 4);
+        assert_eq!(height, 4);
+        assert_eq!(resolution, 0.5);
+    }
+
+    #[test]
+    fn grid_resolution_must_be_positive() {
+        assert!(PibtPlanner::with_grid_resolution(100, 0.5).is_ok());
+        assert!(PibtPlanner::with_grid_resolution(100, 0.0).is_err());
+        assert!(PibtPlanner::with_grid_resolution(100, -0.5).is_err());
     }
 }
