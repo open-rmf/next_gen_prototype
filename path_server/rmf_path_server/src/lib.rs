@@ -596,13 +596,65 @@ impl<P: MapfPlanner> PlanServer<P> {
             }
         }
 
+        let simplified_waypoints = simplify_waypoints(waypoints);
+
         Plan {
-            waypoints,
+            waypoints: simplified_waypoints,
             start_time: builtin_interfaces::msg::Time { sec: 0, nanosec: 0 },
             plan_id,
             workflow: String::new(),
         }
     }
+}
+
+/// Simplify a sequence of waypoints by removing redundant collinear points,
+/// while strictly preserving any waypoints with traffic blockers, actions, or trajectories.
+pub fn simplify_waypoints(waypoints: Vec<Waypoint>) -> Vec<Waypoint> {
+    if waypoints.len() <= 2 {
+        return waypoints;
+    }
+    let mut simplified = Vec::with_capacity(waypoints.len());
+    simplified.push(waypoints[0].clone());
+
+    let mut i = 1;
+    while i < waypoints.len() - 1 {
+        let prev = simplified.last().unwrap();
+        let curr = &waypoints[i];
+        let next = &waypoints[i + 1];
+
+        // Do not prune if current waypoint has special duties
+        let has_special_duties = !curr.departure_blockers.is_empty()
+            || !curr.arrival_action.is_empty()
+            || !curr.departure_action.is_empty()
+            || !curr.departure_trajectory.is_empty();
+
+        if has_special_duties {
+            simplified.push(curr.clone());
+            i += 1;
+            continue;
+        }
+
+        // Check collinearity between prev -> curr and curr -> next
+        let dx1 = curr.position[0] - prev.position[0];
+        let dy1 = curr.position[1] - prev.position[1];
+        let dx2 = next.position[0] - curr.position[0];
+        let dy2 = next.position[1] - curr.position[1];
+
+        let cross_product = dx1 * dy2 - dy1 * dx2;
+        let dot_product = dx1 * dx2 + dy1 * dy2;
+
+        // If cross product is close to 0 and dot product is positive (same direction)
+        if cross_product.abs() < 1e-4 && dot_product > 0.0 {
+            // curr is collinear and redundant, skip it
+            i += 1;
+        } else {
+            simplified.push(curr.clone());
+            i += 1;
+        }
+    }
+
+    simplified.push(waypoints.last().unwrap().clone());
+    simplified
 }
 
 pub struct RobotPathConnections<P: MapfPlanner> {
@@ -844,4 +896,85 @@ pub fn start_path_server_with_nav_graph<P: MapfPlanner + 'static>(
         discovery_subscription,
         map_subscription,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_wp(pos: [f32; 2], progress: f32) -> Waypoint {
+        Waypoint {
+            position: pos,
+            arrival_constraints: Default::default(),
+            progress,
+            maps: Vec::new(),
+            departure_blockers: Vec::new(),
+            departure_trajectory: Vec::new(),
+            departure_action: String::new(),
+            arrival_action: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_simplify_straight_line() {
+        let waypoints = vec![
+            make_wp([0.0, 0.0], 0.0),
+            make_wp([0.0, 1.0], 1.0),
+            make_wp([0.0, 2.0], 2.0),
+            make_wp([0.0, 3.0], 3.0),
+        ];
+
+        let simplified = simplify_waypoints(waypoints);
+        assert_eq!(simplified.len(), 2);
+        assert_eq!(simplified[0].position, [0.0, 0.0]);
+        assert_eq!(simplified[1].position, [0.0, 3.0]);
+        assert_eq!(simplified[1].progress, 3.0);
+    }
+
+    #[test]
+    fn test_simplify_corner_turn() {
+        let waypoints = vec![
+            make_wp([0.0, 0.0], 0.0),
+            make_wp([0.0, 1.0], 1.0),
+            make_wp([0.0, 2.0], 2.0),
+            make_wp([1.0, 2.0], 3.0),
+            make_wp([2.0, 2.0], 4.0),
+        ];
+
+        let simplified = simplify_waypoints(waypoints);
+        assert_eq!(simplified.len(), 3);
+        assert_eq!(simplified[0].position, [0.0, 0.0]);
+        assert_eq!(simplified[1].position, [0.0, 2.0]);
+        assert_eq!(simplified[2].position, [2.0, 2.0]);
+    }
+
+    #[test]
+    fn test_simplify_preserves_blockers_and_actions() {
+        let mut wp_blocked = make_wp([0.0, 2.0], 2.0);
+        wp_blocked.departure_blockers.push(TrafficDependency {
+            name: "other_robot".to_string(),
+            plan_id: PlanId::default(),
+            required_progress: 5.0,
+        });
+
+        let mut wp_action = make_wp([0.0, 4.0], 4.0);
+        wp_action.arrival_action = "dock_conveyor".to_string();
+
+        let waypoints = vec![
+            make_wp([0.0, 0.0], 0.0),
+            make_wp([0.0, 1.0], 1.0),
+            wp_blocked,
+            make_wp([0.0, 3.0], 3.0),
+            wp_action,
+        ];
+
+        let simplified = simplify_waypoints(waypoints);
+        // Should keep: [0.0, 0.0], [0.0, 2.0] (blocked), [0.0, 4.0] (action)
+        assert_eq!(simplified.len(), 3);
+        assert_eq!(simplified[0].position, [0.0, 0.0]);
+        assert_eq!(simplified[1].position, [0.0, 2.0]);
+        assert_eq!(simplified[1].departure_blockers.len(), 1);
+        assert_eq!(simplified[2].position, [0.0, 4.0]);
+        assert_eq!(simplified[2].arrival_action, "dock_conveyor");
+    }
 }
