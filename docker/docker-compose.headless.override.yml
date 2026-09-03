@@ -1,0 +1,11 @@
+services:
+  robot0_nav2_sim:
+    command:
+      - bash
+      - -c
+      - "source /nav2_traffic_ws/install/setup.bash && ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py robots:='robot0={x: 0.0, y: 5.0, yaw: 0.0};' use_rviz:=False"
+  robot1_nav2_sim:
+    command:
+      - bash
+      - -c
+      - "source /nav2_traffic_ws/install/setup.bash && ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py robots:='robot1={x: 3.0, y: 5.0, yaw: 0.0};' use_rviz:=False"
