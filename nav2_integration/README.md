@@ -99,7 +99,7 @@ Follow the steps below to use pre-made `docker/Dockerfile.base` to run the demo 
    <summary><b>Click here 🐳.</b></summary>
 
 ```bash
-docker build --load -t ros2_rust_nav2_tb4_sim:jazzy -f docker/Dockerfile.base .
+docker build --load -t ros2_rust_base:jazzy -f docker/Dockerfile.base .
 ```
 
 </details>
@@ -159,13 +159,13 @@ ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py   robots:
 xhost +local:docker
 
 docker run -it --rm \
---name ros2_rust_nav2_tb4_sim_c \
+--name ros2_rust_base_c \
 --gpus all \
 --env="DISPLAY" \
 --env="QT_X11_NO_MITSHM=1" \
 -v /tmp/.X11-unix:/tmp/.X11-unix \
 --device=/dev/dri \
-ros2_rust_nav2_tb4_sim:jazzy \
+ros2_rust_base:jazzy \
 bash -c "source /nav2_traffic_ws/install/setup.bash && \
 ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py \
 robots:=\"robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};\""
@@ -179,13 +179,13 @@ robots:=\"robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};\
 xhost +local:docker
 
 docker run -it --rm \
---name ros2_rust_nav2_tb4_sim_c \
+--name ros2_rust_base_c \
 --gpus all \
 --env="DISPLAY=${DISPLAY}" \
 --env="QT_X11_NO_MITSHM=1" \
 -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
 --device=/dev/dri \
-ros2_rust_nav2_tb4_sim:jazzy \
+ros2_rust_base:jazzy \
 bash -c "source /nav2_traffic_ws/install/setup.bash && \
   ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py \
   robots:=\"robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};\""
@@ -199,12 +199,12 @@ bash -c "source /nav2_traffic_ws/install/setup.bash && \
 xhost +local:docker
 
 docker run -it --rm \
---name ros2_rust_nav2_tb4_sim_c \
+--name ros2_rust_base_c \
 --env="DISPLAY=${DISPLAY}" \
 --env="QT_X11_NO_MITSHM=1" \
 -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
 --device=/dev/dri \
-ros2_rust_nav2_tb4_sim:jazzy \
+ros2_rust_base:jazzy \
 bash -c "source /nav2_traffic_ws/install/setup.bash && \
   ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py \
   robots:=\"robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};\""
@@ -220,7 +220,7 @@ ros2 launch rmf_path_server_demo demo_nav2.launch.py robots:="robot0 robot1"
    <summary><b>Click here if running in docker container 🐳.</b></summary>
 
 ```bash
-docker exec -it ros2_rust_nav2_tb4_sim_c bash -c "source /nav2_traffic_ws/install/setup.bash && ros2 launch rmf_path_server_demo demo_nav2.launch.py robots:=\"robot0 robot1\""
+docker exec -it ros2_rust_base_c bash -c "source /nav2_traffic_ws/install/setup.bash && ros2 launch rmf_path_server_demo demo_nav2.launch.py robots:=\"robot0 robot1\""
 ```
 
 </details>
@@ -245,7 +245,7 @@ ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
    <summary><b>Click here if running in docker container 🐳.</b></summary>
 
 ```bash
-docker exec -it ros2_rust_nav2_tb4_sim_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
+docker exec -it ros2_rust_base_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
     ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose \"{
       pose: {
         header: {
@@ -281,7 +281,7 @@ ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
    <summary><b>Click here if running in docker container 🐳.</b></summary>
 
 ```bash
-docker exec -it ros2_rust_nav2_tb4_sim_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
+docker exec -it ros2_rust_base_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
     ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose \"{
       pose: {
         header: {
@@ -319,7 +319,7 @@ ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
    <summary><b>Click here if running in docker container 🐳.</b></summary>
 
 ```bash
-docker exec -it ros2_rust_nav2_tb4_sim_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
+docker exec -it ros2_rust_base_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
     ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose \"{
       pose: {
         header: {
@@ -355,7 +355,7 @@ ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
    <summary><b>Click here if running in docker container 🐳.</b></summary>
 
 ```bash
-docker exec -it ros2_rust_nav2_tb4_sim_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
+docker exec -it ros2_rust_base_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
     ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose \"{
       pose: {
         header: {
