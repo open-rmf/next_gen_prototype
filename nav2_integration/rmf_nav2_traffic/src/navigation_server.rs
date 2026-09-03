@@ -378,7 +378,7 @@ fn monitor_inner_navigation_clients(
     mut orders: ContinuousQuery<NavigationRequest, (), StreamOf<NavigationRequest>>,
     mut agents: Query<(
         &InnerNavigationClient,
-        &AgentPose,
+        Option<&AgentPose>,
         &mut CurrentNavigationRequest,
         Option<&CancellingInnerNavigation>,
     )>,
@@ -396,21 +396,23 @@ fn monitor_inner_navigation_clients(
         let request = order.request();
         order.streams().send(request.clone());
 
-        if let Ok((client, pose, mut current_nav_request, cancelling_inner)) =
+        if let Ok((client, maybe_pose, mut current_nav_request, cancelling_inner)) =
             agents.get_mut(request.agent)
         {
             // If reached destination, complete order
-            if client.active_goal.is_none() && request.destination_reached(pose) {
-                info!(
-                    "[{:?}] Destination reached, marking NavigationRequest as completed",
-                    request.agent.index()
-                );
-                nav_completed.write(NavigationCompleted {
-                    agent: request.agent,
-                    plan_id: request.plan_id.clone(),
-                });
-                order.respond(());
-                return;
+            if let Some(pose) = maybe_pose {
+                if client.active_goal.is_none() && request.destination_reached(pose) {
+                    info!(
+                        "[{:?}] Destination reached, marking NavigationRequest as completed",
+                        request.agent.index()
+                    );
+                    nav_completed.write(NavigationCompleted {
+                        agent: request.agent,
+                        plan_id: request.plan_id.clone(),
+                    });
+                    order.respond(());
+                    return;
+                }
             }
             // If inner cancellation is complete, complete order
             if cancelling_inner.is_some_and(|cancelling| cancelling.success) {
