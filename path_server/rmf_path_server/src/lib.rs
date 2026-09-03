@@ -179,6 +179,8 @@ impl<P: MapfPlanner> PlanServer<P> {
             self.is_planning = false;
             self.current_planning_session = None;
             self.current_cancellation = None;
+            self.active_destinations
+                .insert(robot_id.to_string(), msg.clone());
             self.replan_queue.push((robot_id.to_owned(), msg));
         } else {
             rclrs::log_error!(self.node.logger(), "Duplicate session id received");
