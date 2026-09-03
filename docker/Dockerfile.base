@@ -17,7 +17,8 @@ RUN apt-get update && apt-get upgrade -y && \
         python3-colcon-cargo\
         libssl-dev \
         pkg-config \
-        && rm -rf /var/lib/apt/lists/*
+        ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \
+        ros-${ROS_DISTRO}-rmw-zenoh-cpp
 
 # Install colcon extensions for Rust
 RUN pip3 install --no-cache-dir --break-system-packages colcon-ros-cargo
@@ -30,7 +31,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no
     cargo install cargo-ament-build && \
     chmod -R a+rwX /usr/local/cargo /usr/local/rustup
 
-
 # Initialize Underlay Workspace
 WORKDIR /opt/ros2_rust_ws
 
@@ -38,8 +38,7 @@ WORKDIR /opt/ros2_rust_ws
 COPY . /tmp/next_gen_prototype
 
 # Install ROS 2 dependencies via rosdep for both underlay and prototype branch
-RUN apt-get update && \
-    rosdep init || true && \
+RUN rosdep init || true && \
     rosdep update && \
     rosdep install --from-paths /tmp/next_gen_prototype --ignore-src -yr --skip-keys="rclrs ament_cargo ament_python" && \
     rm -rf /var/lib/apt/lists/*
@@ -48,12 +47,12 @@ WORKDIR /nav2_traffic_ws
 
 # Build the Underlay Workspace
 RUN mkdir src && mv /tmp/next_gen_prototype /nav2_traffic_ws/src/next_gen_prototype
-RUN /bin/bash -c "source /opt/ros/jazzy/setup.bash && \
+RUN /bin/bash -c "source /opt/ros/${ROS_DISTRO}/setup.bash && \
    colcon build --packages-up-to sp_demo_nav2_bringup rmf_nav2_traffic rmf_path_server_demo rmf_path_server_test --cmake-args -DCMAKE_BUILD_TYPE=Release && \
-   rm -r build/ log/ src/"
+   rm -rf build/ log/ src/"
 
 # Provide automatic sourcing entrypoint configuration inside ~/.bashrc
-RUN echo "source /opt/ros/jazzy/setup.bash" >> /root/.bashrc
+RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /root/.bashrc
 RUN echo "source /nav2_traffic_ws/install/setup.bash" >> /root/.bashrc
 
 CMD ["/bin/bash"]
