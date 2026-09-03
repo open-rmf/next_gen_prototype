@@ -18,13 +18,19 @@ use ros_env::{
     nav_msgs::msg::{OccupancyGrid, Odometry},
     rmf_prototype_msgs::{
         self,
-        msg::{Destination, Plan, PlanError, PlanId, TrafficDependency, Waypoint},
+        msg::{
+            ControlPoint, Curve, Destination, Plan, PlanError, PlanId, Region, TargetRegion,
+            TrafficDependency, Trajectory, Waypoint,
+        },
     },
 };
 use std::{
     collections::{hash_map::Entry, HashMap},
     sync::Arc,
 };
+
+pub mod nav_graph;
+pub use nav_graph::{NavGraphData, NavVertex, VertexAction};
 
 pub mod planner;
 pub use planner::{Map, MapfPlanner, MockPlanner, PibtPlanner};
@@ -36,6 +42,7 @@ pub struct PlanSuccess {
     pub goals: HashMap<String, Destination>,
     pub robot_ids: Vec<String>,
     pub active_plan: MapfResult,
+    pub target_actions: HashMap<String, String>,
 }
 
 pub enum PlanResult {
@@ -59,6 +66,8 @@ pub struct PlanServer<P: MapfPlanner> {
     pub footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
     pub active_plan_ids: HashMap<String, PlanId>,
     pub map: Arc<Map>,
+    pub nav_graph: Option<Arc<NavGraphData>>,
+    pub target_actions: HashMap<String, String>,
 }
 
 impl<P: MapfPlanner> PlanServer<P> {
@@ -66,6 +75,15 @@ impl<P: MapfPlanner> PlanServer<P> {
         node: Node,
         planner: P,
         footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
+    ) -> Self {
+        Self::new_with_nav_graph(node, planner, footprints, None)
+    }
+
+    pub fn new_with_nav_graph(
+        node: Node,
+        planner: P,
+        footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
+        nav_graph: Option<Arc<NavGraphData>>,
     ) -> Self {
         let (plan_sender, plan_receiver) = std::sync::mpsc::channel();
         Self {
@@ -84,10 +102,12 @@ impl<P: MapfPlanner> PlanServer<P> {
             footprints,
             active_plan_ids: HashMap::new(),
             map: Arc::new(Map::default()),
+            nav_graph,
+            target_actions: HashMap::new(),
         }
     }
 
-    pub fn handle_destination(&mut self, robot_id: &str, msg: Destination) {
+    pub fn handle_destination(&mut self, robot_id: &str, mut msg: Destination) {
         rclrs::log!(
             self.node.logger(),
             "PathServer (DestinationsWorker) received updated destination for {} (session UUID {})",
@@ -99,6 +119,53 @@ impl<P: MapfPlanner> PlanServer<P> {
                 .collect::<Vec<String>>()
                 .join("")
         );
+
+        // Check if a graph key target node is specified and matches any vertex in the nav graph
+        let mut looked_up_action = None;
+        if let Some(nav_graph) = &self.nav_graph {
+            for node_target in &msg.constraints.nodes {
+                if let Some(vertex) = nav_graph.find_vertex(&node_target.key) {
+                    rclrs::log!(
+                        self.node.logger(),
+                        "Matched destination graph key to vertex {} at ({}, {}) for robot {}",
+                        vertex.id,
+                        vertex.position[0],
+                        vertex.position[1],
+                        robot_id
+                    );
+
+                    // If region constraints are empty, resolve coordinates from vertex position
+                    if msg.constraints.regions.is_empty() {
+                        msg.constraints.regions.push(TargetRegion {
+                            region: Region {
+                                points: vec![vertex.position[0], vertex.position[1]],
+                                hint: Region::HINT_POINT,
+                            },
+                            ..Default::default()
+                        });
+                    }
+
+                    // Check for special arrival action (e.g. docking)
+                    if let Some(action) = &vertex.arrival_action {
+                        rclrs::log!(
+                            self.node.logger(),
+                            "Found special action for robot {} at vertex {}: {:?}",
+                            robot_id,
+                            vertex.id,
+                            action
+                        );
+                        looked_up_action = Some(action.name.clone());
+                    }
+                    break;
+                }
+            }
+        }
+
+        if let Some(action) = looked_up_action {
+            self.target_actions.insert(robot_id.to_string(), action);
+        } else {
+            self.target_actions.remove(robot_id);
+        }
 
         let is_new_session = match self.active_destinations.get(robot_id) {
             Some(active_dest) => active_dest.session.uuid != msg.session.uuid,
@@ -112,6 +179,8 @@ impl<P: MapfPlanner> PlanServer<P> {
             self.is_planning = false;
             self.current_planning_session = None;
             self.current_cancellation = None;
+            self.active_destinations
+                .insert(robot_id.to_string(), msg.clone());
             self.replan_queue.push((robot_id.to_owned(), msg));
         } else {
             rclrs::log_error!(self.node.logger(), "Duplicate session id received");
@@ -163,6 +232,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                             traffic_dependencies,
                             goals,
                             robot_ids,
+                            target_actions,
                             ..
                         } = success;
 
@@ -199,6 +269,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                                 );
                                 continue;
                             };
+                            let target_action = target_actions.get(robot_id).map(|s| s.as_str());
                             let plan = Self::to_plan_msg(
                                 agent_idx,
                                 traj,
@@ -206,6 +277,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                                 &traffic_dependencies,
                                 &robot_ids,
                                 &self.active_plan_ids,
+                                target_action,
                                 1.0,
                             );
                             plans.insert(robot_id.clone(), plan);
@@ -222,8 +294,8 @@ impl<P: MapfPlanner> PlanServer<P> {
                                     })
                                     .collect();
                                 wp_strs.push(format!(
-                                    "  wp {}: pos {:?}, progress {}, blockers: {:?}",
-                                    j, wp.position, wp.progress, blockers
+                                    "  wp {}: pos {:?}, progress {}, action: '{}', blockers: {:?}",
+                                    j, wp.position, wp.progress, wp.arrival_action, blockers
                                 ));
                             }
                             rclrs::log!(
@@ -343,6 +415,7 @@ impl<P: MapfPlanner> PlanServer<P> {
         let footprints_clone = Arc::clone(&self.footprints);
         let sender_clone = self.plan_sender.clone();
         let map_clone = self.map.clone();
+        let target_actions_clone = self.target_actions.clone();
 
         std::thread::spawn(move || {
             if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
@@ -421,6 +494,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                 goals,
                 robot_ids,
                 active_plan: mapf_result,
+                target_actions: target_actions_clone,
             }));
         });
     }
@@ -432,6 +506,7 @@ impl<P: MapfPlanner> PlanServer<P> {
         traffic_dependencies: &SemanticPlan,
         robot_ids: &[String],
         active_plan_ids: &HashMap<String, PlanId>,
+        target_action: Option<&str>,
         timestep: f32,
     ) -> Plan {
         let mut waypoints = Vec::new();
@@ -446,6 +521,56 @@ impl<P: MapfPlanner> PlanServer<P> {
                 departure_action: String::new(),
                 arrival_action: String::new(),
             });
+        }
+
+        if let Some(action) = target_action {
+            if let Some(last_wp) = waypoints.last_mut() {
+                last_wp.arrival_action = action.to_string();
+            }
+        }
+
+        // For any docking waypoints, populate departure_trajectory
+        let num_waypoints = waypoints.len();
+        for i in 0..num_waypoints {
+            let arrival_act = waypoints[i].arrival_action.clone();
+            let is_docking = !arrival_act.is_empty()
+                && (arrival_act.starts_with("dock") || arrival_act.contains("dock"));
+            if is_docking && waypoints[i].departure_trajectory.is_empty() {
+                let [dock_x, dock_y] = waypoints[i].position;
+                let depart_pos = if i + 1 < num_waypoints {
+                    waypoints[i + 1].position
+                } else if i > 0 {
+                    waypoints[i - 1].position
+                } else {
+                    [dock_x, dock_y]
+                };
+                // TODO(arjoc) parameterize it
+                let departure_duration = 1.0f32;
+                let departure_curve = Curve {
+                    degree: 1,
+                    control_points: vec![
+                        ControlPoint {
+                            position: [dock_x, dock_y],
+                            weight: 1.0,
+                        },
+                        ControlPoint {
+                            position: depart_pos,
+                            weight: 1.0,
+                        },
+                    ],
+                    knots: vec![0.0, 0.0, departure_duration, departure_duration],
+                };
+
+                let departure_traj = Trajectory {
+                    curve: departure_curve,
+                    initial_progress_level: waypoints[i].progress,
+                    final_progress_level: waypoints[i].progress + departure_duration,
+                    maps: waypoints[i].maps.clone(),
+                    keys: Vec::new(),
+                };
+
+                waypoints[i].departure_trajectory = vec![departure_traj];
+            }
         }
 
         for i in 0..traj.len() {
@@ -519,12 +644,66 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
     node: rclrs::Node,
     planner: P,
 ) -> Result<PathServerRunning<P>, Box<dyn std::error::Error>> {
+    let nav_graph = match node
+        .declare_parameter("site_file")
+        .default(Arc::from(""))
+        .mandatory()
+    {
+        Ok(param) => {
+            let path: Arc<str> = param.get();
+            if !path.is_empty() {
+                match NavGraphData::from_site_file(&path) {
+                    Ok(graph) => {
+                        rclrs::log!(
+                            node.logger(),
+                            "Loaded navigation graph from '{}' with {} vertices",
+                            path,
+                            graph.vertices_by_id.len()
+                        );
+                        Some(Arc::new(graph))
+                    }
+                    Err(err) => {
+                        rclrs::log_error!(
+                            node.logger(),
+                            "Failed to load site file '{}': {:?}",
+                            path,
+                            err
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        Err(err) => {
+            rclrs::log_warn!(
+                node.logger(),
+                "Could not declare optional 'site_file' parameter: {:?}",
+                err
+            );
+            None
+        }
+    };
+
+    start_path_server_with_nav_graph(node, planner, nav_graph)
+}
+
+pub fn start_path_server_with_nav_graph<P: MapfPlanner + 'static>(
+    node: rclrs::Node,
+    planner: P,
+    nav_graph: Option<Arc<NavGraphData>>,
+) -> Result<PathServerRunning<P>, Box<dyn std::error::Error>> {
     let footprints = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let footprints_clone = Arc::clone(&footprints);
 
     // Create the Destinations worker
-    let destinations_worker =
-        node.create_worker(PlanServer::new(node.clone(), planner, footprints));
+    let destinations_worker = node.create_worker(PlanServer::new_with_nav_graph(
+        node.clone(),
+        planner,
+        footprints,
+        nav_graph,
+    ));
 
     let map_subscription = destinations_worker.create_subscription::<OccupancyGrid, _>(
         "/map".transient_local().reliable(),
@@ -584,7 +763,6 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
                     .create_subscription::<Destination, _>(
                         destination_topic.as_str().transient_local().reliable(),
                         move |dest_server: &mut PlanServer<P>, dest_msg: Destination| {
-                            //rclrs::log!(server.node.logger(), "Received destination for robot");
                             dest_server.handle_destination(&robot_id_clone, dest_msg);
                         },
                     ) {

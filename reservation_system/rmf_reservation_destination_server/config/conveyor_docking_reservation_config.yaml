@@ -1,0 +1,44 @@
+# Reservation and docking configuration for factory conveyor simulation.
+grid_size: 0.5
+
+safe_sets:
+  - name: factory_floor
+    region:
+      hint: axis_aligned_rectangle
+      points: [-5.0, -5.0, 15.0, 15.0]
+
+parking_spots:
+  - name: parking_1
+    region:
+      hint: axis_aligned_rectangle
+      points: [-2.0, 1.0, -1.0, 2.0]
+  - name: parking_2
+    region:
+      hint: axis_aligned_rectangle
+      points: [7.0, 1.0, 8.0, 2.0]
+
+docking_spots:
+  - name: conveyor_r1_c1_dock
+    region:
+      hint: axis_aligned_rectangle
+      points: [-0.25, 0.5, 0.25, 1.0]
+  - name: conveyor_r1_c2_dock
+    region:
+      hint: axis_aligned_rectangle
+      points: [2.25, 0.5, 2.75, 1.0]
+  - name: conveyor_r1_c3_dock
+    region:
+      hint: axis_aligned_rectangle
+      points: [4.75, 0.5, 5.25, 1.0]
+  - name: conveyor_r2_c1_dock
+    region:
+      hint: axis_aligned_rectangle
+      points: [-0.25, 2.0, 0.25, 2.5]
+  - name: conveyor_r2_c2_dock
+    region:
+      hint: axis_aligned_rectangle
+      points: [2.25, 2.0, 2.75, 2.5]
+  - name: conveyor_r2_c3_dock
+    region:
+      hint: axis_aligned_rectangle
+      points: [4.75, 2.0, 5.25, 2.5]
