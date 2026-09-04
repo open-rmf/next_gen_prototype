@@ -38,7 +38,8 @@ WORKDIR /opt/ros2_rust_ws
 COPY . /tmp/next_gen_prototype
 
 # Install ROS 2 dependencies via rosdep for both underlay and prototype branch
-RUN rosdep init || true && \
+RUN apt-get update && \
+    rosdep init || true && \
     rosdep update && \
     rosdep install --from-paths /tmp/next_gen_prototype --ignore-src -yr --skip-keys="rclrs ament_cargo ament_python" && \
     rm -rf /var/lib/apt/lists/*
