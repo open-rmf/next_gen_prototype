@@ -3,13 +3,31 @@ use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
 use ros_env::{
     nav2_msgs::msg::Costmap,
-    rmf_prototype_msgs::msg::{PlanError, Progress, Region, SafeZone},
+    rmf_prototype_msgs::msg::{Plan, PlanError, Progress, Region, SafeZone},
 };
 use std::sync::Arc;
 
 #[derive(Component)]
 pub struct SafeZoneSubscription {
     pub subscriber: Arc<RosSubscription<SafeZone>>,
+}
+
+#[derive(Component)]
+pub struct PlanSubscription {
+    pub subscriber: Arc<RosSubscription<Plan>>,
+}
+
+#[derive(Component, Debug, Clone, Default, Deref)]
+pub struct CurrentPlan(pub Option<Plan>);
+
+impl CurrentPlan {
+    pub fn update(&mut self, value: Plan) {
+        self.0 = Some(value);
+    }
+
+    pub fn clear(&mut self) {
+        self.0 = None;
+    }
 }
 
 #[derive(Component)]
@@ -97,8 +115,9 @@ pub struct SafeZoneSubscriptionPlugin {}
 
 impl Plugin for SafeZoneSubscriptionPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(PreUpdate, update_incremental_target)
+        app.add_systems(PreUpdate, (update_incremental_target, update_plan))
             .add_observer(create_safe_zone_subscriber)
+            .add_observer(create_plan_subscriber)
             .add_observer(create_costmap_publisher)
             .add_observer(create_progress_publisher)
             .add_observer(create_plan_error_publisher);
@@ -122,6 +141,26 @@ fn create_safe_zone_subscriber(
             subscriber: Arc::clone(&subscription),
         },
         CurrentSafeZone::default(),
+    ));
+}
+
+fn create_plan_subscriber(
+    trigger: Trigger<OnAdd, Nav2Agent>,
+    mut commands: Commands,
+    agents: Query<&Nav2Agent>,
+    node: Res<RclrsNode>,
+) {
+    let e = trigger.target();
+    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
+        return;
+    };
+    let topic = agent_name + "/plan";
+    let subscription = Arc::new(RosSubscription::<Plan>::new(&node, topic.clone()));
+    commands.entity(e).insert((
+        PlanSubscription {
+            subscriber: Arc::clone(&subscription),
+        },
+        CurrentPlan::default(),
     ));
 }
 
@@ -242,6 +281,33 @@ fn update_incremental_target(
             target_y as f64,
             target_yaw as f64,
         ));
+    }
+}
+
+fn update_plan(
+    mut subscriptions: Query<(
+        &PlanSubscription,
+        &mut CurrentPlan,
+        &Nav2Agent,
+    )>,
+) {
+    for (plan_sub, mut current_plan, agent) in subscriptions.iter_mut() {
+        let Some(plan) = plan_sub.subscriber.data_callback() else {
+            continue;
+        };
+        let is_new = match current_plan.0.as_ref() {
+            Some(current) => current.plan_id != plan.plan_id,
+            None => true,
+        };
+        if is_new {
+            debug!(
+                "[{}] Received new plan version {} with {} waypoints",
+                agent.name,
+                plan.plan_id.plan_version,
+                plan.waypoints.len()
+            );
+            *current_plan = CurrentPlan(Some(plan));
+        }
     }
 }
 
