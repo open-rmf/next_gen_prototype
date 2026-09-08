@@ -29,11 +29,12 @@ from launch.actions import (
     LogInfo,
     OpaqueFunction,
     RegisterEventHandler,
+    SetEnvironmentVariable,
 )
 from launch.conditions import IfCondition, UnlessCondition
 from launch.event_handlers import OnShutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, TextSubstitution
+from launch.substitutions import LaunchConfiguration, PythonExpression, TextSubstitution
 from launch_ros.actions import Node
 from nav2_common.launch import ParseMultiRobotPose
 
@@ -122,19 +123,53 @@ def generate_launch_description():
         description='Start each robot stack after its transforms are ready.',
     )
 
+    declare_use_simulator_cmd = DeclareLaunchArgument(
+        'use_simulator',
+        default_value='True',
+        description='Whether to start the Gazebo simulation server',
+    )
+
+    declare_start_gazebo_cmd = DeclareLaunchArgument(
+        'start_gazebo',
+        default_value=LaunchConfiguration('use_simulator'),
+        description='Alias for use_simulator: whether to start the Gazebo simulation server',
+    )
+
+    start_sim = PythonExpression([
+        "str('", LaunchConfiguration('use_simulator'), "').lower() in ('true', '1') and ",
+        "str('", LaunchConfiguration('start_gazebo'), "').lower() in ('true', '1')"
+    ])
+
+    has_clock = LaunchConfiguration('has_clock')
+    declare_has_clock_cmd = DeclareLaunchArgument(
+        'has_clock',
+        default_value=start_sim,
+        description='Whether to bridge the simulation clock to /clock (defaults to true if starting simulator)',
+    )
+
+    declare_gz_partition_cmd = DeclareLaunchArgument(
+        'gz_partition',
+        default_value=os.environ.get('GZ_PARTITION', 'sim'),
+        description='Gazebo Transport partition name',
+    )
+
     # Start Gazebo with plugin providing the robot spawning service
     world_sdf = tempfile.mktemp(prefix='nav2_', suffix='.sdf')
     world_sdf_xacro = ExecuteProcess(
+        condition=IfCondition(start_sim),
         cmd=['xacro', '-o', world_sdf, ['headless:=', 'False'], world])
     start_gazebo_cmd = ExecuteProcess(
+        condition=IfCondition(start_sim),
         cmd=['gz', 'sim', '-r', '-s', world_sdf],
         output='screen',
     )
 
-    remove_temp_sdf_file = RegisterEventHandler(event_handler=OnShutdown(
-        on_shutdown=[
-            OpaqueFunction(function=lambda _: os.remove(world_sdf))
-        ]))
+    remove_temp_sdf_file = RegisterEventHandler(
+        condition=IfCondition(start_sim),
+        event_handler=OnShutdown(
+            on_shutdown=[
+                OpaqueFunction(function=lambda _: os.path.exists(world_sdf) and os.remove(world_sdf))
+            ]))
 
     robots_list = ParseMultiRobotPose('robots').value()
 
@@ -183,13 +218,12 @@ def generate_launch_description():
                         'headless': 'False',
                         'use_robot_state_pub': use_robot_state_pub,
                         'use_navigation': use_navigation,
-                        'clock_topic': TextSubstitution(
-                            text=(
-                                '/clock'
-                                if robot_index == 0
-                                else f'/{namespace}/clock'
-                            )
-                        ),
+                        'clock_topic': PythonExpression([
+                            "'/clock' if (str('",
+                            has_clock,
+                            "').lower() in ('true', '1') and ",
+                            f"{robot_index} == 0) else '/{namespace}/clock'",
+                        ]),
                         'x_pose': TextSubstitution(text=str(init_pose['x'])),
                         'y_pose': TextSubstitution(text=str(init_pose['y'])),
                         'z_pose': TextSubstitution(text=str(init_pose['z'])),
@@ -244,6 +278,11 @@ def generate_launch_description():
     ld.add_action(declare_use_robot_state_pub_cmd)
     ld.add_action(declare_use_navigation_cmd)
     ld.add_action(declare_staged_startup_cmd)
+    ld.add_action(declare_use_simulator_cmd)
+    ld.add_action(declare_start_gazebo_cmd)
+    ld.add_action(declare_has_clock_cmd)
+    ld.add_action(declare_gz_partition_cmd)
+    ld.add_action(SetEnvironmentVariable('GZ_PARTITION', LaunchConfiguration('gz_partition')))
 
     # initial localization node
     for robot_name in robots_list:
