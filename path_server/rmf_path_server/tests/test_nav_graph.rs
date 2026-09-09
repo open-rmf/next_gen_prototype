@@ -252,7 +252,9 @@ fn test_path_server_graphkey_destination_dock_action() -> Result<(), Box<dyn std
     // Spin until plan is received
     let start_time = std::time::Instant::now();
     while start_time.elapsed() < std::time::Duration::from_secs(5) {
+        let _ = discovery_pub.publish(&discovery_msg);
         let _ = odom_pub.publish(&odom_msg);
+        let _ = dest_pub.publish(&dest_msg);
         executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
         if let Ok(guard) = received_plan.lock() {
             if let Some(plan) = guard.as_ref() {

@@ -134,7 +134,8 @@ impl<P: MapfPlanner> PlanServer<P> {
                         robot_id
                     );
 
-                    // If region constraints are empty, resolve coordinates from vertex position
+                    // If region constraints are empty, resolve coordinates from vertex position.
+                    // If already present, ensure primary region matches the exact vertex position.
                     if msg.constraints.regions.is_empty() {
                         msg.constraints.regions.push(TargetRegion {
                             region: Region {
@@ -143,6 +144,9 @@ impl<P: MapfPlanner> PlanServer<P> {
                             },
                             ..Default::default()
                         });
+                    } else if let Some(first_reg) = msg.constraints.regions.first_mut() {
+                        first_reg.region.points = vec![vertex.position[0], vertex.position[1]];
+                        first_reg.region.hint = Region::HINT_POINT;
                     }
 
                     // Check for special arrival action (e.g. docking)
@@ -270,7 +274,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                                 continue;
                             };
                             let target_action = target_actions.get(robot_id).map(|s| s.as_str());
-                            let plan = Self::to_plan_msg(
+                            let mut plan = Self::to_plan_msg(
                                 agent_idx,
                                 traj,
                                 plan_id,
@@ -280,6 +284,11 @@ impl<P: MapfPlanner> PlanServer<P> {
                                 target_action,
                                 1.0,
                             );
+                            if let Some(dest) = goals.get(robot_id) {
+                                if let Some(last_wp) = plan.waypoints.last_mut() {
+                                    last_wp.arrival_constraints = dest.constraints.clone();
+                                }
+                            }
                             plans.insert(robot_id.clone(), plan);
                         }
 
