@@ -1,14 +1,17 @@
-use crate::{safe_zone::PlanErrorPublisher, Nav2Agent};
+use crate::{safe_zone::PlanErrorPublisher, workflow::*, Nav2Agent};
 use bevy::prelude::*;
 use bevy_ros2::{RclrsExecutorCommands, RclrsNode, RosActionClient};
 use crossflow::{prelude::*, service::Service};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use nalgebra::UnitQuaternion;
 use rclrs::*;
 use ros_env::{
     builtin_interfaces::msg::Time as RosTime,
     geometry_msgs::msg::{Point, Pose, PoseStamped, Quaternion},
-    nav2_msgs::action::{NavigateToPose, NavigateToPose_Feedback, NavigateToPose_Goal},
+    nav2_msgs::action::{
+        DockRobot, DockRobot_Goal, NavigateToPose, NavigateToPose_Feedback, NavigateToPose_Goal,
+        UndockRobot, UndockRobot_Goal,
+    },
     rmf_prototype_msgs::msg::SafeZoneId,
     std_msgs::msg::Header,
 };
@@ -17,21 +20,61 @@ use thiserror::Error;
 
 #[derive(Clone, Debug, Event)]
 pub struct InnerNavigationTarget {
-    agent: Entity,
-    safe_zone_id: SafeZoneId,
-    x: f64,
-    y: f64,
-    yaw: f64,
+    pub agent: Entity,
+    pub safe_zone_id: SafeZoneId,
+    pub x: f64,
+    pub y: f64,
+    pub yaw: f64,
+    pub dock_action: Option<String>,
+    pub workflow: Vec<WorkflowActionStep>,
 }
 
 impl InnerNavigationTarget {
-    pub fn new(agent: Entity, safe_zone_id: SafeZoneId, x: f64, y: f64, yaw: f64) -> Self {
+    pub fn new(
+        agent: Entity,
+        safe_zone_id: SafeZoneId,
+        x: f64,
+        y: f64,
+        yaw: f64,
+        dock_action: Option<String>,
+    ) -> Self {
+        let workflow = dock_action
+            .as_deref()
+            .map(parse_workflow)
+            .unwrap_or_default();
         Self {
             agent,
             safe_zone_id,
             x,
             y,
             yaw,
+            dock_action,
+            workflow,
+        }
+    }
+
+    pub fn with_workflow(
+        agent: Entity,
+        safe_zone_id: SafeZoneId,
+        x: f64,
+        y: f64,
+        yaw: f64,
+        workflow: Vec<WorkflowActionStep>,
+    ) -> Self {
+        let dock_action = workflow.first().and_then(|s| match s {
+            WorkflowActionStep::Dock { dock_id } => Some(dock_id.clone()),
+            WorkflowActionStep::Undock => Some("undock".to_string()),
+            WorkflowActionStep::Custom { name, .. } => Some(name.clone()),
+            _ => None,
+        });
+        Self {
+            agent,
+            safe_zone_id,
+            x,
+            y,
+            yaw,
+            dock_action,
+            workflow,
         }
     }
 }
@@ -110,6 +153,8 @@ impl Plugin for InnerNavigationClientPlugin {
         app.add_event::<InnerNavigationTarget>()
             .add_event::<InnerNavigationFeedback>()
             .add_event::<CancelInnerForAgent>()
+            .add_event::<WorkflowStepEvent>()
+            .add_event::<WorkflowCompletedEvent>()
             .add_observer(create_inner_navigation_client);
 
         // Initialize Navigation services
@@ -127,6 +172,12 @@ impl Plugin for InnerNavigationClientPlugin {
     }
 }
 
+#[derive(Component, Clone)]
+pub struct InnerDockClient {
+    pub dock_client: Arc<RosActionClient<DockRobot>>,
+    pub undock_client: Arc<RosActionClient<UndockRobot>>,
+}
+
 fn create_inner_navigation_client(
     trigger: Trigger<OnAdd, Nav2Agent>,
     mut commands: Commands,
@@ -137,13 +188,22 @@ fn create_inner_navigation_client(
     let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
         return;
     };
-    let action_name = agent_name + "/inner/navigate_to_pose";
+    let action_name = agent_name.clone() + "/inner/navigate_to_pose";
     // Set up client for the inner Nav2 action
     let inner_action_client = RosActionClient::<NavigateToPose>::new(&node, action_name);
 
+    let dock_action_name = agent_name.clone() + "/inner/dock_robot";
+    let undock_action_name = agent_name + "/inner/undock_robot";
+    let dock_client = RosActionClient::<DockRobot>::new(&node, dock_action_name);
+    let undock_client = RosActionClient::<UndockRobot>::new(&node, undock_action_name);
+
     commands
         .entity(e)
-        .insert(InnerNavigationClient::new(Arc::new(inner_action_client)));
+        .insert(InnerNavigationClient::new(Arc::new(inner_action_client)))
+        .insert(InnerDockClient {
+            dock_client: Arc::new(dock_client),
+            undock_client: Arc::new(undock_client),
+        });
 }
 
 #[derive(Clone)]
@@ -151,6 +211,14 @@ struct InnerNavigationRequest {
     agent: Entity,
     safe_zone_id: SafeZoneId,
     target_pose: PoseStamped,
+    dock_action: Option<String>,
+    workflow: Vec<WorkflowActionStep>,
+}
+
+#[derive(Clone)]
+struct InnerWorkflowRequest {
+    handle: CurrentInnerNavigationGoal,
+    steps: Vec<WorkflowActionStep>,
 }
 
 #[derive(Clone)]
@@ -218,6 +286,8 @@ impl InnerNavigationServices {
         let async_monitor_ongoing_navigation_service =
             app.spawn_service(async_monitor_ongoing_navigation);
         let process_navigation_result_service = app.spawn_service(process_navigation_result);
+        let check_workflow_action_service = app.spawn_service(check_workflow_action);
+        let async_execute_workflow_service = app.spawn_service(async_execute_workflow);
         let cleanup_goal_client_service = app.spawn_service(cleanup_goal_client);
         let log_error_service = app.spawn_service(log_inner_navigation_error);
 
@@ -240,6 +310,8 @@ impl InnerNavigationServices {
             let async_monitor_new_navigation_request =
                 builder.create_node(async_monitor_ongoing_navigation_service);
             let post_nav_processing = builder.create_node(process_navigation_result_service);
+            let check_workflow_action = builder.create_node(check_workflow_action_service);
+            let async_execute_workflow = builder.create_node(async_execute_workflow_service);
             let cleanup_goal_client = builder.create_node(cleanup_goal_client_service);
             let log_error = builder.create_node(log_error_service);
 
@@ -302,8 +374,19 @@ impl InnerNavigationServices {
             // If goal was aborted, retry navigation by requesting new goal
             // Goal client will be updated in a downstream node
             builder.connect(post_nav_fork_result.ok, async_request_new_goal.input);
-            // Otherwise, cleanup goal client
-            builder.connect(post_nav_fork_result.err, cleanup_goal_client.input);
+
+            // Check if workflow action should be executed upon reaching target waypoint
+            builder.connect(post_nav_fork_result.err, check_workflow_action.input);
+            let (check_wf_fork_result_input, check_wf_fork_result) = builder.create_fork_result();
+            builder.connect(check_workflow_action.output, check_wf_fork_result_input);
+
+            // If workflow steps are present, execute workflow action
+            builder.connect(check_wf_fork_result.ok, async_execute_workflow.input);
+            // When workflow completes, cleanup goal client
+            builder.connect(async_execute_workflow.output, cleanup_goal_client.input);
+
+            // If no workflow steps required or navigation error, cleanup goal client
+            builder.connect(check_wf_fork_result.err, cleanup_goal_client.input);
 
             // Connect errors to logging node
             builder.connect(cancel_goal_fork_result.err, log_error.input);
@@ -368,6 +451,8 @@ fn await_new_requests(
             agent: target.agent,
             safe_zone_id: target.safe_zone_id.clone(),
             target_pose: goal_pose.clone(),
+            dock_action: target.dock_action.clone(),
+            workflow: target.workflow.clone(),
         };
         info!(
             "[{:?}] Requesting new pending goal to pose [{}, {}]",
@@ -809,6 +894,339 @@ fn process_navigation_result(
     return Err(result);
 }
 
+fn check_workflow_action(
+    Blocking {
+        request: result, ..
+    }: Blocking<InnerNavigationResult>,
+) -> Result<InnerWorkflowRequest, InnerNavigationResult> {
+    match result {
+        Ok(ref success) => {
+            if !success.handle.request.workflow.is_empty() {
+                info!(
+                    "[{:?}] Navigation succeeded to waypoint. Initiating {} workflow step(s)",
+                    success.handle.request.agent.index(),
+                    success.handle.request.workflow.len()
+                );
+                Ok(InnerWorkflowRequest {
+                    handle: success.handle.clone(),
+                    steps: success.handle.request.workflow.clone(),
+                })
+            } else if let Some(ref dock_id) = success.handle.request.dock_action {
+                let steps = parse_workflow(dock_id);
+                if !steps.is_empty() {
+                    info!(
+                        "[{:?}] Navigation succeeded to waypoint. Initiating fallback {} workflow step(s) from dock_action '{}'",
+                        success.handle.request.agent.index(),
+                        steps.len(),
+                        dock_id
+                    );
+                    Ok(InnerWorkflowRequest {
+                        handle: success.handle.clone(),
+                        steps,
+                    })
+                } else {
+                    Err(result)
+                }
+            } else {
+                Err(result)
+            }
+        }
+        Err(_) => Err(result),
+    }
+}
+
+fn async_execute_workflow(
+    Async {
+        request: wf_req,
+        channel,
+        ..
+    }: Async<InnerWorkflowRequest>,
+    inner_dock_clients: Query<&InnerDockClient>,
+    executor_commands: Res<RclrsExecutorCommands>,
+) -> impl Future<Output = InnerNavigationResult> {
+    let handle = wf_req.handle.clone();
+    let agent_entity = handle.request.agent;
+    let safe_zone_id = handle.request.safe_zone_id.clone();
+    let dock_client_result = inner_dock_clients.get(agent_entity);
+    let Ok(dock_client) = dock_client_result else {
+        warn!(
+            "[{:?}] InnerDockClient not found for agent entity",
+            agent_entity.index()
+        );
+        return std::future::ready(Ok(InnerNavigationSuccess { handle })).left_future();
+    };
+
+    let dock_client = dock_client.clone();
+    let steps = wf_req.steps.clone();
+    let fallback_handle = handle.clone();
+    let total_steps = steps.len();
+
+    info!(
+        "[{:?}] Executing workflow with {} step(s)",
+        agent_entity.index(),
+        total_steps
+    );
+
+    executor_commands
+        .run(async move {
+            for (idx, step) in steps.into_iter().enumerate() {
+                // Broadcast WorkflowStepEvent to Bevy observers
+                let step_clone = step.clone();
+                let sz_id = safe_zone_id.clone();
+                channel.commands(move |cmds| {
+                    cmds.trigger(WorkflowStepEvent {
+                        agent: agent_entity,
+                        safe_zone_id: sz_id,
+                        step: step_clone,
+                        step_index: idx,
+                        total_steps,
+                    });
+                });
+
+                match step {
+                    WorkflowActionStep::Dock { dock_id } => {
+                        info!(
+                            "[{:?}] [Step {}/{}] Starting DockRobot action for dock_id: '{}'",
+                            agent_entity.index(),
+                            idx + 1,
+                            total_steps,
+                            dock_id
+                        );
+                        let dock_goal = DockRobot_Goal {
+                            use_dock_id: true,
+                            dock_id: dock_id.clone(),
+                            dock_pose: handle.request.target_pose.clone(),
+                            dock_type: "simple_charging_dock".to_string(),
+                            max_staging_time: 1000.0,
+                            navigate_to_staging_pose: false,
+                        };
+                        let Some(goal_client) = dock_client.dock_client.request_goal(dock_goal).await else {
+                            warn!(
+                                "[{:?}] DockRobot action request failed or server unavailable for dock '{}'",
+                                agent_entity.index(),
+                                dock_id
+                            );
+                            continue;
+                        };
+
+                        let mut stream = goal_client.stream();
+                        let mut success = false;
+                        let mut last_error_code = 0;
+                        while let Some(event) = stream.next().await {
+                            match event {
+                                GoalEvent::Feedback(fb) => {
+                                    info!(
+                                        "[{:?}] [DockRobot] Docking state: {}, retries: {}",
+                                        agent_entity.index(),
+                                        fb.state,
+                                        fb.num_retries
+                                    );
+                                }
+                                GoalEvent::Status(s) => {
+                                    debug!("[{:?}] [DockRobot] Status: {:?}", agent_entity.index(), s.code);
+                                }
+                                GoalEvent::Result((status, result)) => {
+                                    last_error_code = result.error_code;
+                                    info!(
+                                        "[{:?}] [DockRobot] Result: {:?}, success={}, error_code={}, error_msg='{}'",
+                                        agent_entity.index(),
+                                        status,
+                                        result.success,
+                                        result.error_code,
+                                        result.error_msg
+                                    );
+                                    if status == GoalStatusCode::Succeeded || result.success {
+                                        success = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !success && last_error_code == 901 {
+                            warn!(
+                                "[{:?}] Dock '{}' not in database (code 901). Retrying with direct target dock_pose...",
+                                agent_entity.index(),
+                                dock_id
+                            );
+                            let fallback_goal = DockRobot_Goal {
+                                use_dock_id: false,
+                                dock_id: String::new(),
+                                dock_pose: handle.request.target_pose.clone(),
+                                dock_type: "simple_charging_dock".to_string(),
+                                max_staging_time: 1000.0,
+                                navigate_to_staging_pose: false,
+                            };
+                            if let Some(fb_client) = dock_client.dock_client.request_goal(fallback_goal).await {
+                                let mut fb_stream = fb_client.stream();
+                                while let Some(event) = fb_stream.next().await {
+                                    match event {
+                                        GoalEvent::Result((status, result)) => {
+                                            info!(
+                                                "[{:?}] [DockRobot Fallback] Result: {:?}, success={}, error_code={}, error_msg='{}'",
+                                                agent_entity.index(),
+                                                status,
+                                                result.success,
+                                                result.error_code,
+                                                result.error_msg
+                                            );
+                                            if status == GoalStatusCode::Succeeded || result.success {
+                                                success = true;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        if !success && last_error_code == 903 {
+                            warn!(
+                                "[{:?}] Robot not pre-staged for dock '{}' (code 903). Retrying with navigate_to_staging_pose=true...",
+                                agent_entity.index(),
+                                dock_id
+                            );
+                            let staging_goal = DockRobot_Goal {
+                                use_dock_id: true,
+                                dock_id: dock_id.clone(),
+                                dock_pose: handle.request.target_pose.clone(),
+                                dock_type: "simple_charging_dock".to_string(),
+                                max_staging_time: 1000.0,
+                                navigate_to_staging_pose: true,
+                            };
+                            if let Some(st_client) = dock_client.dock_client.request_goal(staging_goal).await {
+                                let mut st_stream = st_client.stream();
+                                while let Some(event) = st_stream.next().await {
+                                    if let GoalEvent::Result((status, result)) = event {
+                                        info!(
+                                            "[{:?}] [DockRobot Stage Retry] Result: {:?}, success={}, error_code={}, error_msg='{}'",
+                                            agent_entity.index(),
+                                            status,
+                                            result.success,
+                                            result.error_code,
+                                            result.error_msg
+                                        );
+                                        if status == GoalStatusCode::Succeeded || result.success {
+                                            success = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !success {
+                            let sz_id = safe_zone_id.clone();
+                            channel.commands(move |cmds| {
+                                cmds.trigger(WorkflowCompletedEvent {
+                                    agent: agent_entity,
+                                    safe_zone_id: sz_id,
+                                    success: false,
+                                });
+                            });
+                            return Err(InnerNavigationError {
+                                handle: Some(handle),
+                                kind: InnerNavigationErrorKind::GoalAbortedError,
+                            });
+                        }
+                    }
+                    WorkflowActionStep::Undock => {
+                        info!(
+                            "[{:?}] [Step {}/{}] Starting UndockRobot action",
+                            agent_entity.index(),
+                            idx + 1,
+                            total_steps
+                        );
+                        let undock_goal = UndockRobot_Goal {
+                            dock_type: String::new(),
+                            max_undocking_time: 60.0,
+                        };
+                        let Some(goal_client) = dock_client.undock_client.request_goal(undock_goal).await else {
+                            warn!(
+                                "[{:?}] UndockRobot action request failed or server unavailable",
+                                agent_entity.index()
+                            );
+                            continue;
+                        };
+
+                        let mut stream = goal_client.stream();
+                        let mut success = false;
+                        while let Some(event) = stream.next().await {
+                            match event {
+                                GoalEvent::Status(s) => {
+                                    debug!("[{:?}] [UndockRobot] Status: {:?}", agent_entity.index(), s.code);
+                                }
+                                GoalEvent::Result((status, result)) => {
+                                    info!(
+                                        "[{:?}] [UndockRobot] Result: {:?}, success={}",
+                                        agent_entity.index(),
+                                        status,
+                                        result.success
+                                    );
+                                    if status == GoalStatusCode::Succeeded || result.success {
+                                        success = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !success {
+                            let sz_id = safe_zone_id.clone();
+                            channel.commands(move |cmds| {
+                                cmds.trigger(WorkflowCompletedEvent {
+                                    agent: agent_entity,
+                                    safe_zone_id: sz_id,
+                                    success: false,
+                                });
+                            });
+                            return Err(InnerNavigationError {
+                                handle: Some(handle),
+                                kind: InnerNavigationErrorKind::GoalAbortedError,
+                            });
+                        }
+                    }
+                    WorkflowActionStep::Wait { duration_sec } => {
+                        info!(
+                            "[{:?}] [Step {}/{}] Waiting for {:.2} seconds",
+                            agent_entity.index(),
+                            idx + 1,
+                            total_steps,
+                            duration_sec
+                        );
+                        if duration_sec > 0.0 {
+                            tokio::time::sleep(std::time::Duration::from_secs_f32(duration_sec)).await;
+                        }
+                    }
+                    WorkflowActionStep::Custom { name, payload } => {
+                        info!(
+                            "[{:?}] [Step {}/{}] Executing custom action '{}' (payload: {:?})",
+                            agent_entity.index(),
+                            idx + 1,
+                            total_steps,
+                            name,
+                            payload
+                        );
+                    }
+                }
+            }
+
+            let sz_id = safe_zone_id.clone();
+            channel.commands(move |cmds| {
+                cmds.trigger(WorkflowCompletedEvent {
+                    agent: agent_entity,
+                    safe_zone_id: sz_id,
+                    success: true,
+                });
+            });
+
+            info!(
+                "[{:?}] Successfully completed all {} workflow step(s)",
+                agent_entity.index(),
+                total_steps
+            );
+            Ok(InnerNavigationSuccess { handle })
+        })
+        .then(|res| async move {
+            res.unwrap_or(Ok(InnerNavigationSuccess { handle: fallback_handle }))
+        })
+        .right_future()
+}
+
 fn should_publish_path_blocked(
     completed_goal_id: &SafeZoneId,
     active_goal: Option<(&SafeZoneId, bool)>,
@@ -921,5 +1339,48 @@ mod tests {
         let completed = safe_zone_id(1, 3, 7);
 
         assert!(!should_publish_path_blocked(&completed, None));
+    }
+
+    #[test]
+    fn inner_navigation_target_parses_workflow_automatically() {
+        let target = InnerNavigationTarget::new(
+            Entity::from_raw(1),
+            safe_zone_id(1, 0, 0),
+            1.0,
+            2.0,
+            0.0,
+            Some(r#"[{"action": "dock", "dock_id": "d1"}, {"action": "undock"}]"#.to_string()),
+        );
+
+        assert_eq!(target.workflow.len(), 2);
+        assert_eq!(
+            target.workflow[0],
+            WorkflowActionStep::Dock {
+                dock_id: "d1".to_string()
+            }
+        );
+        assert_eq!(target.workflow[1], WorkflowActionStep::Undock);
+    }
+
+    #[test]
+    fn inner_navigation_target_with_workflow_derives_dock_action() {
+        let steps = vec![
+            WorkflowActionStep::Dock {
+                dock_id: "station_42".to_string(),
+            },
+            WorkflowActionStep::Wait { duration_sec: 5.0 },
+            WorkflowActionStep::Undock,
+        ];
+        let target = InnerNavigationTarget::with_workflow(
+            Entity::from_raw(1),
+            safe_zone_id(1, 0, 0),
+            1.0,
+            2.0,
+            0.0,
+            steps.clone(),
+        );
+
+        assert_eq!(target.workflow, steps);
+        assert_eq!(target.dock_action, Some("station_42".to_string()));
     }
 }

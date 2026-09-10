@@ -291,7 +291,8 @@ fn update_incremental_target(
         }
 
         let plan_ref = maybe_plan.and_then(|p| p.0.as_ref());
-        let Some((target_x, target_y, target_yaw)) = next_target(&safe_zone, plan_ref) else {
+        let Some((target_x, target_y, target_yaw, dock_action)) = next_target(&safe_zone, plan_ref)
+        else {
             continue;
         };
 
@@ -316,8 +317,8 @@ fn update_incremental_target(
             continue;
         }
         debug!(
-            "[{:?}] Updating SafeZone to target: ({:.2}, {:.2}, {:.2})",
-            agent.name, target_x, target_y, target_yaw
+            "[{:?}] Updating SafeZone to target: ({:.2}, {:.2}, {:.2}), dock={:?}",
+            agent.name, target_x, target_y, target_yaw, dock_action
         );
 
         *current_safe_zone = CurrentSafeZone(Some(safe_zone.clone()));
@@ -328,6 +329,7 @@ fn update_incremental_target(
             target_x as f64,
             target_y as f64,
             target_yaw as f64,
+            dock_action,
         ));
     }
 }
@@ -368,10 +370,14 @@ fn is_valid(safe_zone: &SafeZone) -> bool {
     true
 }
 
-fn next_target(safe_zone: &SafeZone, plan: Option<&Plan>) -> Option<(f32, f32, f32)> {
+fn next_target(
+    safe_zone: &SafeZone,
+    plan: Option<&Plan>,
+) -> Option<(f32, f32, f32, Option<String>)> {
     let constraints = &safe_zone.incremental_target;
     let mut xy: Option<(f32, f32)> = None;
     let mut yaw: Option<f32> = None;
+    let mut dock_action: Option<String> = None;
 
     // 1. Extract position and explicit orientations from regions
     for target_region in constraints.regions.iter() {
@@ -401,10 +407,16 @@ fn next_target(safe_zone: &SafeZone, plan: Option<&Plan>) -> Option<(f32, f32, f
         }
     }
 
-    // 2. Extract explicit orientations from incremental_target.nodes
+    // 2. Extract explicit orientations and dock action from incremental_target.nodes
     for target_node in constraints.nodes.iter() {
         for target_ori in target_node.orientations.iter() {
             yaw = Some(target_ori.orientation_radians);
+        }
+        if let Some(name) = target_node.key.name.first() {
+            let name_str = name.to_string();
+            if name_str.contains("dock") {
+                dock_action = Some(name_str);
+            }
         }
     }
 
@@ -418,6 +430,32 @@ fn next_target(safe_zone: &SafeZone, plan: Option<&Plan>) -> Option<(f32, f32, f
         if let Some(waypoint) = plan.waypoints.get(wp_idx) {
             if xy.is_none() {
                 xy = Some((waypoint.position[0], waypoint.position[1]));
+            }
+
+            // Extract dock action or workflow from arrival_action
+            if !waypoint.arrival_action.is_empty() {
+                dock_action = Some(waypoint.arrival_action.clone());
+            }
+
+            // Fallback or override from plan.workflow if this is the target/final waypoint
+            if dock_action.is_none() && !plan.workflow.is_empty() {
+                let is_last_wp = wp_idx + 1 >= plan.waypoints.len();
+                if is_last_wp {
+                    dock_action = Some(plan.workflow.clone());
+                }
+            }
+
+            // Fallback dock action from waypoint arrival_constraints.nodes
+            if dock_action.is_none() {
+                for node in &waypoint.arrival_constraints.nodes {
+                    if let Some(name) = node.key.name.first() {
+                        let name_str = name.to_string();
+                        if name_str.contains("dock") {
+                            dock_action = Some(name_str);
+                            break;
+                        }
+                    }
+                }
             }
 
             // Check waypoint arrival_constraints.nodes for orientation
@@ -442,11 +480,13 @@ fn next_target(safe_zone: &SafeZone, plan: Option<&Plan>) -> Option<(f32, f32, f
 
             // Semantic dock orientation conventions (e.g. conveyor docks)
             if yaw.is_none() {
-                let action = &waypoint.arrival_action;
-                if action.contains("conveyor_r1") || action.contains("dock_conveyor_r1") {
+                let action_str = dock_action.as_deref().unwrap_or(&waypoint.arrival_action);
+                if action_str.contains("conveyor_r1") || action_str.contains("dock_conveyor_r1") {
                     // Row 1 conveyors (Infeed at Y=0.0): approached from South corridor, face South (-pi/2)
                     yaw = Some(-std::f32::consts::FRAC_PI_2);
-                } else if action.contains("conveyor_r2") || action.contains("dock_conveyor_r2") {
+                } else if action_str.contains("conveyor_r2")
+                    || action_str.contains("dock_conveyor_r2")
+                {
                     // Row 2 conveyors (Outfeed at Y=5.0): approached from North corridor, face North (+pi/2)
                     yaw = Some(std::f32::consts::FRAC_PI_2);
                 }
@@ -468,7 +508,7 @@ fn next_target(safe_zone: &SafeZone, plan: Option<&Plan>) -> Option<(f32, f32, f
     }
 
     let final_yaw = yaw.unwrap_or(0.0);
-    xy.map(|(x, y)| (x, y, final_yaw))
+    xy.map(|(x, y)| (x, y, final_yaw, dock_action))
 }
 
 #[cfg(test)]
@@ -545,7 +585,7 @@ mod tests {
             .push(target_ori);
 
         let target = next_target(&sz, None);
-        assert_eq!(target, Some((1.0, 2.0, 1.23)));
+        assert_eq!(target, Some((1.0, 2.0, 1.23, None)));
     }
 
     #[test]
@@ -558,7 +598,7 @@ mod tests {
         sz.incremental_target.nodes.push(node);
 
         let target = next_target(&sz, None);
-        assert_eq!(target, Some((1.0, 2.0, -1.57)));
+        assert_eq!(target, Some((1.0, 2.0, -1.57, None)));
     }
 
     #[test]
@@ -581,9 +621,10 @@ mod tests {
 
         let target = next_target(&sz, Some(&plan));
         assert!(target.is_some());
-        let (x, y, yaw) = target.unwrap();
+        let (x, y, yaw, dock) = target.unwrap();
         assert_eq!((x, y), (0.0, 1.5));
         assert!((yaw - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-6);
+        assert_eq!(dock, Some("dock_conveyor_r1_c1".to_string()));
     }
 
     #[test]
@@ -606,9 +647,10 @@ mod tests {
 
         let target = next_target(&sz, Some(&plan));
         assert!(target.is_some());
-        let (x, y, yaw) = target.unwrap();
+        let (x, y, yaw, dock) = target.unwrap();
         assert_eq!((x, y), (2.5, 3.5));
         assert!((yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        assert_eq!(dock, Some("dock_conveyor_r2_c2".to_string()));
     }
 
     #[test]
@@ -629,7 +671,7 @@ mod tests {
         ];
 
         let target = next_target(&sz, Some(&plan));
-        assert_eq!(target, Some((5.0, 0.0, 0.0)));
+        assert_eq!(target, Some((5.0, 0.0, 0.0, None)));
     }
 
     #[test]
@@ -664,5 +706,64 @@ mod tests {
             .push(ori2);
 
         assert!(current.should_update_target(&next_sz));
+    }
+
+    #[test]
+    fn next_target_extracts_json_workflow_from_arrival_action() {
+        let mut sz = safe_zone(1, 0, 0, 0.0, 1.5);
+        sz.target_waypoint = vec![1].try_into().unwrap();
+
+        let workflow_json = r#"[
+            {"action": "dock", "dock_id": "dock_conveyor_r1_c1"},
+            {"action": "wait", "duration_sec": 3.0},
+            {"action": "undock"}
+        ]"#;
+
+        let mut plan = Plan::default();
+        plan.waypoints = vec![
+            ros_env::rmf_prototype_msgs::msg::Waypoint {
+                position: [0.0, 2.0],
+                ..Default::default()
+            },
+            ros_env::rmf_prototype_msgs::msg::Waypoint {
+                position: [0.0, 1.5],
+                arrival_action: workflow_json.to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let target = next_target(&sz, Some(&plan));
+        assert!(target.is_some());
+        let (x, y, yaw, action) = target.unwrap();
+        assert_eq!((x, y), (0.0, 1.5));
+        assert!((yaw - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-6);
+        assert_eq!(action, Some(workflow_json.to_string()));
+    }
+
+    #[test]
+    fn next_target_uses_plan_workflow_on_final_waypoint() {
+        let mut sz = safe_zone(1, 0, 0, 2.5, 3.5);
+        sz.target_waypoint = vec![1].try_into().unwrap();
+
+        let mut plan = Plan::default();
+        plan.workflow = "dock_conveyor_r2_c2".to_string();
+        plan.waypoints = vec![
+            ros_env::rmf_prototype_msgs::msg::Waypoint {
+                position: [2.5, 3.0],
+                ..Default::default()
+            },
+            ros_env::rmf_prototype_msgs::msg::Waypoint {
+                position: [2.5, 3.5],
+                arrival_action: String::new(),
+                ..Default::default()
+            },
+        ];
+
+        let target = next_target(&sz, Some(&plan));
+        assert!(target.is_some());
+        let (x, y, yaw, action) = target.unwrap();
+        assert_eq!((x, y), (2.5, 3.5));
+        assert!((yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        assert_eq!(action, Some("dock_conveyor_r2_c2".to_string()));
     }
 }
