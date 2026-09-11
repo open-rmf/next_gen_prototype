@@ -19,8 +19,8 @@ use ros_env::{
     rmf_prototype_msgs::{
         self,
         msg::{
-            ControlPoint, Curve, Destination, Plan, PlanError, PlanId, Region, TargetRegion,
-            TrafficDependency, Trajectory, Waypoint,
+            ControlPoint, Curve, Destination, GraphElementKey, Plan, PlanError, PlanId, Region,
+            TargetNode, TargetOrientation, TargetRegion, TrafficDependency, Trajectory, Waypoint,
         },
     },
 };
@@ -120,47 +120,111 @@ impl<P: MapfPlanner> PlanServer<P> {
                 .join("")
         );
 
-        // Check if a graph key target node is specified and matches any vertex in the nav graph
+        // Check if destination targets a nav graph vertex or docking station
         let mut looked_up_action = None;
         if let Some(nav_graph) = &self.nav_graph {
+            let mut matched_vertex = None;
+
+            // 1. Try matching by target node graph key (vertex ID or location/dock name)
             for node_target in &msg.constraints.nodes {
                 if let Some(vertex) = nav_graph.find_vertex(&node_target.key) {
+                    matched_vertex = Some(vertex);
+                    break;
+                }
+            }
+
+            // 2. If not matched, try matching by proximity to a docking station
+            // (e.g. client sent raw contact pose (0.0, 0.95) for a conveyor dock)
+            if matched_vertex.is_none() {
+                if let Some(first_reg) = msg.constraints.regions.first() {
+                    if first_reg.region.points.len() >= 2 {
+                        let x = first_reg.region.points[0];
+                        let y = first_reg.region.points[1];
+                        if let Some(dock_vertex) =
+                            nav_graph.find_dock_vertex_by_proximity(x, y, 0.8)
+                        {
+                            rclrs::log!(
+                                self.node.logger(),
+                                "Destination point ({}, {}) resolved to dock vertex {} at ({}, {}) by proximity for robot {}",
+                                x,
+                                y,
+                                dock_vertex.id,
+                                dock_vertex.position[0],
+                                dock_vertex.position[1],
+                                robot_id
+                            );
+                            matched_vertex = Some(dock_vertex);
+                        }
+                    }
+                }
+            }
+
+            // 3. If a vertex is matched, snap destination to the vertex position (pre-docking pose for docks)
+            if let Some(vertex) = matched_vertex {
+                rclrs::log!(
+                    self.node.logger(),
+                    "Resolved destination to vertex {} at ({}, {}) for robot {}",
+                    vertex.id,
+                    vertex.position[0],
+                    vertex.position[1],
+                    robot_id
+                );
+
+                // Set primary region to vertex position (pre-docking pose for docking stations)
+                if msg.constraints.regions.is_empty() {
+                    msg.constraints.regions.push(TargetRegion {
+                        region: Region {
+                            points: vec![vertex.position[0], vertex.position[1]],
+                            hint: Region::HINT_POINT,
+                        },
+                        ..Default::default()
+                    });
+                } else if let Some(first_reg) = msg.constraints.regions.first_mut() {
+                    first_reg.region.points = vec![vertex.position[0], vertex.position[1]];
+                    first_reg.region.hint = Region::HINT_POINT;
+                }
+
+                // If vertex has an approach orientation (e.g. facing dock), enforce target orientation
+                if let Some(ori) = vertex.orientation {
+                    let target_ori = TargetOrientation {
+                        orientation_radians: ori,
+                        spread_radians: 0.0,
+                        tolerance_radians: 0.05,
+                    };
+                    if let Some(first_reg) = msg.constraints.regions.first_mut() {
+                        first_reg.orientations = vec![target_ori.clone()];
+                    }
+                    if !msg.constraints.nodes.is_empty() {
+                        for node in msg.constraints.nodes.iter_mut() {
+                            node.orientations = vec![target_ori.clone()];
+                        }
+                    } else {
+                        let mut key = GraphElementKey::default();
+                        if let Ok(seq) = vec![vertex.id as i64].try_into() {
+                            key.key = seq;
+                        }
+                        if let Some(vname) = &vertex.name {
+                            if let Ok(seq) = vec![vname.clone().into()].try_into() {
+                                key.name = seq;
+                            }
+                        }
+                        msg.constraints.nodes.push(TargetNode {
+                            key,
+                            orientations: vec![target_ori],
+                        });
+                    }
+                }
+
+                // Check for special arrival action (e.g. docking)
+                if let Some(action) = &vertex.arrival_action {
                     rclrs::log!(
                         self.node.logger(),
-                        "Matched destination graph key to vertex {} at ({}, {}) for robot {}",
+                        "Found special action for robot {} at dock vertex {}: {:?}",
+                        robot_id,
                         vertex.id,
-                        vertex.position[0],
-                        vertex.position[1],
-                        robot_id
+                        action
                     );
-
-                    // If region constraints are empty, resolve coordinates from vertex position.
-                    // If already present, ensure primary region matches the exact vertex position.
-                    if msg.constraints.regions.is_empty() {
-                        msg.constraints.regions.push(TargetRegion {
-                            region: Region {
-                                points: vec![vertex.position[0], vertex.position[1]],
-                                hint: Region::HINT_POINT,
-                            },
-                            ..Default::default()
-                        });
-                    } else if let Some(first_reg) = msg.constraints.regions.first_mut() {
-                        first_reg.region.points = vec![vertex.position[0], vertex.position[1]];
-                        first_reg.region.hint = Region::HINT_POINT;
-                    }
-
-                    // Check for special arrival action (e.g. docking)
-                    if let Some(action) = &vertex.arrival_action {
-                        rclrs::log!(
-                            self.node.logger(),
-                            "Found special action for robot {} at vertex {}: {:?}",
-                            robot_id,
-                            vertex.id,
-                            action
-                        );
-                        looked_up_action = Some(action.name.clone());
-                    }
-                    break;
+                    looked_up_action = Some(action.name.clone());
                 }
             }
         }
@@ -392,7 +456,26 @@ impl<P: MapfPlanner> PlanServer<P> {
             // Make sure we have the latest odometry for all robots.
             // Give up if odometry for some robots is stale.
             if let Some(odom) = self.latest_pose_estimate.get(robot_id) {
-                starts.insert(robot_id.clone(), odom.clone());
+                let mut start_odom = odom.clone();
+                // If robot is at a docked vertex or corridor, assume plan starts at the undocked vertex
+                if let Some(nav_graph) = &self.nav_graph {
+                    let rx = start_odom.pose.pose.position.x as f32;
+                    let ry = start_odom.pose.pose.position.y as f32;
+                    if let Some(undock_pos) = nav_graph.find_undocked_start_position(rx, ry) {
+                        rclrs::log!(
+                            self.node.logger(),
+                            "Robot {} is at docked position ({:.2}, {:.2}); assuming start at undocked vertex ({:.2}, {:.2})",
+                            robot_id,
+                            rx,
+                            ry,
+                            undock_pos[0],
+                            undock_pos[1]
+                        );
+                        start_odom.pose.pose.position.x = undock_pos[0] as f64;
+                        start_odom.pose.pose.position.y = undock_pos[1] as f64;
+                    }
+                }
+                starts.insert(robot_id.clone(), start_odom);
             } else {
                 rclrs::log!(
                     self.node.logger(),

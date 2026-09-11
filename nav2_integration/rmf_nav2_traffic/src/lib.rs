@@ -72,7 +72,8 @@ impl Plugin for Nav2TrafficPlugin {
 
         info!("Nav2TrafficPlugin: spawning agents: {:?}", agent_names);
         for name in agent_names {
-            app.world_mut().spawn(Nav2Agent::new(name));
+            app.world_mut()
+                .spawn((Nav2Agent::new(name), AgentDockState::default()));
         }
     }
 }

@@ -44,6 +44,61 @@ impl Nav2Agent {
     }
 }
 
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct AgentDockState {
+    pub is_docked: bool,
+    pub dock_id: Option<String>,
+    pub undock_pose: Option<[f64; 2]>,
+}
+
+impl AgentDockState {
+    pub fn new(is_docked: bool, dock_id: Option<String>, undock_pose: Option<[f64; 2]>) -> Self {
+        Self {
+            is_docked,
+            dock_id,
+            undock_pose,
+        }
+    }
+
+    pub fn docked(dock_id: impl Into<String>, undock_pose: Option<[f64; 2]>) -> Self {
+        Self {
+            is_docked: true,
+            dock_id: Some(dock_id.into()),
+            undock_pose,
+        }
+    }
+
+    pub fn undocked() -> Self {
+        Self {
+            is_docked: false,
+            dock_id: None,
+            undock_pose: None,
+        }
+    }
+
+    pub fn is_docked(&self) -> bool {
+        self.is_docked
+    }
+
+    pub fn set_docked(&mut self, dock_id: impl Into<String>, undock_pose: Option<[f64; 2]>) {
+        self.is_docked = true;
+        self.dock_id = Some(dock_id.into());
+        self.undock_pose = undock_pose;
+    }
+
+    pub fn set_undocked(&mut self) {
+        self.is_docked = false;
+        self.dock_id = None;
+        self.undock_pose = None;
+    }
+}
+
+#[derive(Clone, Debug, Event, PartialEq)]
+pub struct AgentDockStateChanged {
+    pub agent: Entity,
+    pub state: AgentDockState,
+}
+
 #[derive(Component)]
 pub struct AmclPose(pub PoseWithCovarianceStamped);
 

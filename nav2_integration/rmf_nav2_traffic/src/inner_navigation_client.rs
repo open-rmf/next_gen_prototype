@@ -1,6 +1,8 @@
-use crate::{safe_zone::PlanErrorPublisher, workflow::*, Nav2Agent};
+use crate::{
+    safe_zone::PlanErrorPublisher, workflow::*, AgentDockState, AgentDockStateChanged, Nav2Agent,
+};
 use bevy::prelude::*;
-use bevy_ros2::{RclrsExecutorCommands, RclrsNode, RosActionClient};
+use bevy_ros2::{RclrsExecutorCommands, RclrsNode, RosActionClient, RosPublisher};
 use crossflow::{prelude::*, service::Service};
 use futures::{FutureExt, StreamExt};
 use nalgebra::UnitQuaternion;
@@ -13,7 +15,7 @@ use ros_env::{
         UndockRobot, UndockRobot_Goal,
     },
     rmf_prototype_msgs::msg::SafeZoneId,
-    std_msgs::msg::Header,
+    std_msgs::msg::{Header, String as RosString},
 };
 use std::{future::Future, sync::Arc};
 use thiserror::Error;
@@ -155,6 +157,7 @@ impl Plugin for InnerNavigationClientPlugin {
             .add_event::<CancelInnerForAgent>()
             .add_event::<WorkflowStepEvent>()
             .add_event::<WorkflowCompletedEvent>()
+            .add_event::<AgentDockStateChanged>()
             .add_observer(create_inner_navigation_client);
 
         // Initialize Navigation services
@@ -176,6 +179,7 @@ impl Plugin for InnerNavigationClientPlugin {
 pub struct InnerDockClient {
     pub dock_client: Arc<RosActionClient<DockRobot>>,
     pub undock_client: Arc<RosActionClient<UndockRobot>>,
+    pub dock_status_pub: Arc<RosPublisher<RosString>>,
 }
 
 fn create_inner_navigation_client(
@@ -193,9 +197,11 @@ fn create_inner_navigation_client(
     let inner_action_client = RosActionClient::<NavigateToPose>::new(&node, action_name);
 
     let dock_action_name = agent_name.clone() + "/inner/dock_robot";
-    let undock_action_name = agent_name + "/inner/undock_robot";
+    let undock_action_name = agent_name.clone() + "/inner/undock_robot";
+    let dock_status_topic = "/".to_string() + &agent_name + "/dock_status";
     let dock_client = RosActionClient::<DockRobot>::new(&node, dock_action_name);
     let undock_client = RosActionClient::<UndockRobot>::new(&node, undock_action_name);
+    let dock_status_pub = Arc::new(RosPublisher::<RosString>::new(&node, dock_status_topic));
 
     commands
         .entity(e)
@@ -203,7 +209,9 @@ fn create_inner_navigation_client(
         .insert(InnerDockClient {
             dock_client: Arc::new(dock_client),
             undock_client: Arc::new(undock_client),
-        });
+            dock_status_pub,
+        })
+        .insert(AgentDockState::default());
 }
 
 #[derive(Clone)]
@@ -635,11 +643,51 @@ fn async_cancel_goal(
         })
 }
 
+/// Executes an UndockRobot ROS 2 action on the given action client and returns true on success.
+pub async fn execute_undock_action(
+    undock_client: &Arc<RosActionClient<UndockRobot>>,
+    agent_index: u32,
+) -> bool {
+    let undock_goal = UndockRobot_Goal {
+        dock_type: String::new(),
+        max_undocking_time: 60.0,
+    };
+    let Some(goal_client) = undock_client.request_goal(undock_goal).await else {
+        warn!("[{agent_index}] UndockRobot action request failed or server unavailable");
+        return false;
+    };
+
+    let mut stream = goal_client.stream();
+    let mut success = false;
+    while let Some(event) = stream.next().await {
+        match event {
+            GoalEvent::Status(s) => {
+                debug!("[{agent_index}] [UndockRobot] Status: {:?}", s.code);
+            }
+            GoalEvent::Result((status, result)) => {
+                info!(
+                    "[{agent_index}] [UndockRobot] Result: {:?}, success={}",
+                    status, result.success
+                );
+                if status == GoalStatusCode::Succeeded || result.success {
+                    success = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    success
+}
+
 /// Submits a new NavigateToPose goal asynchronously to the Nav2 action server
 /// and returns a handle containing the goal client.
+/// If the agent is currently docked, it first triggers undocking before navigating.
 fn async_request_new_goal(
-    Async { request, .. }: Async<InnerNavigationRequest>,
+    Async {
+        request, channel, ..
+    }: Async<InnerNavigationRequest>,
     mut inner_nav_clients: Query<&mut InnerNavigationClient>,
+    dock_states: Query<(&InnerDockClient, Option<&AgentDockState>)>,
     executor_commands: Res<RclrsExecutorCommands>,
 ) -> impl Future<Output = Result<CurrentInnerNavigationGoal, InnerNavigationError>> {
     let inner_nav_client_result = inner_nav_clients.get_mut(request.agent);
@@ -655,21 +703,82 @@ fn async_request_new_goal(
     // Reset goal client before submitting new request
     inner_nav_client.reset_goal();
 
+    let action_client = Arc::clone(&inner_nav_client.action_client);
+
+    let (dock_client_opt, is_docked) = match dock_states.get(request.agent) {
+        Ok((dc, state_opt)) => (
+            Some(dc.clone()),
+            state_opt.map(|s| s.is_docked).unwrap_or(false),
+        ),
+        Err(_) => (None, false),
+    };
+
     let mut pose = request.target_pose.clone();
     debug!(
-        "[{:?}] Requesting new navigation goal to pose [{}, {}]",
+        "[{:?}] Requesting new navigation goal to pose [{}, {}] (is_docked: {})",
         request.agent.index(),
         pose.pose.position.x,
-        pose.pose.position.y
+        pose.pose.position.y,
+        is_docked,
     );
     pose.header.frame_id = "map".to_string();
-    let nav_request = inner_nav_client
-        .action_client
-        .request_goal(NavigateToPose_Goal { pose, ..default() });
+
+    let agent_entity = request.agent;
 
     executor_commands
         .run(async move {
-            match nav_request.await {
+            if is_docked {
+                if let Some(dock_client) = dock_client_opt {
+                    info!(
+                        "[{:?}] Agent is currently docked. Triggering UndockRobot before navigating to pose [{}, {}]",
+                        agent_entity.index(),
+                        pose.pose.position.x,
+                        pose.pose.position.y
+                    );
+                    let _ = dock_client.dock_status_pub.publish(RosString {
+                        data: "undocking".to_string(),
+                    });
+                    let undock_success =
+                        execute_undock_action(&dock_client.undock_client, agent_entity.index()).await;
+                    if !undock_success {
+                        error!(
+                            "[{:?}] UndockRobot failed prior to navigation. Aborting request.",
+                            agent_entity.index()
+                        );
+                        let _ = dock_client.dock_status_pub.publish(RosString {
+                            data: "undock_failed".to_string(),
+                        });
+                        return Err(InnerNavigationError {
+                            handle: None,
+                            kind: InnerNavigationErrorKind::GoalAbortedError,
+                        });
+                    }
+
+                    info!(
+                        "[{:?}] Undocking succeeded. Updating AgentDockState to is_docked=false and proceeding with navigation.",
+                        agent_entity.index()
+                    );
+                    let _ = dock_client.dock_status_pub.publish(RosString {
+                        data: "undocked".to_string(),
+                    });
+                    channel.commands(move |cmds| {
+                        cmds.entity(agent_entity).insert(AgentDockState::undocked());
+                        cmds.trigger(AgentDockStateChanged {
+                            agent: agent_entity,
+                            state: AgentDockState::undocked(),
+                        });
+                    });
+                }
+            }
+
+            let nav_handle = action_client
+                .request_goal(NavigateToPose_Goal {
+                    pose,
+                    ..default()
+                })
+                .await;
+
+            match nav_handle {
                 Some(handle) => Ok(CurrentInnerNavigationGoal {
                     request,
                     goal_client: handle,
@@ -992,6 +1101,9 @@ fn async_execute_workflow(
                             total_steps,
                             dock_id
                         );
+                        let _ = dock_client.dock_status_pub.publish(RosString {
+                            data: format!("docking: {}", dock_id),
+                        });
                         let dock_goal = DockRobot_Goal {
                             use_dock_id: true,
                             dock_id: dock_id.clone(),
@@ -1006,6 +1118,9 @@ fn async_execute_workflow(
                                 agent_entity.index(),
                                 dock_id
                             );
+                            let _ = dock_client.dock_status_pub.publish(RosString {
+                                data: format!("dock_failed: {} (server unavailable)", dock_id),
+                            });
                             continue;
                         };
 
@@ -1053,13 +1168,14 @@ fn async_execute_workflow(
                                 dock_pose: handle.request.target_pose.clone(),
                                 dock_type: "simple_charging_dock".to_string(),
                                 max_staging_time: 1000.0,
-                                navigate_to_staging_pose: false,
+                                navigate_to_staging_pose: true,
                             };
                             if let Some(fb_client) = dock_client.dock_client.request_goal(fallback_goal).await {
                                 let mut fb_stream = fb_client.stream();
                                 while let Some(event) = fb_stream.next().await {
                                     match event {
                                         GoalEvent::Result((status, result)) => {
+                                            last_error_code = result.error_code;
                                             info!(
                                                 "[{:?}] [DockRobot Fallback] Result: {:?}, success={}, error_code={}, error_msg='{}'",
                                                 agent_entity.index(),
@@ -1077,11 +1193,12 @@ fn async_execute_workflow(
                                 }
                             }
                         }
-                        if !success && last_error_code == 903 {
+                        if !success && (last_error_code == 903 || last_error_code == 0 || last_error_code == 905 || last_error_code == 999) {
                             warn!(
-                                "[{:?}] Robot not pre-staged for dock '{}' (code 903). Retrying with navigate_to_staging_pose=true...",
+                                "[{:?}] Robot dock attempt for '{}' unsuccessful (error_code={}). Retrying with navigate_to_staging_pose=true...",
                                 agent_entity.index(),
-                                dock_id
+                                dock_id,
+                                last_error_code
                             );
                             let staging_goal = DockRobot_Goal {
                                 use_dock_id: true,
@@ -1095,6 +1212,7 @@ fn async_execute_workflow(
                                 let mut st_stream = st_client.stream();
                                 while let Some(event) = st_stream.next().await {
                                     if let GoalEvent::Result((status, result)) = event {
+                                        last_error_code = result.error_code;
                                         info!(
                                             "[{:?}] [DockRobot Stage Retry] Result: {:?}, success={}, error_code={}, error_msg='{}'",
                                             agent_entity.index(),
@@ -1111,6 +1229,9 @@ fn async_execute_workflow(
                             }
                         }
                         if !success {
+                            let _ = dock_client.dock_status_pub.publish(RosString {
+                                data: format!("dock_failed: {} (code={})", dock_id, last_error_code),
+                            });
                             let sz_id = safe_zone_id.clone();
                             channel.commands(move |cmds| {
                                 cmds.trigger(WorkflowCompletedEvent {
@@ -1124,6 +1245,28 @@ fn async_execute_workflow(
                                 kind: InnerNavigationErrorKind::GoalAbortedError,
                             });
                         }
+
+                        let dock_id_clone = dock_id.clone();
+                        let pose = [
+                            handle.request.target_pose.pose.position.x,
+                            handle.request.target_pose.pose.position.y,
+                        ];
+                        info!(
+                            "[{:?}] Dock '{}' succeeded! Updating AgentDockState to is_docked=true",
+                            agent_entity.index(),
+                            dock_id_clone
+                        );
+                        let _ = dock_client.dock_status_pub.publish(RosString {
+                            data: format!("docked: {}", dock_id_clone),
+                        });
+                        channel.commands(move |cmds| {
+                            let state = AgentDockState::docked(dock_id_clone, Some(pose));
+                            cmds.entity(agent_entity).insert(state.clone());
+                            cmds.trigger(AgentDockStateChanged {
+                                agent: agent_entity,
+                                state,
+                            });
+                        });
                     }
                     WorkflowActionStep::Undock => {
                         info!(
@@ -1132,40 +1275,30 @@ fn async_execute_workflow(
                             idx + 1,
                             total_steps
                         );
-                        let undock_goal = UndockRobot_Goal {
-                            dock_type: String::new(),
-                            max_undocking_time: 60.0,
-                        };
-                        let Some(goal_client) = dock_client.undock_client.request_goal(undock_goal).await else {
-                            warn!(
-                                "[{:?}] UndockRobot action request failed or server unavailable",
+                        let _ = dock_client.dock_status_pub.publish(RosString {
+                            data: "undocking".to_string(),
+                        });
+                        let success =
+                            execute_undock_action(&dock_client.undock_client, agent_entity.index()).await;
+                        if success {
+                            info!(
+                                "[{:?}] Undock action in workflow succeeded! Updating AgentDockState to is_docked=false",
                                 agent_entity.index()
                             );
-                            continue;
-                        };
-
-                        let mut stream = goal_client.stream();
-                        let mut success = false;
-                        while let Some(event) = stream.next().await {
-                            match event {
-                                GoalEvent::Status(s) => {
-                                    debug!("[{:?}] [UndockRobot] Status: {:?}", agent_entity.index(), s.code);
-                                }
-                                GoalEvent::Result((status, result)) => {
-                                    info!(
-                                        "[{:?}] [UndockRobot] Result: {:?}, success={}",
-                                        agent_entity.index(),
-                                        status,
-                                        result.success
-                                    );
-                                    if status == GoalStatusCode::Succeeded || result.success {
-                                        success = true;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !success {
+                            let _ = dock_client.dock_status_pub.publish(RosString {
+                                data: "undocked".to_string(),
+                            });
+                            channel.commands(move |cmds| {
+                                cmds.entity(agent_entity).insert(AgentDockState::undocked());
+                                cmds.trigger(AgentDockStateChanged {
+                                    agent: agent_entity,
+                                    state: AgentDockState::undocked(),
+                                });
+                            });
+                        } else {
+                            let _ = dock_client.dock_status_pub.publish(RosString {
+                                data: "undock_failed".to_string(),
+                            });
                             let sz_id = safe_zone_id.clone();
                             channel.commands(move |cmds| {
                                 cmds.trigger(WorkflowCompletedEvent {
@@ -1382,5 +1515,23 @@ mod tests {
 
         assert_eq!(target.workflow, steps);
         assert_eq!(target.dock_action, Some("station_42".to_string()));
+    }
+
+    #[test]
+    fn agent_dock_state_default_and_transitions() {
+        let mut state = AgentDockState::default();
+        assert!(!state.is_docked);
+        assert_eq!(state.dock_id, None);
+        assert_eq!(state.undock_pose, None);
+
+        state.set_docked("dock_c1", Some([0.0, 1.5]));
+        assert!(state.is_docked);
+        assert_eq!(state.dock_id.as_deref(), Some("dock_c1"));
+        assert_eq!(state.undock_pose, Some([0.0, 1.5]));
+
+        state.set_undocked();
+        assert!(!state.is_docked);
+        assert_eq!(state.dock_id, None);
+        assert_eq!(state.undock_pose, None);
     }
 }
