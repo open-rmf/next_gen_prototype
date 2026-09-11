@@ -1,4 +1,8 @@
-use crate::{inner_navigation_client::InnerNavigationTarget, Nav2Agent};
+use crate::{
+    agent::{AgentExecutionState, AmclPose},
+    inner_navigation_client::InnerNavigationTarget,
+    Nav2Agent,
+};
 use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
 use ros_env::{
@@ -266,11 +270,22 @@ fn update_incremental_target(
         &ProgressPublisher,
         &mut CurrentSafeZone,
         Option<&CurrentPlan>,
+        Option<&AmclPose>,
+        Option<&AgentExecutionState>,
         &Nav2Agent,
     )>,
 ) {
-    for (e, safe_zone_sub, costmap_pub, progress_pub, mut current_safe_zone, maybe_plan, agent) in
-        subscriptions.iter_mut()
+    for (
+        e,
+        safe_zone_sub,
+        costmap_pub,
+        progress_pub,
+        mut current_safe_zone,
+        maybe_plan,
+        maybe_pose,
+        maybe_execution,
+        agent,
+    ) in subscriptions.iter_mut()
     {
         let Some(safe_zone) = safe_zone_sub.subscriber.data_callback() else {
             continue;
@@ -302,12 +317,39 @@ fn update_incremental_target(
             .first()
             .copied()
             .unwrap_or(safe_zone.last_waypoint);
+
+        // Our actual progress along the plan, as opposed to the progress level we
+        // have merely been released to reach. Reporting the latter would tell
+        // every robot that depends on us that we have already vacated space we
+        // are still sitting in.
+        let progress_value = match (plan_ref, maybe_pose) {
+            (Some(plan), Some(pose)) => projected_progress(
+                plan,
+                pose.0.pose.pose.position.x as f32,
+                pose.0.pose.pose.position.y as f32,
+                safe_zone.target_progress,
+            ),
+            // Without a pose or a plan we cannot make any claim about having
+            // moved, and claiming progress we have not made is the dangerous
+            // direction to be wrong in.
+            _ => 0.0,
+        };
+
+        let (execution_state, active_action) = execution_state_of(
+            maybe_execution,
+            plan_ref,
+            safe_zone.last_waypoint,
+            target_wp,
+        );
+
         let Ok(_) = progress_pub.publisher.publish(Progress {
-            progress: safe_zone.target_progress,
+            progress: progress_value,
             reached_waypoint: safe_zone.last_waypoint,
             target_waypoint: target_wp,
             reached_keys: vec![],
             plan_id: safe_zone.id.plan_id.clone(),
+            execution_state,
+            active_action,
         }) else {
             error!("Failed to publish progress for agent [{}]", agent.name);
             continue;
@@ -352,6 +394,85 @@ fn update_plan(mut subscriptions: Query<(&PlanSubscription, &mut CurrentPlan, &N
             );
             *current_plan = CurrentPlan(Some(plan));
         }
+    }
+}
+
+/// Estimate how far along its plan the robot actually is, expressed in the
+/// plan's own progress units.
+///
+/// The robot's position is projected onto the nearest segment of the plan and
+/// the progress levels of that segment's endpoints are interpolated. The result
+/// is clamped to `ceiling` (the safe zone's `target_progress`) because reporting
+/// progress beyond what we have been released to reach would tell dependent
+/// robots that we have vacated space we are in fact still occupying - which
+/// SafeZone.msg warns can cascade into unrecoverable traffic states.
+///
+/// Note this is the naive nearest-segment projection, and it is wrong whenever
+/// the plan doubles back on itself or the robot leaves the planned polyline (as
+/// it does while docking). The `execution_state` field exists precisely so that
+/// consumers are not forced to rely on this number in those situations.
+fn projected_progress(plan: &Plan, x: f32, y: f32, ceiling: f32) -> f32 {
+    let clamp = |value: f32| value.clamp(0.0, ceiling.max(0.0));
+
+    match plan.waypoints.len() {
+        0 => return 0.0,
+        1 => return clamp(plan.waypoints[0].progress),
+        _ => {}
+    }
+
+    let mut best: Option<(f32, f32)> = None;
+    for pair in plan.waypoints.windows(2) {
+        let (ax, ay) = (pair[0].position[0], pair[0].position[1]);
+        let (bx, by) = (pair[1].position[0], pair[1].position[1]);
+        let (dx, dy) = (bx - ax, by - ay);
+
+        let length_squared = dx * dx + dy * dy;
+        let t = if length_squared <= f32::EPSILON {
+            0.0
+        } else {
+            (((x - ax) * dx + (y - ay) * dy) / length_squared).clamp(0.0, 1.0)
+        };
+
+        let distance_squared = (x - (ax + t * dx)).powi(2) + (y - (ay + t * dy)).powi(2);
+        let progress = pair[0].progress + t * (pair[1].progress - pair[0].progress);
+
+        if best.is_none_or(|(best_distance, _)| distance_squared < best_distance) {
+            best = Some((distance_squared, progress));
+        }
+    }
+
+    clamp(best.map(|(_, progress)| progress).unwrap_or(0.0))
+}
+
+/// Decide which `Progress::EXECUTION_STATE_*` to report.
+///
+/// An action that is in flight always wins: while the robot is driving into or
+/// out of a dock it is physically committed and must not be replanned, whatever
+/// its waypoint indices happen to say. Only when nothing is in flight do we fall
+/// back to distinguishing "finished" from "stopped short of the goal", which is
+/// what `reached_waypoint == target_waypoint` alone cannot tell us apart.
+fn execution_state_of(
+    execution: Option<&AgentExecutionState>,
+    plan: Option<&Plan>,
+    reached_waypoint: u64,
+    target_waypoint: u64,
+) -> (u8, String) {
+    if let Some(action) = execution.and_then(|state| state.active_action.clone()) {
+        return (Progress::EXECUTION_STATE_EXECUTING_ACTION, action);
+    }
+
+    if reached_waypoint != target_waypoint {
+        return (Progress::EXECUTION_STATE_MOVING, String::new());
+    }
+
+    let at_end_of_plan = plan
+        .map(|plan| reached_waypoint as usize + 1 >= plan.waypoints.len())
+        .unwrap_or(true);
+
+    if at_end_of_plan {
+        (Progress::EXECUTION_STATE_IDLE, String::new())
+    } else {
+        (Progress::EXECUTION_STATE_HOLDING_FOR_TRAFFIC, String::new())
     }
 }
 
@@ -765,5 +886,91 @@ mod tests {
         assert_eq!((x, y), (2.5, 3.5));
         assert!((yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
         assert_eq!(action, Some("dock_conveyor_r2_c2".to_string()));
+    }
+    fn plan_with_progress(points: &[([f32; 2], f32)]) -> Plan {
+        let mut plan = Plan::default();
+        plan.waypoints = points
+            .iter()
+            .map(
+                |(position, progress)| ros_env::rmf_prototype_msgs::msg::Waypoint {
+                    position: *position,
+                    progress: *progress,
+                    ..Default::default()
+                },
+            )
+            .collect();
+        plan
+    }
+
+    #[test]
+    fn progress_interpolates_between_waypoints() {
+        let plan = plan_with_progress(&[([0.0, 0.0], 0.0), ([10.0, 0.0], 4.0)]);
+
+        // A quarter of the way along the segment is a quarter of the way through
+        // that segment's progress band.
+        let progress = projected_progress(&plan, 2.5, 0.0, f32::MAX);
+        assert!((progress - 1.0).abs() < 1e-5, "got {progress}");
+    }
+
+    #[test]
+    fn progress_projects_robot_off_the_line_back_onto_it() {
+        let plan = plan_with_progress(&[([0.0, 0.0], 0.0), ([10.0, 0.0], 4.0)]);
+
+        let progress = projected_progress(&plan, 5.0, 1.5, f32::MAX);
+        assert!((progress - 2.0).abs() < 1e-5, "got {progress}");
+    }
+
+    #[test]
+    fn progress_is_clamped_to_the_released_ceiling() {
+        let plan = plan_with_progress(&[([0.0, 0.0], 0.0), ([10.0, 0.0], 4.0)]);
+
+        // The robot has physically overshot the point it was released to, but we
+        // must not advertise progress beyond the ceiling or dependent robots will
+        // believe space has been freed that has not been.
+        let progress = projected_progress(&plan, 9.0, 0.0, 1.0);
+        assert!((progress - 1.0).abs() < 1e-5, "got {progress}");
+    }
+
+    #[test]
+    fn progress_of_empty_plan_is_zero() {
+        assert_eq!(projected_progress(&Plan::default(), 3.0, 4.0, 10.0), 0.0);
+    }
+
+    #[test]
+    fn executing_action_overrides_waypoint_heuristic() {
+        let plan = plan_with_progress(&[([0.0, 0.0], 0.0), ([1.0, 0.0], 1.0)]);
+        let execution = AgentExecutionState {
+            active_action: Some("dock_conveyor_r1_c1".to_string()),
+        };
+
+        // Sitting on the last waypoint would otherwise look like IDLE.
+        let (state, action) = execution_state_of(Some(&execution), Some(&plan), 1, 1);
+        assert_eq!(state, Progress::EXECUTION_STATE_EXECUTING_ACTION);
+        assert_eq!(action, "dock_conveyor_r1_c1");
+    }
+
+    #[test]
+    fn stopped_short_of_the_goal_is_holding_for_traffic() {
+        let plan = plan_with_progress(&[([0.0, 0.0], 0.0), ([1.0, 0.0], 1.0), ([2.0, 0.0], 2.0)]);
+
+        let (state, action) = execution_state_of(None, Some(&plan), 1, 1);
+        assert_eq!(state, Progress::EXECUTION_STATE_HOLDING_FOR_TRAFFIC);
+        assert!(action.is_empty());
+    }
+
+    #[test]
+    fn stopped_at_the_end_of_the_plan_is_idle() {
+        let plan = plan_with_progress(&[([0.0, 0.0], 0.0), ([1.0, 0.0], 1.0)]);
+
+        let (state, _) = execution_state_of(None, Some(&plan), 1, 1);
+        assert_eq!(state, Progress::EXECUTION_STATE_IDLE);
+    }
+
+    #[test]
+    fn travelling_towards_a_later_waypoint_is_moving() {
+        let plan = plan_with_progress(&[([0.0, 0.0], 0.0), ([1.0, 0.0], 1.0), ([2.0, 0.0], 2.0)]);
+
+        let (state, _) = execution_state_of(None, Some(&plan), 0, 2);
+        assert_eq!(state, Progress::EXECUTION_STATE_MOVING);
     }
 }

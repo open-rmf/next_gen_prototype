@@ -70,6 +70,21 @@ impl WorkflowActionStep {
             _ => None,
         }
     }
+
+    /// A name for this step suitable for reporting on `~/plan/progress`.
+    ///
+    /// Where possible this echoes the identifier that appeared in the plan's
+    /// `arrival_action` / `departure_action`, so that whoever posted the plan can
+    /// correlate the reported action with the one they asked for.
+    pub fn action_name(&self) -> String {
+        match self {
+            Self::Dock { dock_id } if !dock_id.is_empty() => dock_id.clone(),
+            Self::Dock { .. } => "dock".to_string(),
+            Self::Undock => "undock".to_string(),
+            Self::Wait { .. } => "wait".to_string(),
+            Self::Custom { name, .. } => name.clone(),
+        }
+    }
 }
 
 /// A structured container for a sequence of workflow action steps.

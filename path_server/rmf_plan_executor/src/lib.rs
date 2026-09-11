@@ -15,7 +15,7 @@
 use mapf_post::{
     na::{Isometry2, Vector2},
     spatial_allocation::{CurrentPosition, Grid2D},
-    MapfResult, WaypointFollower,
+    MapfResult, SemanticWaypoint, WaypointFollower,
 };
 use rclrs::{IntoPrimitiveOptions, Node};
 use ros_env::builtin_interfaces;
@@ -25,8 +25,8 @@ use ros_env::nav2_msgs::msg::Costmap;
 use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
 use ros_env::rmf_prototype_msgs;
 use ros_env::rmf_prototype_msgs::msg::{
-    DestinationConstraints, Plan, PlanError, PlanId, PlanRelease, SafeZone, SafeZoneId,
-    TargetOrientation,
+    DestinationConstraints, Plan, PlanError, PlanId, PlanRelease, Progress, SafeZone, SafeZoneId,
+    TargetOrientation, TrafficDependency,
 };
 use ros_env::std_msgs;
 use std::{
@@ -105,6 +105,10 @@ pub struct PlanExecutor {
     pub grid_resolution: f32,
     pub grid_origin: Pose,
     pub latest_map: Option<OccupancyGrid>,
+    /// The most recent `~/plan/progress` reported by each participant. This is
+    /// the authoritative account of how far a robot has actually got, as opposed
+    /// to our own projection of its odometry onto its plan.
+    pub latest_progress: HashMap<String, Progress>,
 }
 
 fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
@@ -148,6 +152,7 @@ impl PlanExecutor {
             grid_resolution: 1.0,
             grid_origin: origin,
             latest_map: None,
+            latest_progress: HashMap::new(),
         }
     }
 
@@ -185,6 +190,7 @@ impl PlanExecutor {
             self.plan_release_publishers.remove(robot_id);
             self.safezone_publishers.remove(robot_id);
             self.plan_error_publishers.remove(robot_id);
+            self.latest_progress.remove(robot_id);
             self.reindex_followers();
         }
     }
@@ -257,6 +263,38 @@ impl PlanExecutor {
         }
     }
 
+    pub fn handle_progress(&mut self, robot_id: &str, msg: Progress) {
+        self.latest_progress.insert(robot_id.to_string(), msg);
+    }
+
+    /// Decide whether a traffic dependency has been satisfied.
+    ///
+    /// We prefer the blocker's own published `~/plan/progress`, because that is
+    /// its own statement of how far it has got. We only fall back to projecting
+    /// its odometry onto its plan when it has not reported progress against the
+    /// plan we are depending on. That projection is unreliable whenever the robot
+    /// leaves its planned polyline - which is exactly what happens while it is
+    /// driving into or out of a dock, and would otherwise make it look like the
+    /// robot had finished and moved out of the way.
+    fn blocker_is_satisfied(
+        &self,
+        blocker: &TrafficDependency,
+        semantic_waypoints: &HashMap<String, SemanticWaypoint>,
+    ) -> bool {
+        if let Some(progress) = self.latest_progress.get(&blocker.name) {
+            if progress.plan_id == blocker.plan_id {
+                return progress.progress >= blocker.required_progress;
+            }
+        }
+
+        match semantic_waypoints.get(&blocker.name) {
+            Some(sem) => sem.trajectory_index >= blocker.required_progress.round() as usize,
+            // We know nothing about this participant, so we must assume it is in
+            // the way.
+            None => false,
+        }
+    }
+
     pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) {
         let current_x = msg.pose.pose.position.x as f32;
         let current_y = msg.pose.pose.position.y as f32;
@@ -287,7 +325,7 @@ impl PlanExecutor {
 
         self.update_route_blockage(robot_id);
 
-        if !self.ready_to_execute() {
+        if !self.ready_to_execute(robot_id) {
             return;
         }
 
@@ -321,30 +359,18 @@ impl PlanExecutor {
             let wp = &plan.waypoints[released_wp_idx];
             let mut blocked = false;
             for blocker in &wp.departure_blockers {
-                if let Some(blocker_sem) = semantic_waypoints.get(&blocker.name) {
-                    let blocker_progress = blocker_sem.trajectory_index;
-                    let required_progress = blocker.required_progress.round() as usize;
-                    rclrs::log_debug!(
-                        self.node.logger(),
-                        "[Executor Debug] Blocker check for robot {} wp {}: blocker={} blocker_progress={} required={}",
-                        robot_id,
-                        released_wp_idx,
-                        blocker.name,
-                        blocker_progress,
-                        required_progress
-                    );
-                    if blocker_progress < required_progress {
-                        blocked = true;
-                        break;
-                    }
-                } else {
-                    rclrs::log_debug!(
-                        self.node.logger(),
-                        "[Executor Debug] Blocker check for robot {} wp {}: blocker={} is missing semantic waypoint",
-                        robot_id,
-                        released_wp_idx,
-                        blocker.name
-                    );
+                let satisfied = self.blocker_is_satisfied(blocker, &semantic_waypoints);
+                rclrs::log_debug!(
+                    self.node.logger(),
+                    "[Executor Debug] Blocker check for robot {} wp {}: blocker={} required={} satisfied={} (reported progress={:?})",
+                    robot_id,
+                    released_wp_idx,
+                    blocker.name,
+                    blocker.required_progress,
+                    satisfied,
+                    self.latest_progress.get(&blocker.name).map(|p| p.progress)
+                );
+                if !satisfied {
                     blocked = true;
                     break;
                 }
@@ -408,13 +434,20 @@ impl PlanExecutor {
         let mut max_y = f32::MIN;
 
         for r_state in self.active_robots.values() {
-            let r_plan = r_state.plan.as_ref().unwrap();
-            let r_odom = r_state.latest_odom.as_ref().unwrap();
+            let Some(r_odom) = r_state.latest_odom.as_ref() else {
+                continue;
+            };
 
             min_x = min_x.min(r_odom.pose.pose.position.x as f32);
             min_y = min_y.min(r_odom.pose.pose.position.y as f32);
             max_x = max_x.max(r_odom.pose.pose.position.x as f32);
             max_y = max_y.max(r_odom.pose.pose.position.y as f32);
+
+            // A robot without a plan (e.g. parked at a dock with no active
+            // destination) still occupies space, but contributes no waypoints.
+            let Some(r_plan) = r_state.plan.as_ref() else {
+                continue;
+            };
 
             for wp in &r_plan.waypoints {
                 min_x = min_x.min(wp.position[0]);
@@ -458,34 +491,51 @@ impl PlanExecutor {
         let mut footprints = Vec::new();
         let mut current_positions = Vec::new();
 
-        for (r_name, r_state) in &self.active_robots {
-            let r_plan = r_state.plan.as_ref().unwrap();
+        for (idx, (r_name, r_state)) in self.active_robots.iter().enumerate() {
             let r_odom = r_state.latest_odom.as_ref().unwrap();
+            let real_position = (
+                r_odom.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
+                r_odom.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
+            );
 
-            let traj_poses: Vec<Isometry2<f32>> = r_plan
-                .waypoints
-                .iter()
-                .map(|wp| {
-                    Isometry2::new(
-                        Vector2::new(
-                            wp.position[0] - self.grid_origin.position.x as f32,
-                            wp.position[1] - self.grid_origin.position.y as f32,
-                        ),
-                        0.0,
-                    )
-                })
-                .collect();
+            // A robot with no plan is stationary as far as we know, so we model it
+            // as a single-pose trajectory at its current location. That keeps it
+            // visible to the spatial allocation as an obstacle instead of halting
+            // safe zone generation for every other robot.
+            let traj_poses: Vec<Isometry2<f32>> = match r_state.plan.as_ref() {
+                Some(r_plan) => r_plan
+                    .waypoints
+                    .iter()
+                    .map(|wp| {
+                        Isometry2::new(
+                            Vector2::new(
+                                wp.position[0] - self.grid_origin.position.x as f32,
+                                wp.position[1] - self.grid_origin.position.y as f32,
+                            ),
+                            0.0,
+                        )
+                    })
+                    .collect(),
+                None => vec![Isometry2::new(
+                    Vector2::new(real_position.0, real_position.1),
+                    0.0,
+                )],
+            };
             trajectories.push(mapf_post::Trajectory { poses: traj_poses });
             footprints.push(Arc::new(mapf_post::shape::Ball::new(r_state.radius))
                 as Arc<dyn mapf_post::shape::Shape>);
 
-            let semantic_position = semantic_waypoints.get(r_name).cloned().unwrap();
+            let semantic_position =
+                semantic_waypoints
+                    .get(r_name)
+                    .cloned()
+                    .unwrap_or(SemanticWaypoint {
+                        agent: idx,
+                        trajectory_index: 0,
+                    });
             current_positions.push(CurrentPosition {
                 semantic_position,
-                real_position: (
-                    r_odom.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
-                    r_odom.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
-                ),
+                real_position,
             });
         }
 
@@ -505,6 +555,15 @@ impl PlanExecutor {
         let target_x = plan.waypoints[released_wp_idx].position[0];
         let target_y = plan.waypoints[released_wp_idx].position[1];
         let target_yaw = target_yaw(plan, released_wp_idx);
+        // The progress level the robot will have achieved once it reaches the
+        // incremental target. The executor must report this honestly: it is the
+        // ceiling that the robot's own ~/plan/progress is clamped to, and every
+        // other robot's traffic dependencies are resolved against it.
+        let target_progress = plan
+            .waypoints
+            .get(released_wp_idx)
+            .map(|wp| wp.progress)
+            .unwrap_or(0.0);
 
         let costmap = Self::to_costmap_msg(
             &positions,
@@ -542,8 +601,10 @@ impl PlanExecutor {
             },
             costmap,
             target_waypoint: vec![released_wp_idx as u64].try_into().unwrap(),
-            last_waypoint: released_wp_idx as u64,
-            target_progress: 0.0,
+            // The waypoint we have actually reached, which is not the same as the
+            // one we have been released to travel to.
+            last_waypoint: curr_wp_idx as u64,
+            target_progress,
             id: SafeZoneId {
                 plan_id,
                 safe_zone_version: state.safe_zone_version,
@@ -644,19 +705,27 @@ impl PlanExecutor {
         }
     }
 
-    fn ready_to_execute(&self) -> bool {
+    /// Whether we can generate a release and safe zone for `robot_id`.
+    ///
+    /// Every participant must be localized, since we cannot reason about the
+    /// space a robot occupies if we do not know where it is. Only the robot we
+    /// are generating output for needs an actual plan though - a robot that is
+    /// parked or docked with no active destination must not stall the rest of
+    /// the fleet.
+    fn ready_to_execute(&self, robot_id: &str) -> bool {
         if self.active_robots.is_empty() {
             return false;
         }
-        for state in self.active_robots.values() {
-            if state.plan.is_none()
-                || state.latest_odom.is_none()
-                || state.waypoint_follower.is_none()
-            {
-                return false;
-            }
+        if self
+            .active_robots
+            .values()
+            .any(|state| state.latest_odom.is_none())
+        {
+            return false;
         }
-        true
+        self.active_robots
+            .get(robot_id)
+            .is_some_and(|state| state.plan.is_some() && state.waypoint_follower.is_some())
     }
 
     pub fn to_costmap_msg(

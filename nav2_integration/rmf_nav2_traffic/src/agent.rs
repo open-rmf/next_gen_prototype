@@ -99,6 +99,35 @@ pub struct AgentDockStateChanged {
     pub state: AgentDockState,
 }
 
+/// What this agent's executor is currently busy with.
+///
+/// This is reported verbatim on `~/plan/progress` so that a traffic planner can
+/// tell the difference between a robot that has merely stopped moving and one
+/// that is physically committed to an action and must not be replanned. Without
+/// it the two are indistinguishable, since both simply report
+/// `reached_waypoint == target_waypoint`.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct AgentExecutionState {
+    /// Set while an arrival_action / departure_action is in flight, and named
+    /// after that action so the recipient can correlate it with the plan it
+    /// posted. `None` whenever the agent is free to be given a new plan.
+    pub active_action: Option<String>,
+}
+
+impl AgentExecutionState {
+    pub fn begin_action(&mut self, action: impl Into<String>) {
+        self.active_action = Some(action.into());
+    }
+
+    pub fn end_action(&mut self) {
+        self.active_action = None;
+    }
+
+    pub fn is_executing_action(&self) -> bool {
+        self.active_action.is_some()
+    }
+}
+
 #[derive(Component)]
 pub struct AmclPose(pub PoseWithCovarianceStamped);
 
@@ -166,6 +195,7 @@ fn create_amcl_pose_subscriber(
             publisher: Arc::clone(&odom_publisher),
         },
         AmclPose(PoseWithCovarianceStamped::default()),
+        AgentExecutionState::default(),
     ));
 }
 

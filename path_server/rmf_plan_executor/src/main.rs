@@ -15,12 +15,13 @@
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use rmf_plan_executor::PlanExecutor;
 use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
-use ros_env::rmf_prototype_msgs::msg::{ParticipantList, Plan};
+use ros_env::rmf_prototype_msgs::msg::{ParticipantList, Plan, Progress};
 use std::collections::HashMap;
 
 struct RobotConnections {
     _odom_subscription: rclrs::WorkerSubscription<Odometry, PlanExecutor>,
     _plan_subscription: rclrs::WorkerSubscription<Plan, PlanExecutor>,
+    _progress_subscription: rclrs::WorkerSubscription<Progress, PlanExecutor>,
 }
 
 struct ExecutorDiscoveryServer {
@@ -94,8 +95,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let robot_id_clone = robot_id.to_string();
                 let robot_id_clone2 = robot_id.to_string();
+                let robot_id_clone3 = robot_id.to_string();
                 let odom_topic = robot_id.to_string() + "/odom";
                 let plan_topic = robot_id.to_string() + "/plan";
+                let progress_topic = robot_id.to_string() + "/plan/progress";
 
                 let odom_sub = match server.executor_worker.create_subscription::<Odometry, _>(
                     odom_topic.as_str().reliable(),
@@ -133,11 +136,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
+                let progress_sub = match server.executor_worker.create_subscription::<Progress, _>(
+                    progress_topic.as_str().reliable(),
+                    move |executor: &mut PlanExecutor, msg: Progress| {
+                        executor.handle_progress(&robot_id_clone3, msg);
+                    },
+                ) {
+                    Ok(sub) => sub,
+                    Err(err) => {
+                        rclrs::log_error!(
+                            server.node.logger(),
+                            "Failed to create progress subscription on executor_worker for {}: {:?}",
+                            robot_id,
+                            err
+                        );
+                        return;
+                    }
+                };
+
                 server.active_robots.insert(
                     robot_id.to_string(),
                     RobotConnections {
                         _odom_subscription: odom_sub,
                         _plan_subscription: plan_sub,
+                        _progress_subscription: progress_sub,
                     },
                 );
             }

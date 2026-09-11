@@ -1,5 +1,6 @@
 use crate::{
-    safe_zone::PlanErrorPublisher, workflow::*, AgentDockState, AgentDockStateChanged, Nav2Agent,
+    safe_zone::PlanErrorPublisher, workflow::*, AgentDockState, AgentDockStateChanged,
+    AgentExecutionState, Nav2Agent,
 };
 use bevy::prelude::*;
 use bevy_ros2::{RclrsExecutorCommands, RclrsNode, RosActionClient, RosPublisher};
@@ -158,7 +159,9 @@ impl Plugin for InnerNavigationClientPlugin {
             .add_event::<WorkflowStepEvent>()
             .add_event::<WorkflowCompletedEvent>()
             .add_event::<AgentDockStateChanged>()
-            .add_observer(create_inner_navigation_client);
+            .add_observer(create_inner_navigation_client)
+            .add_observer(track_workflow_step_started)
+            .add_observer(track_workflow_completed);
 
         // Initialize Navigation services
         let navigation_services = InnerNavigationServices::from_app(app);
@@ -212,6 +215,34 @@ fn create_inner_navigation_client(
             dock_status_pub,
         })
         .insert(AgentDockState::default());
+}
+
+/// Mark the agent as physically committed as soon as a workflow step begins, so
+/// that the state is visible on `~/plan/progress` for the whole duration of the
+/// step rather than only after it succeeds.
+fn track_workflow_step_started(
+    trigger: Trigger<WorkflowStepEvent>,
+    mut agents: Query<&mut AgentExecutionState>,
+) {
+    let event = trigger.event();
+    let Ok(mut execution_state) = agents.get_mut(event.agent) else {
+        return;
+    };
+    execution_state.begin_action(event.step.action_name());
+}
+
+/// Release the commitment once the workflow finishes. This runs on failure as
+/// well as success: if a dock has failed then the agent is no longer committed
+/// to it, and the traffic system needs to be free to replan it out of the way.
+fn track_workflow_completed(
+    trigger: Trigger<WorkflowCompletedEvent>,
+    mut agents: Query<&mut AgentExecutionState>,
+) {
+    let event = trigger.event();
+    let Ok(mut execution_state) = agents.get_mut(event.agent) else {
+        return;
+    };
+    execution_state.end_action();
 }
 
 #[derive(Clone)]
@@ -738,6 +769,15 @@ fn async_request_new_goal(
                     let _ = dock_client.dock_status_pub.publish(RosString {
                         data: "undocking".to_string(),
                     });
+                    // This undock runs outside the workflow node, so no
+                    // WorkflowStepEvent is emitted for it. Mark the commitment by
+                    // hand, otherwise the robot advertises itself as replannable
+                    // while it is physically reversing out of the dock.
+                    channel.commands(move |cmds| {
+                        cmds.entity(agent_entity).insert(AgentExecutionState {
+                            active_action: Some("undock".to_string()),
+                        });
+                    });
                     let undock_success =
                         execute_undock_action(&dock_client.undock_client, agent_entity.index()).await;
                     if !undock_success {
@@ -747,6 +787,13 @@ fn async_request_new_goal(
                         );
                         let _ = dock_client.dock_status_pub.publish(RosString {
                             data: "undock_failed".to_string(),
+                        });
+                        // A failed undock leaves the robot stationary but no
+                        // longer committed, so release it back to the traffic
+                        // system rather than stranding it as uncommandable.
+                        channel.commands(move |cmds| {
+                            cmds.entity(agent_entity)
+                                .insert(AgentExecutionState::default());
                         });
                         return Err(InnerNavigationError {
                             handle: None,
@@ -763,6 +810,8 @@ fn async_request_new_goal(
                     });
                     channel.commands(move |cmds| {
                         cmds.entity(agent_entity).insert(AgentDockState::undocked());
+                        cmds.entity(agent_entity)
+                            .insert(AgentExecutionState::default());
                         cmds.trigger(AgentDockStateChanged {
                             agent: agent_entity,
                             state: AgentDockState::undocked(),
