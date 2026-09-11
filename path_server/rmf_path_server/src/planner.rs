@@ -300,6 +300,22 @@ impl MapfPlanner for PibtPlanner {
             }
         }
 
+        // Clamp the final waypoint to exact goal coordinates to prevent coarse grid discretization errors
+        for (agent_idx, id) in robot_ids.iter().enumerate() {
+            if let Some(dest) = goals.get(id) {
+                if let Some(region) = dest.constraints.regions.first() {
+                    if region.region.points.len() >= 2 {
+                        let gx_f32 = region.region.points[0];
+                        let gy_f32 = region.region.points[1];
+                        if let Some(last_pose) = trajectories[agent_idx].last_mut() {
+                            last_pose.translation.vector[0] = gx_f32;
+                            last_pose.translation.vector[1] = gy_f32;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(trajectories)
     }
 }

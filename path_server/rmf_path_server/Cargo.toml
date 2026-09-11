@@ -10,7 +10,9 @@ ros-env = "0.2.0"
 rmf_participant_discovery = { path = "../../rmf_participant_discovery" }
 
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 mapf = { git = "https://github.com/open-rmf/mapf" }
 mapf_post = { git = "https://github.com/arjo129/mapf_post", branch="arjo/feat/more_efficient_checks"}
 hetpibt = { git = "https://github.com/arjo129/pibt_rs", branch="scalability-study-updates" }
+rmf_site_format = { git = "https://github.com/open-rmf/rmf_site", rev = "2f661c2e917bf0093496e1945d50cf25a3c872da", default-features = false }

@@ -25,9 +25,11 @@ from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
     DestinationGoal,
+    GraphElementKey,
     Participant,
     ParticipantList,
     Region,
+    TargetNode,
     TargetRegion,
 )
 
@@ -140,3 +142,91 @@ class TestReservation(unittest.TestCase):
             len(received_dest) > 0,
             'Did not receive Destination message',
         )
+
+    def test_reservation_forwards_graph_key(self):
+        robot_name = 'robot_graph'
+        received_dest = []
+
+        reliable_transient_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
+        self.node.create_subscription(
+            Destination,
+            f'{robot_name}/destination',
+            lambda msg: received_dest.append(msg),
+            qos_profile=reliable_transient_qos
+        )
+
+        pub = self.node.create_publisher(
+            DestinationGoal,
+            f'{robot_name}/destination/goal',
+            qos_profile=reliable_transient_qos
+        )
+
+        discovery_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        discovery_pub = self.node.create_publisher(
+            ParticipantList,
+            '/destination/discovery',
+            qos_profile=discovery_qos
+        )
+
+        time.sleep(1.0)
+
+        parts = ParticipantList()
+        p = Participant()
+        p.name = robot_name
+        parts.participants.append(p)
+        discovery_pub.publish(parts)
+
+        time.sleep(0.5)
+
+        # Create goal with both region and graph element key
+        goal = DestinationGoal()
+        import uuid
+        session_uuid = list(uuid.uuid4().bytes)
+        goal.session.uuid = session_uuid
+
+        constraint = DestinationConstraints()
+        target_region = TargetRegion()
+        target_region.region.hint = Region.HINT_AXIS_ALIGNED_RECTANGLE
+        target_region.region.points = [5.0, 5.0, 6.0, 6.0]
+        constraint.regions.append(target_region)
+
+        target_node = TargetNode()
+        target_node.key = GraphElementKey()
+        target_node.key.key = [42]
+        target_node.key.name = ['station_alpha']
+        constraint.nodes.append(target_node)
+
+        goal.one_of.append(constraint)
+
+        start_time = time.time()
+        timeout = 5.0
+        while time.time() - start_time < timeout:
+            discovery_pub.publish(parts)
+            pub.publish(goal)
+            for _ in range(5):
+                rclpy.spin_once(self.node, timeout_sec=0.1)
+            if any(list(d.session.uuid) == list(goal.session.uuid) for d in received_dest):
+                break
+
+        matching_dests = [
+            d for d in received_dest if list(d.session.uuid) == list(goal.session.uuid)
+        ]
+        self.assertTrue(
+            len(matching_dests) > 0,
+            'Did not receive Destination message with matching session UUID',
+        )
+        dest = matching_dests[-1]
+        self.assertEqual(len(dest.constraints.nodes), 1)
+        self.assertEqual(list(dest.constraints.nodes[0].key.key), [42])
+        self.assertEqual(list(dest.constraints.nodes[0].key.name), ['station_alpha'])

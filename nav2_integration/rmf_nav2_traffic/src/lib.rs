@@ -34,6 +34,9 @@ pub use navigation_server::*;
 pub mod safe_zone;
 pub use safe_zone::*;
 
+pub mod workflow;
+pub use workflow::*;
+
 #[derive(Default)]
 pub struct Nav2TrafficPlugin {}
 
@@ -49,9 +52,28 @@ impl Plugin for Nav2TrafficPlugin {
             ));
 
         // Spawn agents last
-        let agent_names = vec!["robot0".to_string(), "robot1".to_string()];
+        let agent_names: Vec<String> = if let Ok(env_agents) = std::env::var("RMF_NAV2_AGENTS") {
+            env_agents
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            let cli_agents: Vec<String> = std::env::args()
+                .skip(1)
+                .filter(|arg| !arg.starts_with('-') && !arg.starts_with('_'))
+                .collect();
+            if !cli_agents.is_empty() {
+                cli_agents
+            } else {
+                vec!["robot0".to_string(), "robot1".to_string()]
+            }
+        };
+
+        info!("Nav2TrafficPlugin: spawning agents: {:?}", agent_names);
         for name in agent_names {
-            app.world_mut().spawn(Nav2Agent::new(name));
+            app.world_mut()
+                .spawn((Nav2Agent::new(name), AgentDockState::default()));
         }
     }
 }

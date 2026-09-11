@@ -45,6 +45,17 @@ pub(super) enum Outcome {
 }
 
 fn parking_constraints(spot: &ParkingSpot) -> DomainDestinationConstraints {
+    let mut nodes = Vec::new();
+    if !spot.name.is_empty() {
+        let mut key = ros_env::rmf_prototype_msgs::msg::GraphElementKey::default();
+        if let Ok(name_seq) = vec![spot.name.clone().into()].try_into() {
+            key.name = name_seq;
+            nodes.push(ros_env::rmf_prototype_msgs::msg::TargetNode {
+                key,
+                orientations: vec![],
+            });
+        }
+    }
     DomainDestinationConstraints {
         regions: vec![DomainTargetRegion {
             tolerance: 0.0,
@@ -53,6 +64,7 @@ fn parking_constraints(spot: &ParkingSpot) -> DomainDestinationConstraints {
                 hint: spot.region.hint,
             },
         }],
+        nodes,
     }
 }
 
@@ -337,6 +349,7 @@ mod tests {
                         points,
                     },
                 }],
+                nodes: vec![],
             }],
             cost_bias: vec![],
             session: SessionUUID {
@@ -605,5 +618,86 @@ mod tests {
         assert_eq!(r3.detour_for_goal, None);
         assert_eq!(r3.session, SessionUUID { uuid: [3; 16] });
         assert!(state.queue.is_empty());
+    }
+
+    #[test]
+    fn goal_with_graph_key_nodes_preserved() {
+        let mut state = ReservationState::new(queueing_config());
+
+        let mut key = ros_env::rmf_prototype_msgs::msg::GraphElementKey::default();
+        key.key = vec![42i64].try_into().unwrap();
+        key.name = vec!["station_1".to_string().into()].try_into().unwrap();
+
+        let target_node = ros_env::rmf_prototype_msgs::msg::TargetNode {
+            key: key.clone(),
+            orientations: vec![],
+        };
+
+        let goal = DomainDestinationGoal {
+            one_of: vec![DomainDestinationConstraints {
+                regions: vec![DomainTargetRegion {
+                    tolerance: 0.0,
+                    region: DomainRegion {
+                        hint: DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE,
+                        points: vec![10.0, 10.0, 11.0, 11.0],
+                    },
+                }],
+                nodes: vec![target_node],
+            }],
+            cost_bias: vec![],
+            session: SessionUUID { uuid: [7; 16] },
+        };
+
+        let outcomes = state.request("robot_1", goal);
+        let dest = reserved_for(&outcomes, "robot_1").expect("robot_1 should get reservation");
+        assert_eq!(dest.constraints.nodes.len(), 1);
+        assert_eq!(dest.constraints.nodes[0].key.key.first(), Some(&42i64));
+        assert_eq!(
+            dest.constraints.nodes[0]
+                .key
+                .name
+                .first()
+                .map(|s| s.to_string()),
+            Some("station_1".to_string())
+        );
+
+        // Verify that converting to ROS Destination message retains the GraphElementKey details
+        let ros_dest = dest.to_ros();
+        assert_eq!(ros_dest.constraints.nodes.len(), 1);
+        assert_eq!(ros_dest.constraints.nodes[0].key.key.first(), Some(&42i64));
+        assert_eq!(
+            ros_dest.constraints.nodes[0]
+                .key
+                .name
+                .first()
+                .map(|s| s.to_string()),
+            Some("station_1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rmw_conversion() {
+        use rclrs::MessageIDL;
+        let mut key = ros_env::rmf_prototype_msgs::msg::GraphElementKey::default();
+        key.key = vec![42i64].try_into().unwrap();
+        key.name = vec!["station_alpha".to_string().into()].try_into().unwrap();
+        let target_node = ros_env::rmf_prototype_msgs::msg::TargetNode {
+            key,
+            orientations: vec![],
+        };
+        let dest = ros_env::rmf_prototype_msgs::msg::Destination {
+            constraints: ros_env::rmf_prototype_msgs::msg::DestinationConstraints {
+                regions: vec![],
+                nodes: vec![target_node],
+            },
+            ..Default::default()
+        };
+        let rmw = ros_env::rmf_prototype_msgs::msg::Destination::into_rmw_message(
+            std::borrow::Cow::Owned(dest.clone()),
+        )
+        .into_owned();
+        assert_eq!(rmw.constraints.nodes.len(), 1);
+        let back = ros_env::rmf_prototype_msgs::msg::Destination::from_rmw_message(rmw);
+        assert_eq!(back.constraints.nodes.len(), 1);
     }
 }

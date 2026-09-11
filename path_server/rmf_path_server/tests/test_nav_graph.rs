@@ -1,0 +1,636 @@
+// Copyright 2026 Open Source Robotics Foundation
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use mapf_post::na::Isometry2;
+use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
+use rmf_path_server::{start_path_server_with_nav_graph, Map, MapfPlanner, NavGraphData};
+use ros_env::nav_msgs::msg::Odometry;
+use ros_env::rmf_prototype_msgs::msg::{
+    Destination, DestinationConstraints, GraphElementKey, Participant, ParticipantList, Plan,
+    Region, TargetNode, TargetOrientation, TargetRegion,
+};
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+
+const SAMPLE_SITE_JSON: &str = r#"{
+  "format_version": "0.1",
+  "properties": {
+    "name": "test_site"
+  },
+  "levels": {
+    "1": {
+      "properties": {
+        "name": "L1",
+        "elevation": 0.0
+      },
+      "anchors": {
+        "12": {
+          "Translate2D": [0.0, 1.5]
+        },
+        "13": {
+          "Translate2D": [0.0, 2.0]
+        },
+        "17": {
+          "Translate2D": [2.5, 1.5]
+        },
+        "18": {
+          "Translate2D": [2.5, 2.0]
+        }
+      },
+      "floors": {},
+      "rankings": {
+        "floors": []
+      }
+    }
+  },
+  "navigation": {
+    "guided": {
+      "graphs": {
+        "1": {
+          "name": "default",
+          "color": [1.0, 0.5, 0.3]
+        }
+      },
+      "ranking": [1],
+      "lanes": {
+        "16": {
+          "anchors": [13, 12],
+          "forward": {
+            "orientation_constraint": "Forwards",
+            "speed_limit": 0.3,
+            "dock": {
+              "name": "dock_conveyor_r1_c1",
+              "duration": 3.0
+            }
+          },
+          "graphs": "All"
+        }
+      },
+      "locations": {
+        "14": {
+          "anchor": 12,
+          "tags": ["HoldingPoint"],
+          "name": "conveyor_r1_c1_dock",
+          "graphs": "All"
+        },
+        "15": {
+          "anchor": 13,
+          "tags": [],
+          "name": "conveyor_r1_c1_staging",
+          "graphs": "All"
+        }
+      }
+    }
+  }
+}"#;
+
+#[test]
+fn test_nav_graph_parsing() {
+    let site: rmf_site_format::Site =
+        serde_json::from_str(SAMPLE_SITE_JSON).expect("failed to parse site json");
+    let nav_graph = NavGraphData::from_site(&site);
+
+    assert_eq!(nav_graph.vertices_by_id.len(), 4);
+    assert!(nav_graph.vertices_by_name.len() >= 2);
+
+    // Look up by vertex ID
+    let v12 = nav_graph
+        .vertices_by_id
+        .get(&12)
+        .expect("vertex 12 missing");
+    assert_eq!(v12.position, [0.0, 1.5]);
+    assert_eq!(v12.name.as_deref(), Some("conveyor_r1_c1_dock"));
+    assert_eq!(v12.orientation, Some(-std::f32::consts::FRAC_PI_2));
+
+    let action = v12
+        .arrival_action
+        .as_ref()
+        .expect("dock action missing on v12");
+    assert_eq!(action.action_type, "dock");
+    assert_eq!(action.name, "dock_conveyor_r1_c1");
+    assert_eq!(action.duration, Some(3.0));
+
+    // Look up by GraphElementKey with vertex ID
+    let mut key_id = GraphElementKey::default();
+    key_id.key = vec![12i64].try_into().unwrap();
+    let matched_v = nav_graph
+        .find_vertex(&key_id)
+        .expect("failed to find by id");
+    assert_eq!(matched_v.id, 12);
+    assert_eq!(
+        matched_v.arrival_action.as_ref().unwrap().name,
+        "dock_conveyor_r1_c1"
+    );
+
+    // Look up by GraphElementKey with semantic name
+    let mut key_name = GraphElementKey::default();
+    key_name.name = vec!["conveyor_r1_c1_dock".to_string().into()]
+        .try_into()
+        .unwrap();
+    let matched_v_name = nav_graph
+        .find_vertex(&key_name)
+        .expect("failed to find by name");
+    assert_eq!(matched_v_name.id, 12);
+
+    // Look up by dock action name (from lane.forward.dock)
+    let mut key_action = GraphElementKey::default();
+    key_action.name = vec!["dock_conveyor_r1_c1".to_string().into()]
+        .try_into()
+        .unwrap();
+    let matched_action = nav_graph
+        .find_vertex(&key_action)
+        .expect("failed to find by dock action name");
+    assert_eq!(matched_action.id, 12);
+
+    // Proximity matching: physical contact point at (0.0, 0.95) should snap to pre-dock at (0.0, 1.5)
+    let snapped_dock = nav_graph.find_dock_vertex_by_proximity(0.0, 0.95, 0.8);
+    assert!(snapped_dock.is_some());
+    assert_eq!(snapped_dock.unwrap().id, 12);
+    assert_eq!(snapped_dock.unwrap().position, [0.0, 1.5]);
+
+    // Staging point at (0.0, 2.0) should NOT snap to dock
+    let staging_snap = nav_graph.find_dock_vertex_by_proximity(0.0, 2.0, 0.8);
+    assert!(staging_snap.is_none());
+
+    // Pre-dock point at (0.0, 1.5) directly snaps to dock
+    let predock_snap = nav_graph.find_dock_vertex_by_proximity(0.0, 1.5, 0.8);
+    assert!(predock_snap.is_some());
+    assert_eq!(predock_snap.unwrap().id, 12);
+}
+
+struct MockPathPlanner;
+
+impl MapfPlanner for MockPathPlanner {
+    fn plan(
+        &self,
+        starts: &HashMap<String, Odometry>,
+        goals: &HashMap<String, Destination>,
+        _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
+        robot_ids: &[String],
+        _map: &Map,
+        _cancellation: Arc<AtomicBool>,
+    ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
+        let mut plans = Vec::new();
+        for robot_id in robot_ids {
+            let start = starts.get(robot_id).unwrap();
+            let dest = goals.get(robot_id).unwrap();
+            let sx = start.pose.pose.position.x as f32;
+            let sy = start.pose.pose.position.y as f32;
+            let region = dest.constraints.regions.first().unwrap();
+            let gx = region.region.points[0];
+            let gy = region.region.points[1];
+
+            // 2-waypoint plan from start to goal
+            plans.push(vec![
+                Isometry2::translation(sx, sy),
+                Isometry2::translation(gx, gy),
+            ]);
+        }
+        Ok(plans)
+    }
+}
+
+#[test]
+fn test_path_server_graphkey_destination_dock_action() -> Result<(), Box<dyn std::error::Error>> {
+    let context = Context::default_from_env().unwrap();
+    let mut executor = context.create_basic_executor();
+    let test_node = Arc::new(executor.create_node("test_graphkey_node")?);
+    let server_node = Arc::new(executor.create_node("path_server_graphkey")?);
+
+    let site: rmf_site_format::Site =
+        serde_json::from_str(SAMPLE_SITE_JSON).expect("failed to parse site json");
+    let nav_graph = Arc::new(NavGraphData::from_site(&site));
+
+    let _path_server_guard = start_path_server_with_nav_graph(
+        Arc::clone(&server_node),
+        MockPathPlanner,
+        Some(nav_graph),
+    )?;
+
+    let received_plan = Arc::new(Mutex::new(None));
+    let received_plan_clone = Arc::clone(&received_plan);
+
+    let robot_id = "test_mir_dock_graphkey";
+    let plan_sub = test_node.create_subscription::<Plan, _>(
+        format!("{}/plan", robot_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+        move |msg: Plan| {
+            let mut guard = received_plan_clone.lock().unwrap();
+            *guard = Some(msg);
+        },
+    )?;
+    let _ = plan_sub;
+
+    let discovery_pub = test_node.create_publisher::<ParticipantList>(
+        "/destination/discovery".transient_local().reliable(),
+    )?;
+    let odom_pub =
+        test_node.create_publisher::<Odometry>(format!("{}/odom", robot_id).as_str().reliable())?;
+    let dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", robot_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+
+    // Publish discovery
+    let mut discovery_msg = ParticipantList::default();
+    discovery_msg.participants.push(Participant {
+        name: robot_id.to_string(),
+        components: vec![],
+    });
+    discovery_pub.publish(&discovery_msg)?;
+
+    // Publish odometry at staging area (0.0, 2.0)
+    let mut odom_msg = Odometry::default();
+    odom_msg.pose.pose.position.x = 0.0;
+    odom_msg.pose.pose.position.y = 2.0;
+    odom_pub.publish(&odom_msg)?;
+
+    // Publish Destination using GraphElementKey (vertex 12 -> dock_conveyor_r1_c1)
+    let mut dest_msg = Destination::default();
+    let mut key = GraphElementKey::default();
+    key.key = vec![12i64].try_into().unwrap();
+
+    let mut constraints = DestinationConstraints::default();
+    constraints.nodes.push(TargetNode {
+        key,
+        orientations: vec![],
+    });
+    dest_msg.constraints = constraints;
+
+    dest_pub.publish(&dest_msg)?;
+
+    // Spin until plan is received
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5) {
+        let _ = discovery_pub.publish(&discovery_msg);
+        let _ = odom_pub.publish(&odom_msg);
+        let _ = dest_pub.publish(&dest_msg);
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+        if let Ok(guard) = received_plan.lock() {
+            if let Some(plan) = guard.as_ref() {
+                assert!(!plan.waypoints.is_empty(), "Plan should have waypoints");
+                let last_wp = plan.waypoints.last().unwrap();
+                assert_eq!(
+                    last_wp.arrival_action, "dock_conveyor_r1_c1",
+                    "Expected arrival_action 'dock_conveyor_r1_c1' on the final waypoint"
+                );
+                assert_eq!(last_wp.position, [0.0, 1.5]);
+
+                // Verify departure trajectory is populated
+                assert!(
+                    !last_wp.departure_trajectory.is_empty(),
+                    "Expected departure_trajectory to be populated on docking waypoint"
+                );
+                let dep_traj = &last_wp.departure_trajectory[0];
+                assert_eq!(dep_traj.curve.control_points.len(), 2);
+                assert_eq!(dep_traj.curve.control_points[0].position, [0.0, 1.5]);
+                assert_eq!(dep_traj.curve.control_points[1].position, [0.0, 2.0]);
+                return Ok(());
+            }
+        }
+    }
+
+    panic!("Timed out waiting for generated plan with arrival_action");
+}
+
+#[test]
+fn test_path_server_dock_name_destination_routes_to_predock(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let context = Context::default_from_env().unwrap();
+    let mut executor = context.create_basic_executor();
+    let test_node = Arc::new(executor.create_node("test_dock_name_node")?);
+    let server_node = Arc::new(executor.create_node("path_server_dock_name")?);
+
+    let site: rmf_site_format::Site =
+        serde_json::from_str(SAMPLE_SITE_JSON).expect("failed to parse site json");
+    let nav_graph = Arc::new(NavGraphData::from_site(&site));
+
+    let _path_server_guard = start_path_server_with_nav_graph(
+        Arc::clone(&server_node),
+        MockPathPlanner,
+        Some(nav_graph),
+    )?;
+
+    let received_plan = Arc::new(Mutex::new(None));
+    let received_plan_clone = Arc::clone(&received_plan);
+
+    let robot_id = "test_mir_dock_name";
+    let plan_sub = test_node.create_subscription::<Plan, _>(
+        format!("{}/plan", robot_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+        move |msg: Plan| {
+            let mut guard = received_plan_clone.lock().unwrap();
+            *guard = Some(msg);
+        },
+    )?;
+    let _ = plan_sub;
+
+    let discovery_pub = test_node.create_publisher::<ParticipantList>(
+        "/destination/discovery".transient_local().reliable(),
+    )?;
+    let odom_pub =
+        test_node.create_publisher::<Odometry>(format!("{}/odom", robot_id).as_str().reliable())?;
+    let dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", robot_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+
+    let mut discovery_msg = ParticipantList::default();
+    discovery_msg.participants.push(Participant {
+        name: robot_id.to_string(),
+        components: vec![],
+    });
+    discovery_pub.publish(&discovery_msg)?;
+
+    let mut odom_msg = Odometry::default();
+    odom_msg.pose.pose.position.x = 0.0;
+    odom_msg.pose.pose.position.y = 2.0;
+    odom_pub.publish(&odom_msg)?;
+
+    // Destination specifies "conveyor_r1_c1_dock" (from site format locations) and raw contact coords (0.0, 0.95)
+    let mut dest_msg = Destination::default();
+    let mut key = GraphElementKey::default();
+    key.name = vec!["conveyor_r1_c1_dock".to_string().into()]
+        .try_into()
+        .unwrap();
+
+    let mut constraints = DestinationConstraints::default();
+    constraints.nodes.push(TargetNode {
+        key,
+        orientations: vec![],
+    });
+    constraints.regions.push(TargetRegion {
+        region: Region {
+            points: vec![0.0, 0.95],
+            hint: Region::HINT_POINT,
+        },
+        ..Default::default()
+    });
+    dest_msg.constraints = constraints;
+    dest_pub.publish(&dest_msg)?;
+
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5) {
+        let _ = discovery_pub.publish(&discovery_msg);
+        let _ = odom_pub.publish(&odom_msg);
+        let _ = dest_pub.publish(&dest_msg);
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+        if let Ok(guard) = received_plan.lock() {
+            if let Some(plan) = guard.as_ref() {
+                assert!(!plan.waypoints.is_empty(), "Plan should have waypoints");
+                let last_wp = plan.waypoints.last().unwrap();
+                // Verifies planner routed to pre-dock pose (0.0, 1.5), NOT contact point 0.95
+                assert_eq!(last_wp.position, [0.0, 1.5]);
+                assert_eq!(last_wp.arrival_action, "dock_conveyor_r1_c1");
+
+                // Verify orientation constraint is set facing South towards conveyor (-pi/2)
+                let region_ori = last_wp
+                    .arrival_constraints
+                    .regions
+                    .first()
+                    .and_then(|r| r.orientations.first())
+                    .map(|o| o.orientation_radians);
+                assert!(
+                    region_ori.is_some(),
+                    "Arrival region should contain orientation"
+                );
+                let ori = region_ori.unwrap();
+                assert!(
+                    (ori - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-3,
+                    "Expected orientation -pi/2, got {}",
+                    ori
+                );
+
+                assert!(!last_wp.departure_trajectory.is_empty());
+                return Ok(());
+            }
+        }
+    }
+
+    panic!("Timed out waiting for generated plan with dock name destination");
+}
+
+#[test]
+fn test_path_server_raw_contact_coordinates_snaps_to_predock(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let context = Context::default_from_env().unwrap();
+    let mut executor = context.create_basic_executor();
+    let test_node = Arc::new(executor.create_node("test_rawcoord_node")?);
+    let server_node = Arc::new(executor.create_node("path_server_rawcoord")?);
+
+    let site: rmf_site_format::Site =
+        serde_json::from_str(SAMPLE_SITE_JSON).expect("failed to parse site json");
+    let nav_graph = Arc::new(NavGraphData::from_site(&site));
+
+    let _path_server_guard = start_path_server_with_nav_graph(
+        Arc::clone(&server_node),
+        MockPathPlanner,
+        Some(nav_graph),
+    )?;
+
+    let received_plan = Arc::new(Mutex::new(None));
+    let received_plan_clone = Arc::clone(&received_plan);
+
+    let robot_id = "test_mir_raw_dock";
+    let plan_sub = test_node.create_subscription::<Plan, _>(
+        format!("{}/plan", robot_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+        move |msg: Plan| {
+            let mut guard = received_plan_clone.lock().unwrap();
+            *guard = Some(msg);
+        },
+    )?;
+    let _ = plan_sub;
+
+    let discovery_pub = test_node.create_publisher::<ParticipantList>(
+        "/destination/discovery".transient_local().reliable(),
+    )?;
+    let odom_pub =
+        test_node.create_publisher::<Odometry>(format!("{}/odom", robot_id).as_str().reliable())?;
+    let dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", robot_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+
+    let mut discovery_msg = ParticipantList::default();
+    discovery_msg.participants.push(Participant {
+        name: robot_id.to_string(),
+        components: vec![],
+    });
+    discovery_pub.publish(&discovery_msg)?;
+
+    let mut odom_msg = Odometry::default();
+    odom_msg.pose.pose.position.x = 0.0;
+    odom_msg.pose.pose.position.y = 2.0;
+    odom_pub.publish(&odom_msg)?;
+
+    // Destination specifies ONLY raw contact coordinates (0.0, 0.95), no graph node key!
+    let mut dest_msg = Destination::default();
+    let mut constraints = DestinationConstraints::default();
+    constraints.regions.push(TargetRegion {
+        region: Region {
+            points: vec![0.0, 0.95],
+            hint: Region::HINT_POINT,
+        },
+        ..Default::default()
+    });
+    dest_msg.constraints = constraints;
+    dest_pub.publish(&dest_msg)?;
+
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5) {
+        let _ = discovery_pub.publish(&discovery_msg);
+        let _ = odom_pub.publish(&odom_msg);
+        let _ = dest_pub.publish(&dest_msg);
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+        if let Ok(guard) = received_plan.lock() {
+            if let Some(plan) = guard.as_ref() {
+                assert!(!plan.waypoints.is_empty(), "Plan should have waypoints");
+                let last_wp = plan.waypoints.last().unwrap();
+                // Verifies raw contact coordinate was snapped by proximity to pre-dock pose (0.0, 1.5)
+                assert_eq!(last_wp.position, [0.0, 1.5]);
+                assert_eq!(last_wp.arrival_action, "dock_conveyor_r1_c1");
+
+                let region_ori = last_wp
+                    .arrival_constraints
+                    .regions
+                    .first()
+                    .and_then(|r| r.orientations.first())
+                    .map(|o| o.orientation_radians);
+                assert!(
+                    region_ori.is_some(),
+                    "Arrival region should contain orientation"
+                );
+                let ori = region_ori.unwrap();
+                assert!(
+                    (ori - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-3,
+                    "Expected orientation -pi/2, got {}",
+                    ori
+                );
+
+                assert!(!last_wp.departure_trajectory.is_empty());
+                return Ok(());
+            }
+        }
+    }
+
+    panic!("Timed out waiting for generated plan with raw contact coordinates");
+}
+
+#[test]
+fn test_path_server_docked_start_snaps_to_undocked_vertex() -> Result<(), Box<dyn std::error::Error>>
+{
+    let context = Context::default_from_env().unwrap();
+    let mut executor = context.create_basic_executor();
+    let test_node = Arc::new(executor.create_node("test_docked_start_node")?);
+    let server_node = Arc::new(executor.create_node("path_server_docked_start")?);
+
+    let site: rmf_site_format::Site =
+        serde_json::from_str(SAMPLE_SITE_JSON).expect("failed to parse site json");
+    let nav_graph = Arc::new(NavGraphData::from_site(&site));
+
+    let _path_server_guard = start_path_server_with_nav_graph(
+        Arc::clone(&server_node),
+        MockPathPlanner,
+        Some(nav_graph),
+    )?;
+
+    let received_plan = Arc::new(Mutex::new(None));
+    let received_plan_clone = Arc::clone(&received_plan);
+
+    let robot_id = "test_mir_docked_start";
+    let plan_sub = test_node.create_subscription::<Plan, _>(
+        format!("{}/plan", robot_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+        move |msg: Plan| {
+            let mut guard = received_plan_clone.lock().unwrap();
+            *guard = Some(msg);
+        },
+    )?;
+    let _ = plan_sub;
+
+    let discovery_pub = test_node.create_publisher::<ParticipantList>(
+        "/destination/discovery".transient_local().reliable(),
+    )?;
+    let odom_pub =
+        test_node.create_publisher::<Odometry>(format!("{}/odom", robot_id).as_str().reliable())?;
+    let dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", robot_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+
+    let mut discovery_msg = ParticipantList::default();
+    discovery_msg.participants.push(Participant {
+        name: robot_id.to_string(),
+        components: vec![],
+    });
+    discovery_pub.publish(&discovery_msg)?;
+
+    // Robot is currently physically docked at (0.0, 0.95)
+    let mut odom_msg = Odometry::default();
+    odom_msg.pose.pose.position.x = 0.0;
+    odom_msg.pose.pose.position.y = 0.95;
+    odom_pub.publish(&odom_msg)?;
+
+    // Robot receives a destination to go to parking_spot at (2.5, 2.0)
+    let mut dest_msg = Destination::default();
+    let mut constraints = DestinationConstraints::default();
+    constraints.regions.push(TargetRegion {
+        region: Region {
+            points: vec![2.5, 2.0],
+            hint: Region::HINT_POINT,
+        },
+        ..Default::default()
+    });
+    dest_msg.constraints = constraints;
+    dest_pub.publish(&dest_msg)?;
+
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5) {
+        let _ = discovery_pub.publish(&discovery_msg);
+        let _ = odom_pub.publish(&odom_msg);
+        let _ = dest_pub.publish(&dest_msg);
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+        if let Ok(guard) = received_plan.lock() {
+            if let Some(plan) = guard.as_ref() {
+                assert!(!plan.waypoints.is_empty(), "Plan should have waypoints");
+                // The first waypoint should start at the undocked vertex (0.0, 2.0), NOT (0.0, 0.95)!
+                let first_wp = plan.waypoints.first().unwrap();
+                assert_eq!(first_wp.position, [0.0, 2.0]);
+                let last_wp = plan.waypoints.last().unwrap();
+                assert_eq!(last_wp.position, [2.5, 2.0]);
+                return Ok(());
+            }
+        }
+    }
+
+    panic!("Timed out waiting for generated plan starting from undocked vertex");
+}
