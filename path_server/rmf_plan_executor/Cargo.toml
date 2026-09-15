@@ -5,8 +5,8 @@ edition = "2021"
 # Trigger rebuild after package.xml changes
 
 [dependencies]
-rclrs = "*"
-ros-env = "0.2.0"
+rclrs = "0.7.0"
+ros-env = "=0.2.0"
 
 mapf_post = { git = "https://github.com/arjo129/mapf_post", branch="arjo/feat/more_efficient_checks"}
 rmf_participant_discovery = { path = "../../rmf_participant_discovery" }
