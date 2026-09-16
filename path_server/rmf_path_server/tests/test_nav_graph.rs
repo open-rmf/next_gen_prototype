@@ -180,6 +180,7 @@ impl MapfPlanner for MockPathPlanner {
         _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
         _map: &Map,
+        _frozen_claims: &[Vec<[f32; 2]>],
         _cancellation: Arc<AtomicBool>,
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
         let mut plans = Vec::new();
@@ -199,6 +200,44 @@ impl MapfPlanner for MockPathPlanner {
             ]);
         }
         Ok(plans)
+    }
+}
+
+/// Index of the single waypoint carrying `action`.
+///
+/// The dock is deliberately *not* the last waypoint. Plans are padded to the
+/// length of the longest concurrent plan so that a robot which has arrived
+/// keeps occupying its goal in the conflict analysis, and the action must fire
+/// on arrival rather than on each padded repeat.
+fn waypoint_with_action(plan: &Plan, action: &str) -> usize {
+    let matches: Vec<usize> = plan
+        .waypoints
+        .iter()
+        .enumerate()
+        .filter(|(_, wp)| wp.arrival_action == action)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one waypoint with action '{action}', found {matches:?}"
+    );
+    matches[0]
+}
+
+/// Assert that everything beyond `idx` is the robot holding station.
+///
+/// These tests share a ROS domain, so the amount of padding depends on which
+/// peers happen to be alive. What must hold regardless is that padding never
+/// moves the robot and never carries an action.
+fn assert_padding_after(plan: &Plan, idx: usize) {
+    let held = plan.waypoints[idx].position;
+    for (i, wp) in plan.waypoints.iter().enumerate().skip(idx + 1) {
+        assert_eq!(wp.position, held, "padding at wp {i} moved the robot");
+        assert!(
+            wp.arrival_action.is_empty() && wp.departure_action.is_empty(),
+            "padding at wp {i} carries an action"
+        );
     }
 }
 
@@ -255,9 +294,10 @@ fn test_path_server_graphkey_destination_dock_action() -> Result<(), Box<dyn std
     });
     discovery_pub.publish(&discovery_msg)?;
 
-    // Publish odometry at staging area (0.0, 2.0)
+    // Publish odometry away from the dock, at the far staging vertex (2.5, 2.0),
+    // so the resulting plan is not degenerate.
     let mut odom_msg = Odometry::default();
-    odom_msg.pose.pose.position.x = 0.0;
+    odom_msg.pose.pose.position.x = 2.5;
     odom_msg.pose.pose.position.y = 2.0;
     odom_pub.publish(&odom_msg)?;
 
@@ -285,19 +325,41 @@ fn test_path_server_graphkey_destination_dock_action() -> Result<(), Box<dyn std
         if let Ok(guard) = received_plan.lock() {
             if let Some(plan) = guard.as_ref() {
                 assert!(!plan.waypoints.is_empty(), "Plan should have waypoints");
-                let last_wp = plan.waypoints.last().unwrap();
-                assert_eq!(
-                    last_wp.arrival_action, "dock_conveyor_r1_c1",
-                    "Expected arrival_action 'dock_conveyor_r1_c1' on the final waypoint"
-                );
-                assert_eq!(last_wp.position, [0.0, 1.5]);
 
-                // Verify departure trajectory is populated
+                // The destination resolves to the *staging* vertex, so the mock
+                // planner emits [start, staging]. The dock lane is then appended
+                // as a single open-ended segment: how long the robot stays in
+                // the dock is not something the plan can know.
+                let dock_idx = waypoint_with_action(plan, "dock_conveyor_r1_c1");
+                assert_eq!(
+                    dock_idx, 2,
+                    "Expected 2 planned waypoints then the appended dock segment"
+                );
+
+                assert_eq!(plan.waypoints[0].position, [2.5, 2.0]);
+
+                // The staging vertex is where the plan proper ends, so the
+                // destination's constraints live here.
+                let pre_dock = &plan.waypoints[1];
+                assert_eq!(pre_dock.position, [0.0, 2.0]);
                 assert!(
-                    !last_wp.departure_trajectory.is_empty(),
+                    pre_dock.arrival_action.is_empty(),
+                    "Staging is not the dock; it must not trigger the dock action"
+                );
+
+                // Nothing follows the dock but the robot sitting in it: the
+                // plan does not model the dwell, only the occupancy.
+                let arrival_wp = &plan.waypoints[dock_idx];
+                assert_eq!(arrival_wp.position, [0.0, 1.5]);
+                assert_padding_after(plan, dock_idx);
+
+                // Verify departure trajectory is populated. It points back out
+                // of the dock at the staging vertex.
+                assert!(
+                    !arrival_wp.departure_trajectory.is_empty(),
                     "Expected departure_trajectory to be populated on docking waypoint"
                 );
-                let dep_traj = &last_wp.departure_trajectory[0];
+                let dep_traj = &arrival_wp.departure_trajectory[0];
                 assert_eq!(dep_traj.curve.control_points.len(), 2);
                 assert_eq!(dep_traj.curve.control_points[0].position, [0.0, 1.5]);
                 assert_eq!(dep_traj.curve.control_points[1].position, [0.0, 2.0]);
@@ -363,7 +425,7 @@ fn test_path_server_dock_name_destination_routes_to_predock(
     discovery_pub.publish(&discovery_msg)?;
 
     let mut odom_msg = Odometry::default();
-    odom_msg.pose.pose.position.x = 0.0;
+    odom_msg.pose.pose.position.x = 2.5;
     odom_msg.pose.pose.position.y = 2.0;
     odom_pub.publish(&odom_msg)?;
 
@@ -398,13 +460,21 @@ fn test_path_server_dock_name_destination_routes_to_predock(
         if let Ok(guard) = received_plan.lock() {
             if let Some(plan) = guard.as_ref() {
                 assert!(!plan.waypoints.is_empty(), "Plan should have waypoints");
-                let last_wp = plan.waypoints.last().unwrap();
-                // Verifies planner routed to pre-dock pose (0.0, 1.5), NOT contact point 0.95
-                assert_eq!(last_wp.position, [0.0, 1.5]);
-                assert_eq!(last_wp.arrival_action, "dock_conveyor_r1_c1");
+                // The dock action marks where the robot arrives. Verifies the
+                // planner routed to the pre-dock pose and the dock lane was
+                // appended down to (0.0, 1.5), NOT to contact point 0.95.
+                let dock_idx = waypoint_with_action(plan, "dock_conveyor_r1_c1");
+                let arrival_wp = &plan.waypoints[dock_idx];
+                assert_eq!(arrival_wp.position, [0.0, 1.5]);
+                assert_padding_after(plan, dock_idx);
 
-                // Verify orientation constraint is set facing South towards conveyor (-pi/2)
-                let region_ori = last_wp
+                // The destination's constraints belong to the staging vertex,
+                // which is where the planned motion actually ends. The approach
+                // orientation (facing South towards the conveyor, -pi/2) is
+                // therefore adopted before entering the corridor.
+                let pre_dock = &plan.waypoints[dock_idx - 1];
+                assert_eq!(pre_dock.position, [0.0, 2.0]);
+                let region_ori = pre_dock
                     .arrival_constraints
                     .regions
                     .first()
@@ -421,7 +491,7 @@ fn test_path_server_dock_name_destination_routes_to_predock(
                     ori
                 );
 
-                assert!(!last_wp.departure_trajectory.is_empty());
+                assert!(!arrival_wp.departure_trajectory.is_empty());
                 return Ok(());
             }
         }
@@ -484,7 +554,7 @@ fn test_path_server_raw_contact_coordinates_snaps_to_predock(
     discovery_pub.publish(&discovery_msg)?;
 
     let mut odom_msg = Odometry::default();
-    odom_msg.pose.pose.position.x = 0.0;
+    odom_msg.pose.pose.position.x = 2.5;
     odom_msg.pose.pose.position.y = 2.0;
     odom_pub.publish(&odom_msg)?;
 
@@ -510,12 +580,16 @@ fn test_path_server_raw_contact_coordinates_snaps_to_predock(
         if let Ok(guard) = received_plan.lock() {
             if let Some(plan) = guard.as_ref() {
                 assert!(!plan.waypoints.is_empty(), "Plan should have waypoints");
-                let last_wp = plan.waypoints.last().unwrap();
-                // Verifies raw contact coordinate was snapped by proximity to pre-dock pose (0.0, 1.5)
-                assert_eq!(last_wp.position, [0.0, 1.5]);
-                assert_eq!(last_wp.arrival_action, "dock_conveyor_r1_c1");
+                let dock_idx = waypoint_with_action(plan, "dock_conveyor_r1_c1");
+                let arrival_wp = &plan.waypoints[dock_idx];
+                // Verifies raw contact coordinate was snapped by proximity to
+                // the dock vertex, and that the appended dock lane ends there.
+                assert_eq!(arrival_wp.position, [0.0, 1.5]);
+                assert_padding_after(plan, dock_idx);
 
-                let region_ori = last_wp
+                let pre_dock = &plan.waypoints[dock_idx - 1];
+                assert_eq!(pre_dock.position, [0.0, 2.0]);
+                let region_ori = pre_dock
                     .arrival_constraints
                     .regions
                     .first()
@@ -532,7 +606,7 @@ fn test_path_server_raw_contact_coordinates_snaps_to_predock(
                     ori
                 );
 
-                assert!(!last_wp.departure_trajectory.is_empty());
+                assert!(!arrival_wp.departure_trajectory.is_empty());
                 return Ok(());
             }
         }
@@ -541,9 +615,13 @@ fn test_path_server_raw_contact_coordinates_snaps_to_predock(
     panic!("Timed out waiting for generated plan with raw contact coordinates");
 }
 
+/// The grid planner is still started at the undocked vertex, because the dock
+/// lane is finer than its resolution. But the plan handed to the robot must
+/// begin where the robot really is, so that the undock sweep is visible to
+/// `mapf_post` and the dock corridor is not silently declared free.
 #[test]
-fn test_path_server_docked_start_snaps_to_undocked_vertex() -> Result<(), Box<dyn std::error::Error>>
-{
+fn test_path_server_docked_start_splices_the_undock_back_in(
+) -> Result<(), Box<dyn std::error::Error>> {
     let context = Context::default_from_env().unwrap();
     let mut executor = context.create_basic_executor();
     let test_node = Arc::new(executor.create_node("test_docked_start_node")?);
@@ -622,15 +700,35 @@ fn test_path_server_docked_start_snaps_to_undocked_vertex() -> Result<(), Box<dy
         if let Ok(guard) = received_plan.lock() {
             if let Some(plan) = guard.as_ref() {
                 assert!(!plan.waypoints.is_empty(), "Plan should have waypoints");
-                // The first waypoint should start at the undocked vertex (0.0, 2.0), NOT (0.0, 0.95)!
+
+                // [docked] [dock vertex] [staging] [goal] then any padding
+                assert!(plan.waypoints.len() >= 4);
+
+                // The plan starts where the robot physically is, not at the
+                // staging vertex the planner was seeded with.
                 let first_wp = plan.waypoints.first().unwrap();
-                assert_eq!(first_wp.position, [0.0, 2.0]);
-                let last_wp = plan.waypoints.last().unwrap();
-                assert_eq!(last_wp.position, [2.5, 2.0]);
+                assert_eq!(first_wp.position, [0.0, 0.95]);
+                assert_eq!(
+                    first_wp.departure_action, "undock",
+                    "Waypoint 0 should be marked as requiring an undock"
+                );
+
+                // Back out through the dock vertex and the staging vertex,
+                // sweeping the corridor on the way. There are no repeated poses
+                // before the goal: a projection-based progress report cannot
+                // tell them apart, so any blocker aimed at one would never be
+                // satisfied.
+                assert_eq!(plan.waypoints[1].position, [0.0, 1.5]);
+                assert_eq!(plan.waypoints[2].position, [0.0, 2.0]);
+                assert_eq!(plan.waypoints[3].position, [2.5, 2.0]);
+
+                // This robot is not docking, so anything past the goal is the
+                // padding that keeps it visible while its peers finish.
+                assert_padding_after(plan, 3);
                 return Ok(());
             }
         }
     }
 
-    panic!("Timed out waiting for generated plan starting from undocked vertex");
+    panic!("Timed out waiting for generated plan starting from the docked pose");
 }

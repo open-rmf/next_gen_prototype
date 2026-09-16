@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
+use rmf_nav_graph::NavGraphData;
 use rmf_plan_executor::PlanExecutor;
 use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
 use ros_env::rmf_prototype_msgs::msg::{ParticipantList, Plan, Progress};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 struct RobotConnections {
     _odom_subscription: rclrs::WorkerSubscription<Odometry, PlanExecutor>,
@@ -45,8 +47,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut executor = context.create_basic_executor();
     let node = executor.create_node("plan_executor")?;
 
+    // Optional, and deliberately so: the executor only needs the nav graph to
+    // reserve the space a robot holds while docking. Every other launch file
+    // and both launch_testing suites pass no parameters at all, and must keep
+    // working with no graph at all.
+    let nav_graph = match node
+        .declare_parameter("site_file")
+        .default(Arc::from(""))
+        .mandatory()
+    {
+        Ok(param) => {
+            let path: Arc<str> = param.get();
+            if path.is_empty() {
+                None
+            } else {
+                match NavGraphData::from_site_file(&path) {
+                    Ok(graph) => {
+                        rclrs::log!(
+                            node.logger(),
+                            "Loaded navigation graph from '{}' with {} vertices",
+                            path,
+                            graph.vertices_by_id.len()
+                        );
+                        Some(Arc::new(graph))
+                    }
+                    Err(err) => {
+                        rclrs::log_error!(
+                            node.logger(),
+                            "Failed to load site file '{}': {:?}. Dock corridors will not be \
+                             reserved.",
+                            path,
+                            err
+                        );
+                        None
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            rclrs::log_warn!(
+                node.logger(),
+                "Could not declare optional 'site_file' parameter: {:?}",
+                err
+            );
+            None
+        }
+    };
+
     // Create the executor worker
-    let executor_worker = node.create_worker(PlanExecutor::new(node.clone()));
+    let executor_worker =
+        node.create_worker(PlanExecutor::new_with_nav_graph(node.clone(), nav_graph));
 
     // Create the discovery worker
     let discovery_worker = node.create_worker(ExecutorDiscoveryServer::new(

@@ -36,6 +36,7 @@ impl MapfPlanner for TestPlanner {
         _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
         map: &Map,
+        _frozen_claims: &[Vec<[f32; 2]>],
         _cancellation: Arc<AtomicBool>,
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
         if let Ok(mut guard) = self.received_map.lock() {

@@ -11,6 +11,7 @@
 
   <depend>rclrs</depend>
   <depend>rmf_participant_discovery</depend>
+  <depend>rmf_nav_graph</depend>
   <depend>rmf_prototype_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>nav2_msgs</depend>

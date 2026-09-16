@@ -18,6 +18,7 @@ use mapf_post::{
     MapfResult, SemanticWaypoint, WaypointFollower,
 };
 use rclrs::{IntoPrimitiveOptions, Node};
+use rmf_nav_graph::NavGraphData;
 use ros_env::builtin_interfaces;
 use ros_env::geometry_msgs::msg::Pose;
 use ros_env::nav2_msgs;
@@ -30,7 +31,7 @@ use ros_env::rmf_prototype_msgs::msg::{
 };
 use ros_env::std_msgs;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -109,6 +110,10 @@ pub struct PlanExecutor {
     /// the authoritative account of how far a robot has actually got, as opposed
     /// to our own projection of its odometry onto its plan.
     pub latest_progress: HashMap<String, Progress>,
+    /// Site navigation graph, if one was configured. Only used to resolve the
+    /// space a robot holds while it is executing an action; everything else the
+    /// executor does works without it.
+    pub nav_graph: Option<Arc<NavGraphData>>,
 }
 
 fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
@@ -138,6 +143,10 @@ fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
 
 impl PlanExecutor {
     pub fn new(node: Node) -> Self {
+        Self::new_with_nav_graph(node, None)
+    }
+
+    pub fn new_with_nav_graph(node: Node, nav_graph: Option<Arc<NavGraphData>>) -> Self {
         let mut origin = Pose::default();
         origin.orientation.w = 1.0;
         Self {
@@ -153,6 +162,7 @@ impl PlanExecutor {
             grid_origin: origin,
             latest_map: None,
             latest_progress: HashMap::new(),
+            nav_graph,
         }
     }
 
@@ -264,7 +274,111 @@ impl PlanExecutor {
     }
 
     pub fn handle_progress(&mut self, robot_id: &str, msg: Progress) {
+        // Warn on the transition rather than in the allocation path: an
+        // unresolvable action degrades silently to the ordinary allocation, and
+        // a claim that quietly does nothing is exactly the failure that is hard
+        // to spot from the outside.
+        let entering_action = msg.execution_state == Progress::EXECUTION_STATE_EXECUTING_ACTION
+            && self
+                .latest_progress
+                .get(robot_id)
+                .is_none_or(|prev| prev.execution_state != msg.execution_state);
+        if entering_action {
+            match &self.nav_graph {
+                None => rclrs::log_warn!(
+                    self.node.logger(),
+                    "{} is executing action '{}' but no site_file was configured, so its dock \
+                     corridor cannot be reserved against other robots",
+                    robot_id,
+                    msg.active_action
+                ),
+                Some(graph) if graph.find_vertex_by_name(&msg.active_action).is_none() => {
+                    rclrs::log_warn!(
+                        self.node.logger(),
+                        "{} is executing action '{}', which is not a vertex in the nav graph. \
+                         Falling back to its ordinary spatial allocation.",
+                        robot_id,
+                        msg.active_action
+                    )
+                }
+                Some(_) => {}
+            }
+        }
+
         self.latest_progress.insert(robot_id.to_string(), msg);
+    }
+
+    /// Grid cells that each robot currently executing an action is holding.
+    ///
+    /// Derived from the nav graph rather than read out of the spatial
+    /// allocation, because the allocation cannot express this claim.
+    /// `AllocationField::mark` awards a contested cell to the **lower
+    /// trajectory index**, and a dock is always the *last* waypoint in its
+    /// robot's plan. Those indices are per-agent, not a shared clock, so a peer
+    /// that crosses the dock cell early in its own plan outranks the robot that
+    /// is physically sitting in the dock. Resolving the corridor ourselves and
+    /// overlaying it afterwards sidesteps the comparison entirely.
+    ///
+    /// Undock is deliberately not handled here. Its `active_action` is
+    /// `"undock"`, which is not a vertex name, but an undock prefix sits at the
+    /// *start* of the plan and therefore already wins every contest on index.
+    fn action_claims(&self) -> HashMap<String, Vec<(usize, usize)>> {
+        let Some(nav_graph) = self.nav_graph.as_ref() else {
+            return HashMap::new();
+        };
+
+        let mut claims = HashMap::new();
+        for (robot_id, state) in &self.active_robots {
+            let Some(progress) = self.latest_progress.get(robot_id) else {
+                continue;
+            };
+            if progress.execution_state != Progress::EXECUTION_STATE_EXECUTING_ACTION {
+                continue;
+            }
+            let Some(vertex) = nav_graph.find_vertex_by_name(&progress.active_action) else {
+                continue;
+            };
+            let Some(odom) = state.latest_odom.as_ref() else {
+                continue;
+            };
+
+            // Where it is, then the approach, then the dock. Odometry comes
+            // first and is always included: during a dock the robot is driven
+            // by nav2's docking controller and leaves the planned polyline, so
+            // its true position is the only part of this we actually observe.
+            let mut path = vec![[
+                odom.pose.pose.position.x as f32,
+                odom.pose.pose.position.y as f32,
+            ]];
+            if let Some(staging) = vertex.undock_position {
+                path.push(staging);
+            }
+            path.push(vertex.position);
+
+            claims.insert(
+                robot_id.clone(),
+                self.claim_cells_along(&path, state.radius),
+            );
+        }
+        claims
+    }
+
+    /// [`claim_cells_along`] bound to this executor's allocation grid.
+    fn claim_cells_along(&self, path: &[[f32; 2]], radius: f32) -> Vec<(usize, usize)> {
+        claim_cells_along(
+            ClaimGrid {
+                grid: &self.grid,
+                origin: (
+                    self.grid_origin.position.x as f32,
+                    self.grid_origin.position.y as f32,
+                ),
+                width: self.grid_width as usize,
+                height: self.grid_height as usize,
+                cell_size: self.grid_resolution,
+            },
+            path,
+            radius,
+        )
     }
 
     /// Decide whether a traffic dependency has been satisfied.
@@ -548,9 +662,34 @@ impl PlanExecutor {
         let allocation_field = self
             .grid
             .allocate_trajectory(&mapf_result, &current_positions);
-        let positions = allocation_field
-            .get_alloc_for_agent(agent_idx)
-            .unwrap_or_default();
+
+        // The spatial allocation decides most of this, but it cannot decide the
+        // space a robot holds while it is physically committed to an action, so
+        // those claims are resolved from the nav graph and overlaid here. See
+        // `action_claims` for why the allocation gets this wrong on its own.
+        let action_claims = self.action_claims();
+
+        // A robot mid-action is not travelling its plan, so its remaining route
+        // is not what it needs; the corridor replaces it rather than adding to
+        // it. That also hands the approach lane back to everyone else, which is
+        // the whole point of doing this per-action rather than per-robot.
+        let mut positions = match action_claims.get(robot_id) {
+            Some(corridor) => corridor.clone(),
+            None => allocation_field
+                .get_alloc_for_agent(agent_idx)
+                .unwrap_or_default(),
+        };
+
+        // Whatever a peer is holding for its action is not ours, however the
+        // allocation happened to award it.
+        let reserved_by_peers: HashSet<(usize, usize)> = action_claims
+            .iter()
+            .filter(|(peer, _)| peer.as_str() != robot_id)
+            .flat_map(|(_, cells)| cells.iter().copied())
+            .collect();
+        if !reserved_by_peers.is_empty() {
+            positions.retain(|cell| !reserved_by_peers.contains(cell));
+        }
 
         let target_x = plan.waypoints[released_wp_idx].position[0];
         let target_y = plan.waypoints[released_wp_idx].position[1];
@@ -764,6 +903,72 @@ impl PlanExecutor {
             data,
         }
     }
+}
+
+/// The allocation grid a claim is being rasterised against.
+pub struct ClaimGrid<'a> {
+    pub grid: &'a Grid2D,
+    /// World coordinates of the grid's origin, subtracted before indexing.
+    pub origin: (f32, f32),
+    pub width: usize,
+    pub height: usize,
+    pub cell_size: f32,
+}
+
+/// Rasterise a polyline into allocation-grid cells, inflated by `radius`.
+///
+/// Cells are produced with `Grid2D::from_world_coords` so that they index
+/// identically to the cells `allocate_trajectory` returns - including its
+/// top-left origin y flip, which `to_costmap_msg` later undoes. Anything off
+/// the grid is dropped rather than clamped, so a claim never lands on a cell
+/// nobody is standing in.
+pub fn claim_cells_along(
+    grid: ClaimGrid<'_>,
+    path: &[[f32; 2]],
+    radius: f32,
+) -> Vec<(usize, usize)> {
+    let cell_size = grid.cell_size.max(1e-3);
+    // A Chebyshev ring wide enough for the footprint. This matches the one-ring
+    // `blur` that mapf_post applies to its own claims, so a dock corridor is
+    // neither systematically fatter nor thinner than the claims it displaces.
+    let ring = (radius / cell_size).ceil().max(1.0) as isize;
+
+    let stamp = |point: [f32; 2], cells: &mut HashSet<(usize, usize)>| {
+        let (cx, cy) = grid
+            .grid
+            .from_world_coords(point[0] - grid.origin.0, point[1] - grid.origin.1);
+        for dx in -ring..=ring {
+            for dy in -ring..=ring {
+                let (x, y) = (cx + dx, cy + dy);
+                if x < 0 || y < 0 {
+                    continue;
+                }
+                let (x, y) = (x as usize, y as usize);
+                if x < grid.width && y < grid.height {
+                    cells.insert((x, y));
+                }
+            }
+        }
+    };
+
+    let Some(first) = path.first() else {
+        return Vec::new();
+    };
+    let mut cells = HashSet::new();
+    stamp(*first, &mut cells);
+
+    for pair in path.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+        // Quarter-cell steps, so a segment cannot skip a cell it crosses.
+        let steps = ((dx.hypot(dy) / (cell_size * 0.25)).ceil() as usize).max(1);
+        for step in 1..=steps {
+            let t = step as f32 / steps as f32;
+            stamp([from[0] + dx * t, from[1] + dy * t], &mut cells);
+        }
+    }
+
+    cells.into_iter().collect()
 }
 
 fn route_intersects_map(map: &OccupancyGrid, route: &[(f32, f32)], radius: f32) -> bool {
@@ -1001,5 +1206,90 @@ mod tests {
             "After waiting at 10.0 (2nd time): index is {}",
             follower.get_semantic_waypoint().trajectory_index
         );
+    }
+}
+
+#[cfg(test)]
+mod dock_claim_tests {
+    use super::*;
+
+    /// 20x20 grid of 1 m cells with its origin at the world origin, matching
+    /// what `PlanExecutor::new` starts with.
+    fn grid() -> Grid2D {
+        Grid2D::new(vec![vec![0; 20]; 20], 1.0)
+    }
+
+    fn claim(grid: &Grid2D, path: &[[f32; 2]], radius: f32) -> Vec<(usize, usize)> {
+        claim_cells_along(
+            ClaimGrid {
+                grid,
+                origin: (0.0, 0.0),
+                width: 20,
+                height: 20,
+                cell_size: 1.0,
+            },
+            path,
+            radius,
+        )
+    }
+
+    #[test]
+    fn a_claim_indexes_the_same_way_the_allocation_does() {
+        let grid = grid();
+        // The allocation's own conversion is the definition of correct here. If
+        // these ever diverge the overlay would subtract cells from the wrong
+        // place, which is worse than not subtracting at all.
+        let cells = claim(&grid, &[[5.0, 6.0]], 0.0);
+        let expected = grid.from_world_coords(5.0, 6.0);
+        assert!(
+            cells.contains(&(expected.0 as usize, expected.1 as usize)),
+            "claim {cells:?} does not contain the allocation's own cell for (5, 6): {expected:?}"
+        );
+    }
+
+    #[test]
+    fn a_claim_covers_every_cell_between_its_ends() {
+        let grid = grid();
+        // A dock approach: staging at (5, 8) driving in to (5, 5). Three metres
+        // at 1 m cells, so nothing may be left open in the middle.
+        let cells = claim(&grid, &[[5.0, 8.0], [5.0, 5.0]], 0.0);
+
+        for y in [5.0f32, 6.0, 7.0, 8.0] {
+            let (cx, cy) = grid.from_world_coords(5.0, y);
+            assert!(
+                cells.contains(&(cx as usize, cy as usize)),
+                "the approach skipped (5, {y}): {cells:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_claim_is_inflated_by_the_footprint() {
+        let grid = grid();
+        let bare = claim(&grid, &[[5.0, 5.0]], 0.0);
+        let inflated = claim(&grid, &[[5.0, 5.0]], 0.49);
+
+        // Both get at least the one-ring that mapf_post's own `blur` applies,
+        // so a dock claim is never thinner than the claims it displaces.
+        assert_eq!(bare.len(), 9, "expected a one-ring minimum: {bare:?}");
+        assert!(
+            inflated.len() >= bare.len(),
+            "a footprint must not shrink the claim: {inflated:?} vs {bare:?}"
+        );
+    }
+
+    #[test]
+    fn claims_off_the_grid_are_dropped_not_clamped() {
+        let grid = grid();
+        // Clamping would plant this on the boundary and block a cell nobody is
+        // standing in.
+        assert!(claim(&grid, &[[-500.0, -500.0]], 0.0).is_empty());
+        assert!(claim(&grid, &[[500.0, 500.0]], 0.0).is_empty());
+    }
+
+    #[test]
+    fn an_empty_path_claims_nothing() {
+        let grid = grid();
+        assert!(claim(&grid, &[], 0.49).is_empty());
     }
 }

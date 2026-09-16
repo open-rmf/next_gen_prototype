@@ -148,6 +148,39 @@ impl InnerNavigationClient {
     }
 }
 
+/// nav2's `DockRobot` error code for "this dock id is not in the database".
+///
+/// Distinct from the rest because it says the *id* is wrong rather than that the
+/// approach went badly, so no amount of re-approaching will help; the only thing
+/// left to try is the pose the traffic plan supplied.
+const DOCK_ERROR_NOT_IN_DATABASE: u16 = 901;
+
+/// Used when the action server never accepted the goal, so nav2 gave us no code
+/// of its own.
+const DOCK_ERROR_NO_RESPONSE: u16 = u16::MAX;
+
+const DEFAULT_DOCK_MAX_ATTEMPTS: i64 = 3;
+
+/// How many times to ask nav2 to dock before giving up.
+///
+/// Retries are deliberately kept *inside* the adapter. The traffic layer has no
+/// useful opinion about a docking controller backing off and trying again, and
+/// surfacing each attempt would make the robot look like it was repeatedly
+/// failing when it was in fact still working. Only exhaustion is worth
+/// escalating.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct DockRetryPolicy {
+    pub max_attempts: usize,
+}
+
+impl Default for DockRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_DOCK_MAX_ATTEMPTS as usize,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct InnerNavigationClientPlugin {}
 
@@ -163,6 +196,8 @@ impl Plugin for InnerNavigationClientPlugin {
             .add_observer(track_workflow_step_started)
             .add_observer(track_workflow_completed);
 
+        app.insert_resource(read_dock_retry_policy(app.world()));
+
         // Initialize Navigation services
         let navigation_services = InnerNavigationServices::from_app(app);
         app.insert_resource(navigation_services);
@@ -175,6 +210,24 @@ impl Plugin for InnerNavigationClientPlugin {
         app.world_mut().command(|commands| {
             let _ = commands.request((), await_and_send_goal).detach();
         });
+    }
+}
+
+fn read_dock_retry_policy(world: &World) -> DockRetryPolicy {
+    let Some(node) = world.get_resource::<RclrsNode>() else {
+        return DockRetryPolicy::default();
+    };
+    let attempts = node
+        .declare_parameter("dock_max_attempts")
+        .default(DEFAULT_DOCK_MAX_ATTEMPTS)
+        .mandatory()
+        .map(|param| param.get())
+        .unwrap_or(DEFAULT_DOCK_MAX_ATTEMPTS);
+
+    // Zero attempts would mean "never dock", which is not a policy anyone means
+    // to configure.
+    DockRetryPolicy {
+        max_attempts: attempts.max(1) as usize,
     }
 }
 
@@ -204,7 +257,19 @@ fn create_inner_navigation_client(
     let dock_status_topic = "/".to_string() + &agent_name + "/dock_status";
     let dock_client = RosActionClient::<DockRobot>::new(&node, dock_action_name);
     let undock_client = RosActionClient::<UndockRobot>::new(&node, undock_action_name);
-    let dock_status_pub = Arc::new(RosPublisher::<RosString>::new(&node, dock_status_topic));
+    // Transient local, because `dock_status` is a latched *state* rather than a
+    // stream of events: a tool that connects mid-dock needs the current state,
+    // not silence until the next transition.
+    //
+    // It also has to be, for compatibility. Subscribers to this topic use
+    // TRANSIENT_LOCAL (the fleet adapter publishes it that way, and the
+    // dispatcher GUI matches), and a VOLATILE publisher against a
+    // TRANSIENT_LOCAL subscriber is a DURABILITY mismatch - the connection is
+    // silently refused and not one message is ever delivered.
+    let dock_status_pub = Arc::new(RosPublisher::<RosString>::new_transient_local(
+        &node,
+        dock_status_topic,
+    ));
 
     commands
         .entity(e)
@@ -231,9 +296,13 @@ fn track_workflow_step_started(
     execution_state.begin_action(event.step.action_name());
 }
 
-/// Release the commitment once the workflow finishes. This runs on failure as
-/// well as success: if a dock has failed then the agent is no longer committed
-/// to it, and the traffic system needs to be free to replan it out of the way.
+/// Release the commitment once the workflow finishes.
+///
+/// The `active_action` flag is dropped either way: whatever happened, nothing is
+/// in flight any more. The progress pin is not. On success the maneuver is over
+/// and the plan describes the robot again; on failure the robot is stranded
+/// mid-corridor, having neither docked nor retreated, and continuing to claim the
+/// space it is actually occupying is the only safe report available.
 fn track_workflow_completed(
     trigger: Trigger<WorkflowCompletedEvent>,
     mut agents: Query<&mut AgentExecutionState>,
@@ -242,7 +311,7 @@ fn track_workflow_completed(
     let Ok(mut execution_state) = agents.get_mut(event.agent) else {
         return;
     };
-    execution_state.end_action();
+    execution_state.complete_action(event.success);
 }
 
 #[derive(Clone)]
@@ -700,14 +769,91 @@ pub async fn execute_undock_action(
                     "[{agent_index}] [UndockRobot] Result: {:?}, success={}",
                     status, result.success
                 );
-                if status == GoalStatusCode::Succeeded || result.success {
-                    success = true;
-                }
+                success = status == GoalStatusCode::Succeeded || result.success;
+                // A result is terminal, so stop here rather than looping round
+                // to await the stream again. See `execute_dock_attempt` for why
+                // waiting for the stream to end instead is a hang.
+                break;
             }
             _ => {}
         }
     }
     success
+}
+
+/// Run a single `DockRobot` goal to completion.
+///
+/// Returns whether it succeeded and the last error code nav2 reported. The
+/// caller decides what, if anything, to do about the code; this function only
+/// reports.
+pub async fn execute_dock_attempt(
+    dock_client: &Arc<RosActionClient<DockRobot>>,
+    goal: DockRobot_Goal,
+    agent_index: u32,
+    attempt: usize,
+    max_attempts: usize,
+) -> (bool, u16) {
+    info!(
+        "[{agent_index}] [DockRobot {attempt}/{max_attempts}] use_dock_id={}, navigate_to_staging_pose={}",
+        goal.use_dock_id, goal.navigate_to_staging_pose
+    );
+
+    let Some(goal_client) = dock_client.request_goal(goal).await else {
+        warn!(
+            "[{agent_index}] [DockRobot {attempt}/{max_attempts}] goal rejected or server unavailable"
+        );
+        return (false, DOCK_ERROR_NO_RESPONSE);
+    };
+
+    let mut stream = goal_client.stream();
+    let mut success = false;
+    // If the goal is accepted but the stream ends without a result we have
+    // learned nothing, so keep the "no response" code rather than claiming a
+    // specific nav2 failure.
+    let mut error_code = DOCK_ERROR_NO_RESPONSE;
+
+    while let Some(event) = stream.next().await {
+        match event {
+            GoalEvent::Feedback(fb) => {
+                info!(
+                    "[{agent_index}] [DockRobot {attempt}/{max_attempts}] state: {}, nav2 retries: {}",
+                    fb.state, fb.num_retries
+                );
+            }
+            GoalEvent::Status(s) => {
+                debug!(
+                    "[{agent_index}] [DockRobot {attempt}/{max_attempts}] Status: {:?}",
+                    s.code
+                );
+            }
+            GoalEvent::Result((status, result)) => {
+                error_code = result.error_code;
+                info!(
+                    "[{agent_index}] [DockRobot {attempt}/{max_attempts}] Result: {:?}, success={}, error_code={}, error_msg='{}'",
+                    status, result.success, result.error_code, result.error_msg
+                );
+                success = status == GoalStatusCode::Succeeded || result.success;
+                // Stop at the result. It is terminal - there is no further event
+                // worth waiting for - and the goal stream does not reliably end
+                // after delivering it, so looping round to await it again parks
+                // this task forever.
+                //
+                // That hang is silent and expensive: the enclosing workflow step
+                // never finishes, so `WorkflowCompletedEvent` never fires,
+                // `active_action` is never cleared, and the agent reports
+                // EXECUTION_STATE_EXECUTING_ACTION for the rest of its life -
+                // which the traffic planner correctly reads as "physically
+                // committed, do not replan", making the robot permanently
+                // unassignable after a dock that in fact succeeded.
+                //
+                // `async_monitor_ongoing_navigation` returns from inside its own
+                // result arm for the same reason; this is the pattern to follow.
+                break;
+            }
+        }
+    }
+
+    (success, error_code)
 }
 
 /// Submits a new NavigateToPose goal asynchronously to the Nav2 action server
@@ -772,11 +918,13 @@ fn async_request_new_goal(
                     // This undock runs outside the workflow node, so no
                     // WorkflowStepEvent is emitted for it. Mark the commitment by
                     // hand, otherwise the robot advertises itself as replannable
-                    // while it is physically reversing out of the dock.
+                    // while it is physically reversing out of the dock. The
+                    // progress pin is latched by `update_safe_zone` on the next
+                    // tick, where the plan is in scope.
                     channel.commands(move |cmds| {
-                        cmds.entity(agent_entity).insert(AgentExecutionState {
-                            active_action: Some("undock".to_string()),
-                        });
+                        cmds.entity(agent_entity)
+                            .entry::<AgentExecutionState>()
+                            .and_modify(|mut state| state.begin_action("undock"));
                     });
                     let undock_success =
                         execute_undock_action(&dock_client.undock_client, agent_entity.index()).await;
@@ -788,12 +936,14 @@ fn async_request_new_goal(
                         let _ = dock_client.dock_status_pub.publish(RosString {
                             data: "undock_failed".to_string(),
                         });
-                        // A failed undock leaves the robot stationary but no
-                        // longer committed, so release it back to the traffic
-                        // system rather than stranding it as uncommandable.
+                        // A failed undock leaves the robot no longer committed to
+                        // an action, but it is still somewhere in the dock lane.
+                        // Release the action flag so it can be replanned; keep the
+                        // progress pin so peers do not treat the lane as clear.
                         channel.commands(move |cmds| {
                             cmds.entity(agent_entity)
-                                .insert(AgentExecutionState::default());
+                                .entry::<AgentExecutionState>()
+                                .and_modify(|mut state| state.complete_action(false));
                         });
                         return Err(InnerNavigationError {
                             handle: None,
@@ -811,7 +961,8 @@ fn async_request_new_goal(
                     channel.commands(move |cmds| {
                         cmds.entity(agent_entity).insert(AgentDockState::undocked());
                         cmds.entity(agent_entity)
-                            .insert(AgentExecutionState::default());
+                            .entry::<AgentExecutionState>()
+                            .and_modify(|mut state| state.complete_action(true));
                         cmds.trigger(AgentDockStateChanged {
                             agent: agent_entity,
                             state: AgentDockState::undocked(),
@@ -908,6 +1059,14 @@ fn async_monitor_ongoing_navigation(
             let mut goal_client_stream = handle.goal_client.clone().stream();
             let agent = handle.request.agent.clone();
             // TODO(@xiyuoh) this gets stuck sometimes, find out why
+            //
+            // Tried and reverted: making every `GoalEvent::Result` terminal
+            // (returning an error on an unrecognised status instead of falling
+            // through). That looks like the same hang that
+            // `execute_dock_attempt` and `execute_undock_action` had, but it is
+            // not, and it breaks cancellation - see the `other` arm below for
+            // the mechanism. Unlike those two, this loop must tolerate a result
+            // paired with a non-terminal status and wait for the real one.
             while let Some(event) = goal_client_stream.next().await {
                 match event {
                     GoalEvent::Feedback(feedback) => {
@@ -950,7 +1109,37 @@ fn async_monitor_ongoing_navigation(
                                     kind: InnerNavigationErrorKind::GoalCancelledError,
                                 });
                             }
-                            _ => {}
+                            other => {
+                                // Deliberately NOT terminal. A `Result` event
+                                // can arrive paired with a *non-terminal*
+                                // status (`Canceling`, `Executing`, `Unknown`)
+                                // when the result future resolves before the
+                                // status cache catches up; the real terminal
+                                // status follows in a later event. Returning
+                                // here instead broke cancellation outright,
+                                // because `process_navigation_result` only sets
+                                // `cancelling.success` for
+                                // `GoalCancelledError` -- an early
+                                // `UnknownError` left the cancel workflow
+                                // unsatisfied and the replacement goal was
+                                // never requested.
+                                //
+                                // So we keep waiting. The residual risk is the
+                                // pre-existing `TODO(@xiyuoh) this gets stuck
+                                // sometimes`: if the real status never arrives
+                                // and the stream never ends, this task parks
+                                // forever. This warning exists to catch that in
+                                // the act -- if a stall is ever preceded by it,
+                                // the unrecognised status named here is the
+                                // one that needs handling.
+                                warn!(
+                                    "[{:?}] [inner nav2pose] Result arrived with \
+                                     non-terminal status {:?}; still waiting for \
+                                     a terminal one",
+                                    handle.request.agent.index(),
+                                    other
+                                );
+                            }
                         }
                     }
                 }
@@ -1100,6 +1289,8 @@ fn async_execute_workflow(
         ..
     }: Async<InnerWorkflowRequest>,
     inner_dock_clients: Query<&InnerDockClient>,
+    plan_error_publishers: Query<&PlanErrorPublisher>,
+    dock_retry_policy: Res<DockRetryPolicy>,
     executor_commands: Res<RclrsExecutorCommands>,
 ) -> impl Future<Output = InnerNavigationResult> {
     let handle = wf_req.handle.clone();
@@ -1115,6 +1306,11 @@ fn async_execute_workflow(
     };
 
     let dock_client = dock_client.clone();
+    let plan_error_pub = plan_error_publishers
+        .get(agent_entity)
+        .ok()
+        .map(|p| p.publisher.clone());
+    let max_dock_attempts = dock_retry_policy.max_attempts;
     let steps = wf_req.steps.clone();
     let fallback_handle = handle.clone();
     let total_steps = steps.len();
@@ -1153,134 +1349,106 @@ fn async_execute_workflow(
                         let _ = dock_client.dock_status_pub.publish(RosString {
                             data: format!("docking: {}", dock_id),
                         });
-                        let dock_goal = DockRobot_Goal {
-                            use_dock_id: true,
-                            dock_id: dock_id.clone(),
-                            dock_pose: handle.request.target_pose.clone(),
-                            dock_type: "simple_charging_dock".to_string(),
-                            max_staging_time: 1000.0,
-                            navigate_to_staging_pose: false,
-                        };
-                        let Some(goal_client) = dock_client.dock_client.request_goal(dock_goal).await else {
-                            warn!(
-                                "[{:?}] DockRobot action request failed or server unavailable for dock '{}'",
-                                agent_entity.index(),
-                                dock_id
-                            );
-                            let _ = dock_client.dock_status_pub.publish(RosString {
-                                data: format!("dock_failed: {} (server unavailable)", dock_id),
-                            });
-                            continue;
-                        };
 
-                        let mut stream = goal_client.stream();
+                        // Ask nav2 to dock, and keep asking. The traffic layer is
+                        // told nothing until we run out of attempts: a docking
+                        // controller backing off and re-approaching is normal, and
+                        // reporting each attempt as a failure would make a robot
+                        // that is still working look broken.
                         let mut success = false;
-                        let mut last_error_code = 0;
-                        while let Some(event) = stream.next().await {
-                            match event {
-                                GoalEvent::Feedback(fb) => {
-                                    info!(
-                                        "[{:?}] [DockRobot] Docking state: {}, retries: {}",
-                                        agent_entity.index(),
-                                        fb.state,
-                                        fb.num_retries
-                                    );
-                                }
-                                GoalEvent::Status(s) => {
-                                    debug!("[{:?}] [DockRobot] Status: {:?}", agent_entity.index(), s.code);
-                                }
-                                GoalEvent::Result((status, result)) => {
-                                    last_error_code = result.error_code;
-                                    info!(
-                                        "[{:?}] [DockRobot] Result: {:?}, success={}, error_code={}, error_msg='{}'",
-                                        agent_entity.index(),
-                                        status,
-                                        result.success,
-                                        result.error_code,
-                                        result.error_msg
-                                    );
-                                    if status == GoalStatusCode::Succeeded || result.success {
-                                        success = true;
-                                    }
-                                }
-                            }
-                        }
-                        if !success && last_error_code == 901 {
-                            warn!(
-                                "[{:?}] Dock '{}' not in database (code 901). Retrying with direct target dock_pose...",
-                                agent_entity.index(),
-                                dock_id
-                            );
-                            let fallback_goal = DockRobot_Goal {
-                                use_dock_id: false,
-                                dock_id: String::new(),
+                        let mut last_error_code = DOCK_ERROR_NO_RESPONSE;
+                        let mut use_pose_directly = false;
+
+                        for attempt in 0..max_dock_attempts {
+                            // The first attempt goes straight in from wherever the
+                            // traffic plan left us. Every retry re-approaches via
+                            // the staging pose, on the grounds that if we are here
+                            // at all then the approach is what went wrong.
+                            let goal = DockRobot_Goal {
+                                use_dock_id: !use_pose_directly,
+                                dock_id: if use_pose_directly {
+                                    String::new()
+                                } else {
+                                    dock_id.clone()
+                                },
                                 dock_pose: handle.request.target_pose.clone(),
                                 dock_type: "simple_charging_dock".to_string(),
                                 max_staging_time: 1000.0,
-                                navigate_to_staging_pose: true,
+                                navigate_to_staging_pose: attempt > 0,
                             };
-                            if let Some(fb_client) = dock_client.dock_client.request_goal(fallback_goal).await {
-                                let mut fb_stream = fb_client.stream();
-                                while let Some(event) = fb_stream.next().await {
-                                    match event {
-                                        GoalEvent::Result((status, result)) => {
-                                            last_error_code = result.error_code;
-                                            info!(
-                                                "[{:?}] [DockRobot Fallback] Result: {:?}, success={}, error_code={}, error_msg='{}'",
-                                                agent_entity.index(),
-                                                status,
-                                                result.success,
-                                                result.error_code,
-                                                result.error_msg
-                                            );
-                                            if status == GoalStatusCode::Succeeded || result.success {
-                                                success = true;
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
+
+                            let (attempt_ok, error_code) = execute_dock_attempt(
+                                &dock_client.dock_client,
+                                goal,
+                                agent_entity.index(),
+                                attempt + 1,
+                                max_dock_attempts,
+                            )
+                            .await;
+
+                            if attempt_ok {
+                                success = true;
+                                break;
                             }
+
+                            last_error_code = error_code;
+                            if error_code == DOCK_ERROR_NOT_IN_DATABASE {
+                                // The id is not going to start working. Fall back
+                                // to the pose the traffic plan gave us for every
+                                // remaining attempt.
+                                use_pose_directly = true;
+                            }
+
+                            let _ = dock_client.dock_status_pub.publish(RosString {
+                                data: format!(
+                                    "dock_retry: {} (attempt {}/{}, code={})",
+                                    dock_id,
+                                    attempt + 1,
+                                    max_dock_attempts,
+                                    error_code
+                                ),
+                            });
                         }
-                        if !success && (last_error_code == 903 || last_error_code == 0 || last_error_code == 905 || last_error_code == 999) {
-                            warn!(
-                                "[{:?}] Robot dock attempt for '{}' unsuccessful (error_code={}). Retrying with navigate_to_staging_pose=true...",
+
+                        if !success {
+                            error!(
+                                "[{:?}] Dock '{}' failed after {} attempt(s) (last error_code={}). Requesting a replan.",
                                 agent_entity.index(),
                                 dock_id,
+                                max_dock_attempts,
                                 last_error_code
                             );
-                            let staging_goal = DockRobot_Goal {
-                                use_dock_id: true,
-                                dock_id: dock_id.clone(),
-                                dock_pose: handle.request.target_pose.clone(),
-                                dock_type: "simple_charging_dock".to_string(),
-                                max_staging_time: 1000.0,
-                                navigate_to_staging_pose: true,
-                            };
-                            if let Some(st_client) = dock_client.dock_client.request_goal(staging_goal).await {
-                                let mut st_stream = st_client.stream();
-                                while let Some(event) = st_stream.next().await {
-                                    if let GoalEvent::Result((status, result)) = event {
-                                        last_error_code = result.error_code;
-                                        info!(
-                                            "[{:?}] [DockRobot Stage Retry] Result: {:?}, success={}, error_code={}, error_msg='{}'",
-                                            agent_entity.index(),
-                                            status,
-                                            result.success,
-                                            result.error_code,
-                                            result.error_msg
-                                        );
-                                        if status == GoalStatusCode::Succeeded || result.success {
-                                            success = true;
-                                        }
-                                    }
+                            let _ = dock_client.dock_status_pub.publish(RosString {
+                                data: format!(
+                                    "dock_failed: {} (code={}, attempts={})",
+                                    dock_id, last_error_code, max_dock_attempts
+                                ),
+                            });
+
+                            // Only now does the traffic layer hear about it, and
+                            // what it hears is a request to think again rather than
+                            // a bespoke docking failure it would have to understand.
+                            if let Some(publisher) = plan_error_pub.as_ref() {
+                                let plan_error = ros_env::rmf_prototype_msgs::msg::PlanError {
+                                    error: ros_env::rmf_prototype_msgs::msg::Error {
+                                        code: ros_env::rmf_prototype_msgs::msg::PlanError::CODE_REPLAN_REQUEST,
+                                        message: format!(
+                                            "Dock '{}' incomplete after {} attempt(s), last nav2 error_code={}",
+                                            dock_id, max_dock_attempts, last_error_code
+                                        ),
+                                        parameters: String::new(),
+                                    },
+                                    plan_id: handle.request.safe_zone_id.plan_id.clone(),
+                                };
+                                if let Err(e) = publisher.publish(plan_error) {
+                                    error!(
+                                        "Failed to publish dock PlanError for agent {:?}: {:?}",
+                                        agent_entity.index(),
+                                        e
+                                    );
                                 }
                             }
-                        }
-                        if !success {
-                            let _ = dock_client.dock_status_pub.publish(RosString {
-                                data: format!("dock_failed: {} (code={})", dock_id, last_error_code),
-                            });
+
                             let sz_id = safe_zone_id.clone();
                             channel.commands(move |cmds| {
                                 cmds.trigger(WorkflowCompletedEvent {

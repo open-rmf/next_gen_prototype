@@ -112,6 +112,18 @@ pub struct AgentExecutionState {
     /// after that action so the recipient can correlate it with the plan it
     /// posted. `None` whenever the agent is free to be given a new plan.
     pub active_action: Option<String>,
+    /// Progress level to report instead of the odometry projection.
+    ///
+    /// A dock maneuver deliberately drives off the plan polyline: the contact
+    /// pose is not a waypoint, and nav2's `DockRobot` controls the approach. A
+    /// nearest-segment projection therefore stops describing the robot the
+    /// moment the maneuver starts, and the direction it fails in is the
+    /// dangerous one — it saturates at the end of the plan, telling every
+    /// dependent robot that the corridor has been vacated.
+    ///
+    /// So while committed, progress is latched to the level the robot had
+    /// genuinely reached and the maneuver reports its own completion.
+    pub pinned_progress: Option<f32>,
 }
 
 impl AgentExecutionState {
@@ -121,6 +133,33 @@ impl AgentExecutionState {
 
     pub fn end_action(&mut self) {
         self.active_action = None;
+    }
+
+    /// Latch the reported progress. Ignored if a pin is already held, so that
+    /// the earliest (most conservative) level survives a multi-step workflow.
+    pub fn pin_progress(&mut self, progress: f32) {
+        self.pinned_progress.get_or_insert(progress);
+    }
+
+    /// Finish an action.
+    ///
+    /// On success the maneuver is over and the plan's own progress model
+    /// describes the robot again. On failure it does not: the robot is
+    /// somewhere in the corridor, having neither docked nor backed out, so the
+    /// pin is kept and the space stays claimed until a replan supersedes it.
+    pub fn complete_action(&mut self, success: bool) {
+        self.active_action = None;
+        if success {
+            self.pinned_progress = None;
+        }
+    }
+
+    /// Drop the pin because it is no longer meaningful.
+    ///
+    /// Progress levels are only comparable within one plan, so a pin latched
+    /// against a superseded plan says nothing about the new one.
+    pub fn clear_pin(&mut self) {
+        self.pinned_progress = None;
     }
 
     pub fn is_executing_action(&self) -> bool {

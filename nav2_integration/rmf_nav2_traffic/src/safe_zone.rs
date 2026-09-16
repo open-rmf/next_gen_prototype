@@ -271,7 +271,7 @@ fn update_incremental_target(
         &mut CurrentSafeZone,
         Option<&CurrentPlan>,
         Option<&AmclPose>,
-        Option<&AgentExecutionState>,
+        Option<&mut AgentExecutionState>,
         &Nav2Agent,
     )>,
 ) {
@@ -283,7 +283,7 @@ fn update_incremental_target(
         mut current_safe_zone,
         maybe_plan,
         maybe_pose,
-        maybe_execution,
+        mut maybe_execution,
         agent,
     ) in subscriptions.iter_mut()
     {
@@ -322,7 +322,7 @@ fn update_incremental_target(
         // have merely been released to reach. Reporting the latter would tell
         // every robot that depends on us that we have already vacated space we
         // are still sitting in.
-        let progress_value = match (plan_ref, maybe_pose) {
+        let observed_progress = match (plan_ref, maybe_pose) {
             (Some(plan), Some(pose)) => projected_progress(
                 plan,
                 pose.0.pose.pose.position.x as f32,
@@ -335,12 +335,29 @@ fn update_incremental_target(
             _ => 0.0,
         };
 
-        let (execution_state, active_action) = execution_state_of(
-            maybe_execution,
-            plan_ref,
-            safe_zone.last_waypoint,
-            target_wp,
-        );
+        // A dock or undock leaves the plan polyline, so from the moment one
+        // starts the projection above is measuring against a line the robot is
+        // no longer following. Latch the level actually reached and hold it
+        // there until the maneuver reports its own completion. This is the
+        // whole reason the corridor claim survives: geometry cannot see a robot
+        // that is deliberately off-path, but the workflow can.
+        if let Some(execution) = maybe_execution.as_deref_mut() {
+            if execution.is_executing_action() {
+                let reached = plan_ref
+                    .and_then(|plan| plan.waypoints.get(safe_zone.last_waypoint as usize))
+                    .map(|wp| wp.progress)
+                    .unwrap_or(observed_progress);
+                execution.pin_progress(reached);
+            }
+        }
+
+        let execution_ref = maybe_execution.as_deref();
+        let progress_value = execution_ref
+            .and_then(|execution| execution.pinned_progress)
+            .unwrap_or(observed_progress);
+
+        let (execution_state, active_action) =
+            execution_state_of(execution_ref, plan_ref, safe_zone.last_waypoint, target_wp);
 
         let Ok(_) = progress_pub.publisher.publish(Progress {
             progress: progress_value,
@@ -376,8 +393,15 @@ fn update_incremental_target(
     }
 }
 
-fn update_plan(mut subscriptions: Query<(&PlanSubscription, &mut CurrentPlan, &Nav2Agent)>) {
-    for (plan_sub, mut current_plan, agent) in subscriptions.iter_mut() {
+fn update_plan(
+    mut subscriptions: Query<(
+        &PlanSubscription,
+        &mut CurrentPlan,
+        Option<&mut AgentExecutionState>,
+        &Nav2Agent,
+    )>,
+) {
+    for (plan_sub, mut current_plan, mut maybe_execution, agent) in subscriptions.iter_mut() {
         let Some(plan) = plan_sub.subscriber.data_callback() else {
             continue;
         };
@@ -392,6 +416,13 @@ fn update_plan(mut subscriptions: Query<(&PlanSubscription, &mut CurrentPlan, &N
                 plan.plan_id.plan_version,
                 plan.waypoints.len()
             );
+            // Progress levels only mean anything relative to the plan they were
+            // measured against, so a pin held over from the previous plan (a
+            // dock that failed, say) has to go rather than be reinterpreted
+            // against a different scale.
+            if let Some(execution) = maybe_execution.as_deref_mut() {
+                execution.clear_pin();
+            }
             *current_plan = CurrentPlan(Some(plan));
         }
     }
@@ -941,6 +972,7 @@ mod tests {
         let plan = plan_with_progress(&[([0.0, 0.0], 0.0), ([1.0, 0.0], 1.0)]);
         let execution = AgentExecutionState {
             active_action: Some("dock_conveyor_r1_c1".to_string()),
+            ..Default::default()
         };
 
         // Sitting on the last waypoint would otherwise look like IDLE.
@@ -972,5 +1004,59 @@ mod tests {
 
         let (state, _) = execution_state_of(None, Some(&plan), 0, 2);
         assert_eq!(state, Progress::EXECUTION_STATE_MOVING);
+    }
+
+    /// The pin is what stops a docking robot from advertising that it has left
+    /// a corridor it is still driving into. These cover its lifecycle; the
+    /// system that applies it lives in `update_safe_zone`.
+    #[test]
+    fn the_first_pin_wins_so_a_multi_step_workflow_stays_conservative() {
+        let mut execution = AgentExecutionState::default();
+        execution.begin_action("dock_conveyor_r1_c1");
+
+        execution.pin_progress(2.0);
+        // A later step of the same workflow must not be able to talk the claim
+        // forwards; the robot has not gone anywhere the plan can describe.
+        execution.pin_progress(3.0);
+
+        assert_eq!(execution.pinned_progress, Some(2.0));
+    }
+
+    #[test]
+    fn a_successful_dock_releases_the_pin() {
+        let mut execution = AgentExecutionState::default();
+        execution.begin_action("dock_conveyor_r1_c1");
+        execution.pin_progress(2.0);
+
+        execution.complete_action(true);
+
+        assert!(!execution.is_executing_action());
+        assert_eq!(execution.pinned_progress, None);
+    }
+
+    #[test]
+    fn a_failed_dock_keeps_its_claim_on_the_corridor() {
+        let mut execution = AgentExecutionState::default();
+        execution.begin_action("dock_conveyor_r1_c1");
+        execution.pin_progress(2.0);
+
+        execution.complete_action(false);
+
+        // Nothing is in flight any more, but the robot is stranded somewhere in
+        // the corridor. Handing the space back now would route a peer through it.
+        assert!(!execution.is_executing_action());
+        assert_eq!(execution.pinned_progress, Some(2.0));
+    }
+
+    #[test]
+    fn a_new_plan_invalidates_the_pin() {
+        let mut execution = AgentExecutionState::default();
+        execution.pin_progress(2.0);
+
+        // Progress 2.0 meant something in the old plan and means something else
+        // in the new one, so it cannot be carried across.
+        execution.clear_pin();
+
+        assert_eq!(execution.pinned_progress, None);
     }
 }
