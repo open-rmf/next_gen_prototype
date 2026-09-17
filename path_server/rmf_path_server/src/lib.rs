@@ -542,6 +542,32 @@ impl<P: MapfPlanner> PlanServer<P> {
         Some(status.dock_id.as_str())
     }
 
+    /// Whether someone has asked `robot_id` to go somewhere it is not already
+    /// heading.
+    fn has_queued_request(&self, robot_id: &str) -> bool {
+        self.replan_queue
+            .iter()
+            .any(|(queued, _)| queued == robot_id)
+    }
+
+    /// Whether `robot_id` is sitting in a dock that nobody has asked it to
+    /// leave.
+    ///
+    /// Such a robot must be kept out of the negotiation entirely, because for a
+    /// docked robot there is no such thing as a harmless plan. Publishing one
+    /// makes `rmf_nav2_traffic` issue `NavigateToPose`, and its dock handling
+    /// reverses the robot out of the dock first -- so merely *reissuing the
+    /// plan it already had* would drive it out of a dock it was happily parked
+    /// in. Every other participant can absorb a redundant plan; this one
+    /// cannot.
+    ///
+    /// It is the absence of a queued request that makes the robot a bystander.
+    /// A docked robot that has genuinely been given somewhere new to go is a
+    /// full participant and does get planned, undock prefix and all.
+    fn is_idle_in_dock(&self, robot_id: &str) -> bool {
+        self.is_docked(robot_id) && !self.has_queued_request(robot_id)
+    }
+
     /// The space a committed robot has to be treated as holding, as an ordered
     /// swept path.
     ///
@@ -851,12 +877,17 @@ impl<P: MapfPlanner> PlanServer<P> {
         // plan and the plan_id it already has; the planner is told about the
         // space it is holding instead of being asked to route it.
         //
-        // Its destination deliberately stays in `goals`, and so survives into
-        // `active_destinations` below. Dropping it there would strand the robot
+        // The same applies, for a different reason, to a robot already parked in
+        // a dock that nobody has asked to move: see [`Self::is_idle_in_dock`].
+        // Between them these two cases cover a robot for the whole time it is in
+        // a dock, from the approach through to being asked to leave.
+        //
+        // Their destinations deliberately stay in `goals`, and so survive into
+        // `active_destinations` below. Dropping them there would strand the robot
         // at the dock with nothing to return to once the action finishes.
         let frozen: Vec<String> = goals
             .keys()
-            .filter(|robot_id| self.is_committed(robot_id))
+            .filter(|robot_id| self.is_committed(robot_id) || self.is_idle_in_dock(robot_id))
             .cloned()
             .collect();
 
@@ -867,6 +898,9 @@ impl<P: MapfPlanner> PlanServer<P> {
         // Holding it makes recovery level-triggered - whichever tick first finds
         // the robot released picks the request up - instead of depending on
         // catching the exact moment the action ends.
+        //
+        // A robot frozen for being idle in a dock has no entry to hold by
+        // definition, so this only ever concerns the committed ones.
         self.replan_queue
             .retain(|(robot_id, _)| frozen.contains(robot_id));
         // One swept path per frozen robot, not one flat list of points: the
@@ -879,11 +913,20 @@ impl<P: MapfPlanner> PlanServer<P> {
             .filter(|path| !path.is_empty())
             .collect();
         for robot_id in &frozen {
-            rclrs::log!(
-                self.node.logger(),
-                "Robot {} is executing an action; holding its plan and excluding it from this negotiation",
-                robot_id
-            );
+            if self.is_committed(robot_id) {
+                rclrs::log!(
+                    self.node.logger(),
+                    "Robot {} is executing an action; holding its plan and excluding it from this negotiation",
+                    robot_id
+                );
+            } else {
+                rclrs::log!(
+                    self.node.logger(),
+                    "Robot {} is parked in dock {} and has not been asked to move; leaving it there rather than planning it out",
+                    robot_id,
+                    self.docked_at(robot_id).unwrap_or_default()
+                );
+            }
         }
 
         let mut robot_ids: Vec<String> = goals

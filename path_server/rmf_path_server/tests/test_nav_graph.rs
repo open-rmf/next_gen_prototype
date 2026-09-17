@@ -21,7 +21,7 @@ use ros_env::rmf_prototype_msgs::msg::{
     Plan, Region, TargetNode, TargetOrientation, TargetRegion,
 };
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const SAMPLE_SITE_JSON: &str = r#"{
@@ -752,4 +752,198 @@ fn test_path_server_docked_start_splices_the_undock_back_in(
     }
 
     panic!("Timed out waiting for generated plan starting from the docked pose");
+}
+
+/// A robot parked in a dock that nobody has asked to move must not be replanned
+/// because one of its peers was given a task.
+///
+/// This is the defect the dock reporting exists to fix. A destination is never
+/// retired once reached, so a robot that docked long ago is still a member of
+/// every subsequent negotiation. Before the fix it would be handed a fresh plan
+/// whenever any peer replanned, and since `rmf_nav2_traffic` undocks before
+/// servicing a `NavigateToPose`, receiving that plan reversed it out of a dock
+/// it had been sitting in quite happily.
+///
+/// The assertion is on the *number of plans published*, not their contents,
+/// because the content is irrelevant: even republishing the identical plan the
+/// robot is already executing is enough to undock it.
+#[test]
+fn test_path_server_parked_robot_is_not_replanned_for_a_peer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let context = Context::default_from_env().unwrap();
+    let mut executor = context.create_basic_executor();
+    let test_node = Arc::new(executor.create_node("test_parked_peer_node")?);
+    let server_node = Arc::new(executor.create_node("path_server_parked_peer")?);
+
+    let site: rmf_site_format::Site =
+        serde_json::from_str(SAMPLE_SITE_JSON).expect("failed to parse site json");
+    let nav_graph = Arc::new(NavGraphData::from_site(&site));
+
+    let _path_server_guard = start_path_server_with_nav_graph(
+        Arc::clone(&server_node),
+        MockPathPlanner,
+        Some(nav_graph),
+    )?;
+
+    let parked_id = "test_mir_parked_in_dock";
+    let mover_id = "test_mir_peer_mover";
+
+    let parked_plan_count = Arc::new(AtomicUsize::new(0));
+    let parked_plan_count_clone = Arc::clone(&parked_plan_count);
+    let _parked_plan_sub = test_node.create_subscription::<Plan, _>(
+        format!("{}/plan", parked_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+        move |_msg: Plan| {
+            parked_plan_count_clone.fetch_add(1, Ordering::SeqCst);
+        },
+    )?;
+
+    let mover_plan = Arc::new(Mutex::new(None));
+    let mover_plan_clone = Arc::clone(&mover_plan);
+    let _mover_plan_sub = test_node.create_subscription::<Plan, _>(
+        format!("{}/plan", mover_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+        move |msg: Plan| {
+            *mover_plan_clone.lock().unwrap() = Some(msg);
+        },
+    )?;
+
+    let discovery_pub = test_node.create_publisher::<ParticipantList>(
+        "/destination/discovery".transient_local().reliable(),
+    )?;
+    let parked_odom_pub = test_node
+        .create_publisher::<Odometry>(format!("{}/odom", parked_id).as_str().reliable())?;
+    let mover_odom_pub =
+        test_node.create_publisher::<Odometry>(format!("{}/odom", mover_id).as_str().reliable())?;
+    let parked_dock_status_pub = test_node.create_publisher::<DockStatus>(
+        format!("{}/dock_status", parked_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+    let parked_dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", parked_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+    let mover_dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", mover_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+
+    let mut discovery_msg = ParticipantList::default();
+    for name in [parked_id, mover_id] {
+        discovery_msg.participants.push(Participant {
+            name: name.to_string(),
+            components: vec![],
+        });
+    }
+
+    // The parked robot sits in the dock and says so.
+    let mut parked_odom = Odometry::default();
+    parked_odom.pose.pose.position.x = 0.0;
+    parked_odom.pose.pose.position.y = 0.95;
+
+    let mut parked_dock_status = DockStatus::default();
+    parked_dock_status.state = DockStatus::STATE_DOCKED;
+    parked_dock_status.dock_id = "dock_conveyor_r1_c1".to_string();
+
+    // Both robots need odometry throughout: `replan` abandons the whole
+    // negotiation if any participant's pose is missing.
+    let mut mover_odom = Odometry::default();
+    mover_odom.pose.pose.position.x = 2.5;
+    mover_odom.pose.pose.position.y = 1.5;
+
+    let point_destination = |x: f32, y: f32| {
+        let mut dest = Destination::default();
+        let mut constraints = DestinationConstraints::default();
+        constraints.regions.push(TargetRegion {
+            region: Region {
+                points: vec![x, y],
+                hint: Region::HINT_POINT,
+            },
+            ..Default::default()
+        });
+        dest.constraints = constraints;
+        dest
+    };
+
+    // Phase 1: give the parked robot a destination so that it acquires an entry
+    // in `active_destinations`. This is the state a robot is left in after it
+    // has completed a task, and the reason it keeps turning up in negotiations.
+    let parked_dest = point_destination(2.5, 2.0);
+    // Everything the server needs to keep believing in both robots. Republished
+    // every iteration because the subscriptions are created asynchronously as
+    // the participants are discovered, so an early sample can be missed.
+    let republish = || {
+        let _ = discovery_pub.publish(&discovery_msg);
+        let _ = parked_odom_pub.publish(&parked_odom);
+        let _ = mover_odom_pub.publish(&mover_odom);
+        let _ = parked_dock_status_pub.publish(&parked_dock_status);
+        let _ = parked_dest_pub.publish(&parked_dest);
+    };
+
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5)
+        && parked_plan_count.load(Ordering::SeqCst) == 0
+    {
+        republish();
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+    }
+    assert!(
+        parked_plan_count.load(Ordering::SeqCst) > 0,
+        "Timed out waiting for the parked robot's initial plan"
+    );
+
+    // Let the first negotiation finish completely, so that anything counted
+    // after this point is attributable to the peer's request.
+    let settle = std::time::Instant::now();
+    while settle.elapsed() < std::time::Duration::from_secs(1) {
+        republish();
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+    }
+    let plans_before_peer_request = parked_plan_count.load(Ordering::SeqCst);
+
+    // Phase 2: an unrelated robot is given a task. The parked robot has not been
+    // asked to go anywhere, so it must be left alone.
+    let mover_dest = point_destination(0.0, 2.0);
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5) {
+        let _ = mover_dest_pub.publish(&mover_dest);
+        republish();
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+        if mover_plan.lock().unwrap().is_some() {
+            break;
+        }
+    }
+    assert!(
+        mover_plan.lock().unwrap().is_some(),
+        "Timed out waiting for the peer's plan; the parked robot must not be blocking it"
+    );
+
+    // The peer's plan has been produced, so the negotiation that would have
+    // swept the parked robot in has already run. Settle once more to catch a
+    // late publication.
+    let settle = std::time::Instant::now();
+    while settle.elapsed() < std::time::Duration::from_secs(1) {
+        let _ = mover_dest_pub.publish(&mover_dest);
+        republish();
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+    }
+
+    assert_eq!(
+        parked_plan_count.load(Ordering::SeqCst),
+        plans_before_peer_request,
+        "A robot parked in a dock was sent a new plan because a peer replanned; \
+         receiving any plan at all makes it reverse out of the dock"
+    );
+
+    Ok(())
 }
