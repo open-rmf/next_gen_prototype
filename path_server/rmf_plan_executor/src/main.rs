@@ -111,8 +111,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .transient_local()
             .reliable()
             .keep_last(10),
-        move |executor: &mut PlanExecutor, msg: ParticipantList| {
-            let (added, removed) = tracker.update(&msg);
+        move |executor: &mut PlanExecutor, msg: ParticipantList, info: rclrs::MessageInfo| {
+            let (added, removed) =
+                tracker.update(rmf_participant_discovery::publisher_key(&info), &msg);
             for robot_id in removed {
                 executor.handle_robot_removed(&robot_id);
             }

@@ -19,9 +19,9 @@ use ros_env::{
     rmf_prototype_msgs::{
         self,
         msg::{
-            ControlPoint, Curve, Destination, GraphElementKey, Plan, PlanError, PlanId, Progress,
-            Region, TargetNode, TargetOrientation, TargetRegion, TrafficDependency, Trajectory,
-            Waypoint,
+            ControlPoint, Curve, Destination, DockStatus, GraphElementKey, Plan, PlanError, PlanId,
+            Progress, Region, TargetNode, TargetOrientation, TargetRegion, TrafficDependency,
+            Trajectory, Waypoint,
         },
     },
 };
@@ -90,6 +90,29 @@ pub fn reports_commitment(progress: Option<&Progress>, active_plan_id: Option<&P
     };
     progress.plan_id == *active_plan_id
         && progress.execution_state == Progress::EXECUTION_STATE_EXECUTING_ACTION
+}
+
+/// Whether a dock status report says its robot is parked in a dock.
+///
+/// Split out from [`PlanServer::is_docked`] so the rule can be exercised
+/// without standing up a ROS node.
+///
+/// Only `STATE_DOCKED` counts, and the exclusions are the point:
+///
+/// * `STATE_DOCKING` and `STATE_UNDOCKING` describe a robot physically
+///   committed to a maneuver. That is [`reports_commitment`]'s job, and it
+///   calls for a different response - a committed robot is excluded from the
+///   negotiation outright, whereas a parked one is a normal participant that
+///   merely needs an undock spliced in front of its plan.
+/// * `STATE_FAILED` leaves the robot somewhere in the dock lane without saying
+///   where. An undock prefix computed from the dock vertex would then describe
+///   a path the robot is not actually on, which is worse than not prefixing.
+///
+/// Silence means not docked. That risks routing a robot we have heard nothing
+/// about, but the opposite - reading silence as docked - would freeze a robot
+/// out of every negotiation with no way to recover.
+pub fn reports_docked(status: Option<&DockStatus>) -> bool {
+    status.is_some_and(|status| status.state == DockStatus::STATE_DOCKED)
 }
 
 /// Whether a robot holds a destination that the plan it is currently executing
@@ -161,6 +184,13 @@ pub struct PlanServer<P: MapfPlanner> {
     /// Held for one question only: is this robot physically committed to an
     /// action right now? See [`PlanServer::is_committed`].
     pub latest_progress: HashMap<String, Progress>,
+    /// The most recent `<robot>/dock_status` from each participant.
+    ///
+    /// Separate from `latest_progress` because it answers a different question
+    /// and has a different lifetime: progress is only meaningful against the
+    /// plan it was measured on, whereas being parked in a dock outlives any
+    /// plan. See [`PlanServer::is_docked`].
+    pub latest_dock_status: HashMap<String, DockStatus>,
 }
 
 impl<P: MapfPlanner> PlanServer<P> {
@@ -198,6 +228,7 @@ impl<P: MapfPlanner> PlanServer<P> {
             nav_graph,
             target_actions: HashMap::new(),
             latest_progress: HashMap::new(),
+            latest_dock_status: HashMap::new(),
         }
     }
 
@@ -456,6 +487,61 @@ impl<P: MapfPlanner> PlanServer<P> {
         )
     }
 
+    /// Record a dock state report. See [`PlanServer::is_docked`].
+    pub fn handle_dock_status(&mut self, robot_id: &str, msg: DockStatus) {
+        self.latest_dock_status.insert(robot_id.to_string(), msg);
+    }
+
+    /// Drop everything remembered about a participant that has gone away.
+    ///
+    /// Every one of these maps is keyed by robot id and written on receipt, but
+    /// none of them was ever cleaned up, so a robot that left and rejoined
+    /// inherited whatever it had before it disappeared. A stale destination put
+    /// it back into negotiations it never asked to join, and a stale plan id
+    /// made its first report after rejoining look like a commitment.
+    ///
+    /// `latest_dock_status` is the deliberate exception: it is kept. Dock state
+    /// is the one piece of knowledge here that cannot be rebuilt by observation
+    /// -- a robot sitting in a dock looks, to odometry alone, exactly like a
+    /// robot parked next to one. Forgetting it fails in the dangerous
+    /// direction, because a rejoined robot we believe to be undocked is planned
+    /// from its true in-dock pose, which is finer than
+    /// `MIN_PLANNING_RESOLUTION` and never gets the undock prefix spliced in
+    /// front of it. Retaining it fails in the recoverable direction: the report
+    /// is republished under transient-local QoS the moment the subscription
+    /// comes back, and a report that has gone stale in the meantime is caught
+    /// by corroborating it against odometry near the dock it names.
+    pub fn forget_robot(&mut self, robot_id: &str) {
+        self.latest_progress.remove(robot_id);
+        self.latest_pose_estimate.remove(robot_id);
+        self.active_destinations.remove(robot_id);
+        self.active_plan_ids.remove(robot_id);
+        self.target_actions.remove(robot_id);
+        // A queued request for a robot that is gone would otherwise carry
+        // `replan()` past its early return on every tick, forcing a full
+        // negotiation ten times a second on behalf of a participant nobody can
+        // plan for.
+        self.replan_queue.retain(|(queued, _)| queued != robot_id);
+    }
+
+    /// Whether `robot_id` is parked in a dock, according to its own report.
+    /// See [`reports_docked`].
+    pub fn is_docked(&self, robot_id: &str) -> bool {
+        reports_docked(self.latest_dock_status.get(robot_id))
+    }
+
+    /// The dock `robot_id` is parked in, if any.
+    ///
+    /// Returns `None` rather than an empty string when the robot is not parked,
+    /// so that a caller cannot accidentally look up the empty vertex name.
+    pub fn docked_at(&self, robot_id: &str) -> Option<&str> {
+        let status = self.latest_dock_status.get(robot_id)?;
+        if status.state != DockStatus::STATE_DOCKED || status.dock_id.is_empty() {
+            return None;
+        }
+        Some(status.dock_id.as_str())
+    }
+
     /// The space a committed robot has to be treated as holding, as an ordered
     /// swept path.
     ///
@@ -694,11 +780,20 @@ impl<P: MapfPlanner> PlanServer<P> {
             // Give up if odometry for some robots is stale.
             if let Some(odom) = self.latest_pose_estimate.get(robot_id) {
                 let mut start_odom = odom.clone();
-                // If robot is at a docked vertex or corridor, assume plan starts at the undocked vertex
+                // If the robot reports it is parked in a dock, the plan has to
+                // start from that dock's staging vertex.
                 if let Some(nav_graph) = &self.nav_graph {
                     let rx = start_odom.pose.pose.position.x as f32;
                     let ry = start_odom.pose.pose.position.y as f32;
-                    if let Some(dock_vertex) = nav_graph.find_dock_vertex_by_proximity(rx, ry, 0.8)
+                    // Asking the robot beats measuring it. Proximity could only
+                    // ever tell us that *some* dock vertex was within 0.8 m,
+                    // which is equally true of a robot parked beside a dock as
+                    // of one sitting in it, and gets less decidable the closer
+                    // together the docks are. The report names the dock, so we
+                    // resolve that one.
+                    if let Some(dock_vertex) = self
+                        .docked_at(robot_id)
+                        .and_then(|dock_id| nav_graph.find_vertex_by_name(dock_id))
                     {
                         let undock_pos =
                             dock_vertex.undock_position.unwrap_or(dock_vertex.position);
@@ -1090,6 +1185,7 @@ pub struct RobotPathConnections<P: MapfPlanner> {
     pub _odom_subscription: rclrs::WorkerSubscription<Odometry, PlanServer<P>>,
     pub _plan_error_subscription: rclrs::WorkerSubscription<PlanError, PlanServer<P>>,
     pub _progress_subscription: rclrs::WorkerSubscription<Progress, PlanServer<P>>,
+    pub _dock_status_subscription: rclrs::WorkerSubscription<DockStatus, PlanServer<P>>,
 }
 
 pub struct DiscoveryServer<P: MapfPlanner> {
@@ -1325,6 +1421,33 @@ pub fn start_path_server_with_nav_graph<P: MapfPlanner + 'static>(
                     }
                 };
 
+                let robot_id_clone5 = robot_id.to_string();
+                let dock_status_topic = robot_id.to_string() + "/dock_status";
+                // Transient local, to match the publisher in rmf_nav2_traffic.
+                // Unlike progress, this is a latched state rather than a
+                // stream: a path server that starts after a robot has already
+                // docked has to learn that on connection, not wait for the next
+                // transition that may never come.
+                let dock_status_sub = match server
+                    .destinations_worker
+                    .create_subscription::<DockStatus, _>(
+                        dock_status_topic.as_str().transient_local().reliable(),
+                        move |dest_server: &mut PlanServer<P>, dock_msg: DockStatus| {
+                            dest_server.handle_dock_status(&robot_id_clone5, dock_msg);
+                        },
+                    ) {
+                    Ok(sub) => sub,
+                    Err(err) => {
+                        rclrs::log_error!(
+                            server.node.logger(),
+                            "Failed to create dock status subscription on DestinationsWorker for {}: {:?}",
+                            robot_id,
+                            err
+                        );
+                        return;
+                    }
+                };
+
                 server.active_robots.insert(
                     robot_id.to_string(),
                     RobotPathConnections {
@@ -1332,6 +1455,7 @@ pub fn start_path_server_with_nav_graph<P: MapfPlanner + 'static>(
                         _odom_subscription: odom_sub,
                         _plan_error_subscription: plan_error_sub,
                         _progress_subscription: progress_sub,
+                        _dock_status_subscription: dock_status_sub,
                     },
                 );
             }
@@ -1339,6 +1463,17 @@ pub fn start_path_server_with_nav_graph<P: MapfPlanner + 'static>(
         |server: &mut DiscoveryServer<P>, robot_id: &str| {
             if server.active_robots.remove(robot_id).is_some() {
                 rclrs::log!(server.node.logger(), "Participant left: {}", robot_id);
+                // Dropping the subscriptions above stops new reports arriving
+                // but leaves the last ones cached on the plan server, which
+                // lives on a different worker. Clear them there too.
+                let robot_id = robot_id.to_string();
+                // The promise is dropped rather than awaited: this callback is
+                // not async and the cleanup has no result anyone needs.
+                let _ = server
+                    .destinations_worker
+                    .run(move |plan_server: &mut PlanServer<P>| {
+                        plan_server.forget_robot(&robot_id);
+                    });
             }
         },
     )?;
@@ -1402,6 +1537,55 @@ mod tests {
 
         assert!(!reports_commitment(Some(&report), Some(&plan_id(1, 1))));
         assert!(!reports_commitment(Some(&report), Some(&plan_id(2, 0))));
+    }
+
+    fn dock_status(state: u8, dock_id: &str) -> DockStatus {
+        DockStatus {
+            state,
+            dock_id: dock_id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_robot_parked_in_a_dock_is_docked() {
+        let report = dock_status(DockStatus::STATE_DOCKED, "dock_conveyor_r1_c1");
+        assert!(reports_docked(Some(&report)));
+    }
+
+    /// The states either side of `DOCKED` describe a robot mid-maneuver. Those
+    /// are handled as commitment, not as being parked, and conflating them would
+    /// hand an undock prefix to a robot that is already driving out of the dock.
+    #[test]
+    fn transitional_dock_states_do_not_count_as_parked() {
+        for state in [
+            DockStatus::STATE_UNDOCKED,
+            DockStatus::STATE_DOCKING,
+            DockStatus::STATE_UNDOCKING,
+        ] {
+            let report = dock_status(state, "dock_conveyor_r1_c1");
+            assert!(
+                !reports_docked(Some(&report)),
+                "state {} should not count as parked",
+                state
+            );
+        }
+    }
+
+    /// A failed dock leaves the robot somewhere in the lane without saying
+    /// where, so an undock prefix built from the dock vertex would describe a
+    /// path it is not on.
+    #[test]
+    fn a_failed_dock_is_not_a_known_park() {
+        let report = dock_status(DockStatus::STATE_FAILED, "dock_conveyor_r1_c1");
+        assert!(!reports_docked(Some(&report)));
+    }
+
+    #[test]
+    fn a_robot_that_has_never_reported_is_not_docked() {
+        // Treating silence as docked would freeze a robot we simply have not
+        // heard from out of every negotiation, with no way back.
+        assert!(!reports_docked(None));
     }
 
     /// Everything short of `EXECUTING_ACTION` is replannable, including

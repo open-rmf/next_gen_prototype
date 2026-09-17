@@ -17,8 +17,8 @@ use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use rmf_path_server::{start_path_server_with_nav_graph, Map, MapfPlanner, NavGraphData};
 use ros_env::nav_msgs::msg::Odometry;
 use ros_env::rmf_prototype_msgs::msg::{
-    Destination, DestinationConstraints, GraphElementKey, Participant, ParticipantList, Plan,
-    Region, TargetNode, TargetOrientation, TargetRegion,
+    Destination, DestinationConstraints, DockStatus, GraphElementKey, Participant, ParticipantList,
+    Plan, Region, TargetNode, TargetOrientation, TargetRegion,
 };
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -619,6 +619,11 @@ fn test_path_server_raw_contact_coordinates_snaps_to_predock(
 /// lane is finer than its resolution. But the plan handed to the robot must
 /// begin where the robot really is, so that the undock sweep is visible to
 /// `mapf_post` and the dock corridor is not silently declared free.
+///
+/// The robot announces that it is docked. Sitting at the dock's coordinates is
+/// not sufficient and deliberately so: a robot stopped beside a dock occupies
+/// the same neighbourhood without being in it, and only the robot knows which
+/// of the two it is.
 #[test]
 fn test_path_server_docked_start_splices_the_undock_back_in(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -664,6 +669,14 @@ fn test_path_server_docked_start_splices_the_undock_back_in(
             .transient_local()
             .reliable(),
     )?;
+    // Transient local, matching the real publisher in rmf_nav2_traffic: dock
+    // state is a latched fact, not an event stream.
+    let dock_status_pub = test_node.create_publisher::<DockStatus>(
+        format!("{}/dock_status", robot_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
 
     let mut discovery_msg = ParticipantList::default();
     discovery_msg.participants.push(Participant {
@@ -672,11 +685,18 @@ fn test_path_server_docked_start_splices_the_undock_back_in(
     });
     discovery_pub.publish(&discovery_msg)?;
 
-    // Robot is currently physically docked at (0.0, 0.95)
+    // Robot is currently physically docked at (0.0, 0.95), and says so. The
+    // dock_id names the lane it is in, which is how the path server finds the
+    // vertex to back out through.
     let mut odom_msg = Odometry::default();
     odom_msg.pose.pose.position.x = 0.0;
     odom_msg.pose.pose.position.y = 0.95;
     odom_pub.publish(&odom_msg)?;
+
+    let mut dock_status_msg = DockStatus::default();
+    dock_status_msg.state = DockStatus::STATE_DOCKED;
+    dock_status_msg.dock_id = "dock_conveyor_r1_c1".to_string();
+    dock_status_pub.publish(&dock_status_msg)?;
 
     // Robot receives a destination to go to parking_spot at (2.5, 2.0)
     let mut dest_msg = Destination::default();
@@ -695,6 +715,7 @@ fn test_path_server_docked_start_splices_the_undock_back_in(
     while start_time.elapsed() < std::time::Duration::from_secs(5) {
         let _ = discovery_pub.publish(&discovery_msg);
         let _ = odom_pub.publish(&odom_msg);
+        let _ = dock_status_pub.publish(&dock_status_msg);
         let _ = dest_pub.publish(&dest_msg);
         executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
         if let Ok(guard) = received_plan.lock() {

@@ -25,6 +25,7 @@ set(msg_files
   "msg/DestinationConstraints.msg"
   "msg/DestinationError.msg"
   "msg/DestinationGoal.msg"
+  "msg/DockStatus.msg"
   "msg/Error.msg"
   "msg/GraphElementKey.msg"
   "msg/Participant.msg"

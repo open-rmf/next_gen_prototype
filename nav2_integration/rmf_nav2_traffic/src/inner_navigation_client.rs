@@ -15,10 +15,14 @@ use ros_env::{
         DockRobot, DockRobot_Goal, NavigateToPose, NavigateToPose_Feedback, NavigateToPose_Goal,
         UndockRobot, UndockRobot_Goal,
     },
-    rmf_prototype_msgs::msg::SafeZoneId,
-    std_msgs::msg::{Header, String as RosString},
+    rmf_prototype_msgs::msg::{DockStatus, PlanId, SafeZoneId},
+    std_msgs::msg::Header,
 };
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Event)]
@@ -161,6 +165,19 @@ const DOCK_ERROR_NO_RESPONSE: u16 = u16::MAX;
 
 const DEFAULT_DOCK_MAX_ATTEMPTS: i64 = 3;
 
+/// How often the current dock state is repeated on `<agent>/dock_status`.
+///
+/// Dock state is otherwise only announced on a transition, which leaves a robot
+/// that docked an hour ago indistinguishable, to a consumer that cares about
+/// freshness, from a robot whose reporter died an hour ago. Repeating the state
+/// turns silence into evidence.
+///
+/// One second is chosen to sit well inside any sensible consumer timeout while
+/// staying negligible next to the traffic already on the wire: this is one
+/// small message per robot per second, against safe zones published per
+/// odometry tick at roughly fifty times that rate.
+const DOCK_STATUS_HEARTBEAT: Duration = Duration::from_secs(1);
+
 /// How many times to ask nav2 to dock before giving up.
 ///
 /// Retries are deliberately kept *inside* the adapter. The traffic layer has no
@@ -194,7 +211,8 @@ impl Plugin for InnerNavigationClientPlugin {
             .add_event::<AgentDockStateChanged>()
             .add_observer(create_inner_navigation_client)
             .add_observer(track_workflow_step_started)
-            .add_observer(track_workflow_completed);
+            .add_observer(track_workflow_completed)
+            .add_systems(PreUpdate, heartbeat_dock_status);
 
         app.insert_resource(read_dock_retry_policy(app.world()));
 
@@ -235,7 +253,90 @@ fn read_dock_retry_policy(world: &World) -> DockRetryPolicy {
 pub struct InnerDockClient {
     pub dock_client: Arc<RosActionClient<DockRobot>>,
     pub undock_client: Arc<RosActionClient<UndockRobot>>,
-    pub dock_status_pub: Arc<RosPublisher<RosString>>,
+    pub dock_status_pub: Arc<RosPublisher<DockStatus>>,
+    /// Used to stamp every report, including the repeats.
+    ///
+    /// Held here rather than read from `RclrsNode` at the call site because
+    /// almost every transition is announced from inside an async workflow
+    /// block, which a Bevy `Res` cannot be carried into.
+    clock: Clock,
+    /// The last state announced, kept so the heartbeat has something to repeat.
+    ///
+    /// Shared behind a lock rather than stored on the component because the
+    /// transitions are published from async tasks holding a clone of this
+    /// component, while the heartbeat runs on the Bevy schedule; both have to
+    /// see the same value or a repeat could resurrect a superseded state.
+    last_status: Arc<Mutex<DockStatus>>,
+}
+
+impl InnerDockClient {
+    /// Announce a dock state transition on `<agent>/dock_status`.
+    ///
+    /// Every transition goes through here so that the ten call sites cannot
+    /// drift apart in shape. `state` is the whole contract; `message` exists
+    /// for operators reading logs and must never be parsed by a consumer to
+    /// work out what happened.
+    fn publish_status(
+        &self,
+        state: u8,
+        dock_id: impl Into<String>,
+        plan_id: PlanId,
+        message: impl Into<String>,
+    ) {
+        let msg = DockStatus {
+            stamp: self.now(),
+            state,
+            dock_id: dock_id.into(),
+            plan_id,
+            message: message.into(),
+        };
+        // Recorded before publishing so that a heartbeat landing immediately
+        // afterwards repeats the new state rather than the one it replaced.
+        if let Ok(mut last) = self.last_status.lock() {
+            *last = msg.clone();
+        }
+        let _ = self.dock_status_pub.publish(msg);
+    }
+
+    /// Repeat the last announced state with a fresh stamp.
+    ///
+    /// Only the stamp changes. A repeat carries no new information by
+    /// construction, so it cannot be the thing that tells a consumer a robot
+    /// docked; that remains the exclusive job of [`Self::publish_status`].
+    fn republish_status(&self) {
+        let Ok(mut last) = self.last_status.lock() else {
+            return;
+        };
+        last.stamp = self.now();
+        let _ = self.dock_status_pub.publish(last.clone());
+    }
+
+    fn now(&self) -> RosTime {
+        let now = self.clock.now();
+        RosTime {
+            sec: (now.nsec / 1_000_000_000) as i32,
+            nanosec: (now.nsec % 1_000_000_000) as u32,
+        }
+    }
+}
+
+/// Repeat every agent's dock state on a fixed wall-clock interval.
+///
+/// Deliberately driven by [`Instant`] rather than by Bevy's `Time`, and
+/// deliberately not hung off the odometry tick that already drives safe zone
+/// publication. A heartbeat is only meaningful if the one thing it proves is
+/// that the reporter is alive; sourcing it from a clock that can be paused or
+/// scaled, or from sensor data that can drop out, would let an unrelated
+/// failure expire a dock state that is still perfectly true.
+fn heartbeat_dock_status(dock_clients: Query<&InnerDockClient>, mut last: Local<Option<Instant>>) {
+    let now = Instant::now();
+    if last.is_some_and(|prev| now.duration_since(prev) < DOCK_STATUS_HEARTBEAT) {
+        return;
+    }
+    *last = Some(now);
+    for dock_client in &dock_clients {
+        dock_client.republish_status();
+    }
 }
 
 fn create_inner_navigation_client(
@@ -266,7 +367,7 @@ fn create_inner_navigation_client(
     // dispatcher GUI matches), and a VOLATILE publisher against a
     // TRANSIENT_LOCAL subscriber is a DURABILITY mismatch - the connection is
     // silently refused and not one message is ever delivered.
-    let dock_status_pub = Arc::new(RosPublisher::<RosString>::new_transient_local(
+    let dock_status_pub = Arc::new(RosPublisher::<DockStatus>::new_transient_local(
         &node,
         dock_status_topic,
     ));
@@ -278,6 +379,13 @@ fn create_inner_navigation_client(
             dock_client: Arc::new(dock_client),
             undock_client: Arc::new(undock_client),
             dock_status_pub,
+            clock: node.get_clock(),
+            // Defaults to STATE_UNDOCKED, which is both the correct assumption
+            // for a freshly discovered agent and, once the heartbeat picks it
+            // up, the first positive statement anyone has ever made about a
+            // robot that has not yet docked. Previously such a robot was
+            // simply silent.
+            last_status: Arc::new(Mutex::new(DockStatus::default())),
         })
         .insert(AgentDockState::default());
 }
@@ -882,12 +990,18 @@ fn async_request_new_goal(
 
     let action_client = Arc::clone(&inner_nav_client.action_client);
 
-    let (dock_client_opt, is_docked) = match dock_states.get(request.agent) {
+    let (dock_client_opt, is_docked, docked_at) = match dock_states.get(request.agent) {
         Ok((dc, state_opt)) => (
             Some(dc.clone()),
             state_opt.map(|s| s.is_docked).unwrap_or(false),
+            // Carried through so the status we publish names the dock being
+            // vacated. A peer that only hears "undocking" cannot tell which
+            // lane to keep clear.
+            state_opt
+                .and_then(|s| s.dock_id.clone())
+                .unwrap_or_default(),
         ),
-        Err(_) => (None, false),
+        Err(_) => (None, false, String::new()),
     };
 
     let mut pose = request.target_pose.clone();
@@ -901,6 +1015,9 @@ fn async_request_new_goal(
     pose.header.frame_id = "map".to_string();
 
     let agent_entity = request.agent;
+    // Captured out here because `request` does not survive into the async
+    // block, and every dock report has to name the plan that asked for it.
+    let plan_id = request.safe_zone_id.plan_id.clone();
 
     executor_commands
         .run(async move {
@@ -912,9 +1029,12 @@ fn async_request_new_goal(
                         pose.pose.position.x,
                         pose.pose.position.y
                     );
-                    let _ = dock_client.dock_status_pub.publish(RosString {
-                        data: "undocking".to_string(),
-                    });
+                    dock_client.publish_status(
+                        DockStatus::STATE_UNDOCKING,
+                        docked_at.as_str(),
+                        plan_id.clone(),
+                        "undocking before navigating to a new goal",
+                    );
                     // This undock runs outside the workflow node, so no
                     // WorkflowStepEvent is emitted for it. Mark the commitment by
                     // hand, otherwise the robot advertises itself as replannable
@@ -933,9 +1053,15 @@ fn async_request_new_goal(
                             "[{:?}] UndockRobot failed prior to navigation. Aborting request.",
                             agent_entity.index()
                         );
-                        let _ = dock_client.dock_status_pub.publish(RosString {
-                            data: "undock_failed".to_string(),
-                        });
+                        // Still reported against the dock: a failed undock
+                        // leaves the robot somewhere in the lane rather than
+                        // clear of it, so the lane stays occupied.
+                        dock_client.publish_status(
+                            DockStatus::STATE_FAILED,
+                            docked_at.as_str(),
+                            plan_id.clone(),
+                            "UndockRobot failed prior to navigation",
+                        );
                         // A failed undock leaves the robot no longer committed to
                         // an action, but it is still somewhere in the dock lane.
                         // Release the action flag so it can be replanned; keep the
@@ -955,9 +1081,7 @@ fn async_request_new_goal(
                         "[{:?}] Undocking succeeded. Updating AgentDockState to is_docked=false and proceeding with navigation.",
                         agent_entity.index()
                     );
-                    let _ = dock_client.dock_status_pub.publish(RosString {
-                        data: "undocked".to_string(),
-                    });
+                    dock_client.publish_status(DockStatus::STATE_UNDOCKED, "", plan_id, "");
                     channel.commands(move |cmds| {
                         cmds.entity(agent_entity).insert(AgentDockState::undocked());
                         cmds.entity(agent_entity)
@@ -1289,6 +1413,7 @@ fn async_execute_workflow(
         ..
     }: Async<InnerWorkflowRequest>,
     inner_dock_clients: Query<&InnerDockClient>,
+    dock_states: Query<&AgentDockState>,
     plan_error_publishers: Query<&PlanErrorPublisher>,
     dock_retry_policy: Res<DockRetryPolicy>,
     executor_commands: Res<RclrsExecutorCommands>,
@@ -1315,6 +1440,17 @@ fn async_execute_workflow(
     let fallback_handle = handle.clone();
     let total_steps = steps.len();
 
+    // The dock the robot is sitting in as the workflow begins. An Undock step
+    // names no dock of its own, so without this a robot leaving a dock it
+    // entered under an earlier plan would announce an empty dock_id and peers
+    // would not know which lane it is still blocking. Read here because the
+    // query cannot cross into the async block.
+    let initial_dock_id = dock_states
+        .get(agent_entity)
+        .ok()
+        .and_then(|state| state.dock_id.clone())
+        .unwrap_or_default();
+
     info!(
         "[{:?}] Executing workflow with {} step(s)",
         agent_entity.index(),
@@ -1323,6 +1459,7 @@ fn async_execute_workflow(
 
     executor_commands
         .run(async move {
+            let mut current_dock_id = initial_dock_id;
             for (idx, step) in steps.into_iter().enumerate() {
                 // Broadcast WorkflowStepEvent to Bevy observers
                 let step_clone = step.clone();
@@ -1346,9 +1483,12 @@ fn async_execute_workflow(
                             total_steps,
                             dock_id
                         );
-                        let _ = dock_client.dock_status_pub.publish(RosString {
-                            data: format!("docking: {}", dock_id),
-                        });
+                        dock_client.publish_status(
+                            DockStatus::STATE_DOCKING,
+                            &dock_id,
+                            safe_zone_id.plan_id.clone(),
+                            "",
+                        );
 
                         // Ask nav2 to dock, and keep asking. The traffic layer is
                         // told nothing until we run out of attempts: a docking
@@ -1399,15 +1539,21 @@ fn async_execute_workflow(
                                 use_pose_directly = true;
                             }
 
-                            let _ = dock_client.dock_status_pub.publish(RosString {
-                                data: format!(
-                                    "dock_retry: {} (attempt {}/{}, code={})",
-                                    dock_id,
+                            // Still STATE_DOCKING, not STATE_FAILED. A docking
+                            // controller backing off and re-approaching is
+                            // normal; reporting it as a failure would make a
+                            // robot that is still working look broken.
+                            dock_client.publish_status(
+                                DockStatus::STATE_DOCKING,
+                                &dock_id,
+                                safe_zone_id.plan_id.clone(),
+                                format!(
+                                    "retrying (attempt {}/{}, code={})",
                                     attempt + 1,
                                     max_dock_attempts,
                                     error_code
                                 ),
-                            });
+                            );
                         }
 
                         if !success {
@@ -1418,12 +1564,15 @@ fn async_execute_workflow(
                                 max_dock_attempts,
                                 last_error_code
                             );
-                            let _ = dock_client.dock_status_pub.publish(RosString {
-                                data: format!(
-                                    "dock_failed: {} (code={}, attempts={})",
-                                    dock_id, last_error_code, max_dock_attempts
+                            dock_client.publish_status(
+                                DockStatus::STATE_FAILED,
+                                &dock_id,
+                                safe_zone_id.plan_id.clone(),
+                                format!(
+                                    "dock failed (code={}, attempts={})",
+                                    last_error_code, max_dock_attempts
                                 ),
-                            });
+                            );
 
                             // Only now does the traffic layer hear about it, and
                             // what it hears is a request to think again rather than
@@ -1473,9 +1622,15 @@ fn async_execute_workflow(
                             agent_entity.index(),
                             dock_id_clone
                         );
-                        let _ = dock_client.dock_status_pub.publish(RosString {
-                            data: format!("docked: {}", dock_id_clone),
-                        });
+                        // Remembered so a later Undock step in this same
+                        // workflow can name the dock it is leaving.
+                        current_dock_id = dock_id.clone();
+                        dock_client.publish_status(
+                            DockStatus::STATE_DOCKED,
+                            &dock_id,
+                            safe_zone_id.plan_id.clone(),
+                            "",
+                        );
                         channel.commands(move |cmds| {
                             let state = AgentDockState::docked(dock_id_clone, Some(pose));
                             cmds.entity(agent_entity).insert(state.clone());
@@ -1492,9 +1647,12 @@ fn async_execute_workflow(
                             idx + 1,
                             total_steps
                         );
-                        let _ = dock_client.dock_status_pub.publish(RosString {
-                            data: "undocking".to_string(),
-                        });
+                        dock_client.publish_status(
+                            DockStatus::STATE_UNDOCKING,
+                            current_dock_id.as_str(),
+                            safe_zone_id.plan_id.clone(),
+                            "",
+                        );
                         let success =
                             execute_undock_action(&dock_client.undock_client, agent_entity.index()).await;
                         if success {
@@ -1502,9 +1660,13 @@ fn async_execute_workflow(
                                 "[{:?}] Undock action in workflow succeeded! Updating AgentDockState to is_docked=false",
                                 agent_entity.index()
                             );
-                            let _ = dock_client.dock_status_pub.publish(RosString {
-                                data: "undocked".to_string(),
-                            });
+                            dock_client.publish_status(
+                                DockStatus::STATE_UNDOCKED,
+                                "",
+                                safe_zone_id.plan_id.clone(),
+                                "",
+                            );
+                            current_dock_id.clear();
                             channel.commands(move |cmds| {
                                 cmds.entity(agent_entity).insert(AgentDockState::undocked());
                                 cmds.trigger(AgentDockStateChanged {
@@ -1513,9 +1675,14 @@ fn async_execute_workflow(
                                 });
                             });
                         } else {
-                            let _ = dock_client.dock_status_pub.publish(RosString {
-                                data: "undock_failed".to_string(),
-                            });
+                            // The dock id is retained: the robot is left
+                            // somewhere in the lane, not clear of it.
+                            dock_client.publish_status(
+                                DockStatus::STATE_FAILED,
+                                current_dock_id.as_str(),
+                                safe_zone_id.plan_id.clone(),
+                                "UndockRobot failed during workflow",
+                            );
                             let sz_id = safe_zone_id.clone();
                             channel.commands(move |cmds| {
                                 cmds.trigger(WorkflowCompletedEvent {
