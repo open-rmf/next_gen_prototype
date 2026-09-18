@@ -35,9 +35,13 @@ pub trait MapfPlanner: Send + Sync + 'static {
     /// Plan for `robot_ids`, avoiding `frozen_claims`.
     ///
     /// Each entry of `frozen_claims` is the swept path of one robot that is
-    /// *not* in `robot_ids`: it is physically committed to an action, cannot be
-    /// replanned, and will not move out of the way. A path is a polyline in
-    /// world coordinates, ordered, and may be a single point.
+    /// *not* in `robot_ids`. Such a robot is not being routed by this call for
+    /// one of three reasons: it is physically committed to an action, it is
+    /// parked in a dock nobody has asked it to leave, or it has no outstanding
+    /// task at all. In every case it cannot be replanned and will not move out
+    /// of the way. A path is a polyline in world coordinates, ordered, and may
+    /// be a single point -- for a parked robot it usually is, being simply the
+    /// place it is standing.
     ///
     /// These are not agents and they are not obstacles that expire. Treat every
     /// point along every path as **permanently occupied map**, for the whole
@@ -347,9 +351,10 @@ impl MapfPlanner for PibtPlanner {
             grid_ends.push((gx, gy));
         }
 
-        // A committed robot is not an agent in this problem: it cannot be
+        // A frozen robot is not an agent in this problem: it cannot be
         // replanned and it will not get out of the way, so the space it holds
-        // is map, not traffic.
+        // is map, not traffic. That covers a robot mid-dock, a robot parked in
+        // one, and a robot standing idle with no task.
         //
         // This used to enter as a hetpibt external track. That was the wrong
         // mechanism twice over. An external track describes an agent that is

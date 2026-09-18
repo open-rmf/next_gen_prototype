@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use mapf_post::na::Isometry2;
-use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
+use rclrs::{Context, CreateBasicExecutor, InitOptions, IntoPrimitiveOptions, SpinOptions};
 use rmf_path_server::{start_path_server_with_nav_graph, Map, MapfPlanner, NavGraphData};
 use ros_env::nav_msgs::msg::Odometry;
 use ros_env::rmf_prototype_msgs::msg::{
     Destination, DestinationConstraints, DockStatus, GraphElementKey, Participant, ParticipantList,
-    Plan, Region, TargetNode, TargetOrientation, TargetRegion,
+    Plan, Progress, Region, TargetNode, TargetOrientation, TargetRegion,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -170,6 +170,33 @@ fn test_nav_graph_parsing() {
     assert_eq!(predock_snap.unwrap().id, 12);
 }
 
+/// A context on a ROS domain of its own.
+///
+/// Every test here stands up a path server alongside robots with fixed names.
+/// On a shared domain each server discovers every *other* test's robots through
+/// the global `/destination/discovery` topic, plans for them, and publishes to
+/// their topics -- so what a test observed depended on which of its peers
+/// happened to be running beside it. That had been survivable and quietly got
+/// worse with every test added, until two tests that had nothing to do with
+/// each other began timing out waiting for plans their own server had given
+/// away to somebody else's robot.
+///
+/// Isolating the domain is what makes each of these a test of the path server
+/// rather than of the order the harness happened to schedule them in.
+///
+/// Ids are handed out from a counter based well clear of the default domain 0,
+/// so a suite running in the background cannot interfere with a developer's own
+/// session either.
+fn isolated_context() -> Context {
+    static NEXT_DOMAIN_ID: AtomicUsize = AtomicUsize::new(80);
+    let domain_id = NEXT_DOMAIN_ID.fetch_add(1, Ordering::SeqCst);
+    Context::new(
+        std::env::args(),
+        InitOptions::new().with_domain_id(Some(domain_id)),
+    )
+    .expect("failed to create an isolated ROS context")
+}
+
 struct MockPathPlanner;
 
 impl MapfPlanner for MockPathPlanner {
@@ -200,6 +227,47 @@ impl MapfPlanner for MockPathPlanner {
             ]);
         }
         Ok(plans)
+    }
+}
+
+/// `MockPathPlanner` with the frozen claims it was handed written down.
+///
+/// The claims are the entire interface between "the path server knows this
+/// robot is standing there" and "the planner treats that cell as wall", so a
+/// test that wants to prove a robot was marked as a static obstacle has to look
+/// at what actually crossed that boundary. Asserting on the resulting route
+/// instead would prove nothing here, because `MockPathPlanner` draws a straight
+/// line and ignores obstacles entirely.
+struct ClaimRecordingPlanner {
+    claims: Arc<Mutex<Vec<Vec<[f32; 2]>>>>,
+}
+
+impl MapfPlanner for ClaimRecordingPlanner {
+    fn plan(
+        &self,
+        starts: &HashMap<String, Odometry>,
+        goals: &HashMap<String, Destination>,
+        footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
+        robot_ids: &[String],
+        map: &Map,
+        frozen_claims: &[Vec<[f32; 2]>],
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
+        self.claims.lock().unwrap().extend(
+            frozen_claims
+                .iter()
+                .filter(|path| !path.is_empty())
+                .cloned(),
+        );
+        MockPathPlanner.plan(
+            starts,
+            goals,
+            footprints,
+            robot_ids,
+            map,
+            frozen_claims,
+            cancellation,
+        )
     }
 }
 
@@ -243,7 +311,7 @@ fn assert_padding_after(plan: &Plan, idx: usize) {
 
 #[test]
 fn test_path_server_graphkey_destination_dock_action() -> Result<(), Box<dyn std::error::Error>> {
-    let context = Context::default_from_env().unwrap();
+    let context = isolated_context();
     let mut executor = context.create_basic_executor();
     let test_node = Arc::new(executor.create_node("test_graphkey_node")?);
     let server_node = Arc::new(executor.create_node("path_server_graphkey")?);
@@ -374,7 +442,7 @@ fn test_path_server_graphkey_destination_dock_action() -> Result<(), Box<dyn std
 #[test]
 fn test_path_server_dock_name_destination_routes_to_predock(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let context = Context::default_from_env().unwrap();
+    let context = isolated_context();
     let mut executor = context.create_basic_executor();
     let test_node = Arc::new(executor.create_node("test_dock_name_node")?);
     let server_node = Arc::new(executor.create_node("path_server_dock_name")?);
@@ -503,7 +571,7 @@ fn test_path_server_dock_name_destination_routes_to_predock(
 #[test]
 fn test_path_server_raw_contact_coordinates_snaps_to_predock(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let context = Context::default_from_env().unwrap();
+    let context = isolated_context();
     let mut executor = context.create_basic_executor();
     let test_node = Arc::new(executor.create_node("test_rawcoord_node")?);
     let server_node = Arc::new(executor.create_node("path_server_rawcoord")?);
@@ -627,7 +695,7 @@ fn test_path_server_raw_contact_coordinates_snaps_to_predock(
 #[test]
 fn test_path_server_docked_start_splices_the_undock_back_in(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let context = Context::default_from_env().unwrap();
+    let context = isolated_context();
     let mut executor = context.create_basic_executor();
     let test_node = Arc::new(executor.create_node("test_docked_start_node")?);
     let server_node = Arc::new(executor.create_node("path_server_docked_start")?);
@@ -757,12 +825,12 @@ fn test_path_server_docked_start_splices_the_undock_back_in(
 /// A robot parked in a dock that nobody has asked to move must not be replanned
 /// because one of its peers was given a task.
 ///
-/// This is the defect the dock reporting exists to fix. A destination is never
-/// retired once reached, so a robot that docked long ago is still a member of
-/// every subsequent negotiation. Before the fix it would be handed a fresh plan
-/// whenever any peer replanned, and since `rmf_nav2_traffic` undocks before
-/// servicing a `NavigateToPose`, receiving that plan reversed it out of a dock
-/// it had been sitting in quite happily.
+/// This is the defect the dock reporting exists to fix. The robot here never
+/// reports reaching the end of its plan, so its destination is never retired
+/// and it remains a member of every subsequent negotiation. Before the fix it
+/// would be handed a fresh plan whenever any peer replanned, and since
+/// `rmf_nav2_traffic` undocks before servicing a `NavigateToPose`, receiving
+/// that plan reversed it out of a dock it had been sitting in quite happily.
 ///
 /// The assertion is on the *number of plans published*, not their contents,
 /// because the content is irrelevant: even republishing the identical plan the
@@ -770,7 +838,7 @@ fn test_path_server_docked_start_splices_the_undock_back_in(
 #[test]
 fn test_path_server_parked_robot_is_not_replanned_for_a_peer(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let context = Context::default_from_env().unwrap();
+    let context = isolated_context();
     let mut executor = context.create_basic_executor();
     let test_node = Arc::new(executor.create_node("test_parked_peer_node")?);
     let server_node = Arc::new(executor.create_node("path_server_parked_peer")?);
@@ -943,6 +1011,361 @@ fn test_path_server_parked_robot_is_not_replanned_for_a_peer(
         plans_before_peer_request,
         "A robot parked in a dock was sent a new plan because a peer replanned; \
          receiving any plan at all makes it reverse out of the dock"
+    );
+
+    Ok(())
+}
+
+/// A destination is retired once the plan built for it has been run to its end,
+/// so the robot stops being a participant in every negotiation that follows.
+///
+/// Nothing ever removed an entry from `active_destinations`. Every robot that
+/// had been given a task once therefore stayed in the negotiation for the life
+/// of the process, and had a fresh plan generated and published for a
+/// destination it was already standing on.
+///
+/// This deliberately exercises the general case and not the docking one. The
+/// robot simply arrives and reports `EXECUTION_STATE_IDLE`, which is the
+/// executor's way of saying it reached the end of its plan. Nothing about a
+/// dock is involved, so the test cannot be satisfied by the separate rule that
+/// freezes a robot parked in a dock -- it fails unless the destination is
+/// genuinely retired.
+///
+/// As in the parked-robot test the assertion is on the number of plans
+/// published, because the whole point is that a robot with nothing left to do
+/// should not be receiving plans at all.
+#[test]
+fn test_path_server_retires_a_destination_once_it_is_reached(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let context = isolated_context();
+    let mut executor = context.create_basic_executor();
+    let test_node = Arc::new(executor.create_node("test_retire_destination_node")?);
+    let server_node = Arc::new(executor.create_node("path_server_retire_destination")?);
+
+    let site: rmf_site_format::Site =
+        serde_json::from_str(SAMPLE_SITE_JSON).expect("failed to parse site json");
+    let nav_graph = Arc::new(NavGraphData::from_site(&site));
+
+    let _path_server_guard = start_path_server_with_nav_graph(
+        Arc::clone(&server_node),
+        MockPathPlanner,
+        Some(nav_graph),
+    )?;
+
+    let arrived_id = "test_mir_arrived";
+    let mover_id = "test_mir_arrival_peer";
+
+    let arrived_plan_count = Arc::new(AtomicUsize::new(0));
+    let arrived_plan = Arc::new(Mutex::new(None));
+    let arrived_plan_count_clone = Arc::clone(&arrived_plan_count);
+    let arrived_plan_clone = Arc::clone(&arrived_plan);
+    let _arrived_plan_sub = test_node.create_subscription::<Plan, _>(
+        format!("{}/plan", arrived_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+        move |msg: Plan| {
+            *arrived_plan_clone.lock().unwrap() = Some(msg);
+            arrived_plan_count_clone.fetch_add(1, Ordering::SeqCst);
+        },
+    )?;
+
+    let mover_plan = Arc::new(Mutex::new(None));
+    let mover_plan_clone = Arc::clone(&mover_plan);
+    let _mover_plan_sub = test_node.create_subscription::<Plan, _>(
+        format!("{}/plan", mover_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+        move |msg: Plan| {
+            *mover_plan_clone.lock().unwrap() = Some(msg);
+        },
+    )?;
+
+    let discovery_pub = test_node.create_publisher::<ParticipantList>(
+        "/destination/discovery".transient_local().reliable(),
+    )?;
+    let arrived_odom_pub = test_node
+        .create_publisher::<Odometry>(format!("{}/odom", arrived_id).as_str().reliable())?;
+    let mover_odom_pub =
+        test_node.create_publisher::<Odometry>(format!("{}/odom", mover_id).as_str().reliable())?;
+    let arrived_dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", arrived_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+    let mover_dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", mover_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+    // Volatile, to match both the path server's subscription and the real
+    // publisher in rmf_nav2_traffic. A transient_local publisher here would be
+    // QoS-incompatible and the progress would never arrive.
+    let arrived_progress_pub = test_node.create_publisher::<Progress>(
+        format!("{}/plan/progress", arrived_id).as_str().reliable(),
+    )?;
+
+    let mut discovery_msg = ParticipantList::default();
+    for name in [arrived_id, mover_id] {
+        discovery_msg.participants.push(Participant {
+            name: name.to_string(),
+            components: vec![],
+        });
+    }
+
+    // Both robots need odometry throughout: `replan` abandons the whole
+    // negotiation if any participant's pose is missing.
+    let mut arrived_odom = Odometry::default();
+    arrived_odom.pose.pose.position.x = 2.5;
+    arrived_odom.pose.pose.position.y = 1.5;
+
+    let mut mover_odom = Odometry::default();
+    mover_odom.pose.pose.position.x = 0.0;
+    mover_odom.pose.pose.position.y = 1.5;
+
+    let point_destination = |x: f32, y: f32| {
+        let mut dest = Destination::default();
+        let mut constraints = DestinationConstraints::default();
+        constraints.regions.push(TargetRegion {
+            region: Region {
+                points: vec![x, y],
+                hint: Region::HINT_POINT,
+            },
+            ..Default::default()
+        });
+        dest.constraints = constraints;
+        dest
+    };
+
+    let republish = || {
+        let _ = discovery_pub.publish(&discovery_msg);
+        let _ = arrived_odom_pub.publish(&arrived_odom);
+        let _ = mover_odom_pub.publish(&mover_odom);
+    };
+
+    // Phase 1: give the robot a task and wait for the plan that serves it.
+    // The destination is republished only until the plan arrives, because the
+    // subscriptions are created asynchronously as participants are discovered
+    // and an early sample can be missed. Once it has been retired, republishing
+    // would read as a brand new session and put it straight back.
+    let arrived_dest = point_destination(2.5, 2.0);
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5)
+        && arrived_plan.lock().unwrap().is_none()
+    {
+        let _ = arrived_dest_pub.publish(&arrived_dest);
+        republish();
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+    }
+    let served_plan_id = arrived_plan
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|plan| plan.plan_id.clone())
+        .expect("Timed out waiting for the plan that serves the robot's destination");
+
+    // Phase 2: the robot reports that it ran that plan to its end. The plan_id
+    // has to be the one it was actually given: a report about any other plan
+    // says nothing about the destination we are asking to retire.
+    let mut arrived_progress = Progress::default();
+    arrived_progress.plan_id = served_plan_id;
+    arrived_progress.execution_state = Progress::EXECUTION_STATE_IDLE;
+
+    let settle = std::time::Instant::now();
+    while settle.elapsed() < std::time::Duration::from_secs(1) {
+        let _ = arrived_progress_pub.publish(&arrived_progress);
+        republish();
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+    }
+    let plans_before_peer_request = arrived_plan_count.load(Ordering::SeqCst);
+
+    // Phase 3: an unrelated robot is given a task. The arrived robot has nothing
+    // left to do, so there is nothing to plan for it.
+    let mover_dest = point_destination(0.0, 2.0);
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5) {
+        let _ = mover_dest_pub.publish(&mover_dest);
+        let _ = arrived_progress_pub.publish(&arrived_progress);
+        republish();
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+        if mover_plan.lock().unwrap().is_some() {
+            break;
+        }
+    }
+    assert!(
+        mover_plan.lock().unwrap().is_some(),
+        "Timed out waiting for the peer's plan; the arrived robot must not be blocking it"
+    );
+
+    // The peer's plan exists, so the negotiation that would have swept the
+    // arrived robot in has already run. Settle once more to catch a late
+    // publication.
+    let settle = std::time::Instant::now();
+    while settle.elapsed() < std::time::Duration::from_secs(1) {
+        let _ = mover_dest_pub.publish(&mover_dest);
+        let _ = arrived_progress_pub.publish(&arrived_progress);
+        republish();
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+    }
+
+    assert_eq!(
+        arrived_plan_count.load(Ordering::SeqCst),
+        plans_before_peer_request,
+        "A robot that had already reached its destination was replanned because a peer got a \
+         task; its destination should have been retired when it reported reaching the end of \
+         the plan built for it"
+    );
+
+    Ok(())
+}
+
+/// A robot parked in a dock is handed to the planner as a static obstacle, even
+/// though it is not a participant in the negotiation.
+///
+/// The two halves of this are tested in different places. That a claim reaching
+/// the planner is burned into the grid and routed around is
+/// `planner::tests::a_frozen_claim_is_never_entered_or_displaced`. This test is
+/// the other half: that the path server actually produces the claim.
+///
+/// The parked robot here is never given a destination at all. That is the whole
+/// point. While the frozen set was drawn from `goals.keys()`, a robot with no
+/// destination could not be represented -- it was neither routed nor claimed,
+/// so it was simply a hole in the map that a peer could be sent straight
+/// through. Destinations being retired on arrival turns that from a corner case
+/// into the normal resting state of every idle robot.
+#[test]
+fn test_path_server_claims_a_parked_robot_as_an_obstacle() -> Result<(), Box<dyn std::error::Error>>
+{
+    let context = isolated_context();
+    let mut executor = context.create_basic_executor();
+    let test_node = Arc::new(executor.create_node("test_parked_obstacle_node")?);
+    let server_node = Arc::new(executor.create_node("path_server_parked_obstacle")?);
+
+    let site: rmf_site_format::Site =
+        serde_json::from_str(SAMPLE_SITE_JSON).expect("failed to parse site json");
+    let nav_graph = Arc::new(NavGraphData::from_site(&site));
+
+    let recorded_claims = Arc::new(Mutex::new(Vec::new()));
+    let _path_server_guard = start_path_server_with_nav_graph(
+        Arc::clone(&server_node),
+        ClaimRecordingPlanner {
+            claims: Arc::clone(&recorded_claims),
+        },
+        Some(nav_graph),
+    )?;
+
+    let parked_id = "test_mir_parked_obstacle";
+    let mover_id = "test_mir_obstacle_peer";
+
+    // The parked robot is the one sitting in the dock contact zone of
+    // `conveyor_r1_c1`. Its pose is the claim we expect to see.
+    let parked_x = 0.0f32;
+    let parked_y = 0.95f32;
+
+    let mover_plan = Arc::new(Mutex::new(None));
+    let mover_plan_clone = Arc::clone(&mover_plan);
+    let _mover_plan_sub = test_node.create_subscription::<Plan, _>(
+        format!("{}/plan", mover_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+        move |msg: Plan| {
+            *mover_plan_clone.lock().unwrap() = Some(msg);
+        },
+    )?;
+
+    let discovery_pub = test_node.create_publisher::<ParticipantList>(
+        "/destination/discovery".transient_local().reliable(),
+    )?;
+    let parked_odom_pub = test_node
+        .create_publisher::<Odometry>(format!("{}/odom", parked_id).as_str().reliable())?;
+    let mover_odom_pub =
+        test_node.create_publisher::<Odometry>(format!("{}/odom", mover_id).as_str().reliable())?;
+    let parked_dock_status_pub = test_node.create_publisher::<DockStatus>(
+        format!("{}/dock_status", parked_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+    let mover_dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", mover_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+
+    let mut discovery_msg = ParticipantList::default();
+    for name in [parked_id, mover_id] {
+        discovery_msg.participants.push(Participant {
+            name: name.to_string(),
+            components: vec![],
+        });
+    }
+
+    let mut parked_odom = Odometry::default();
+    parked_odom.pose.pose.position.x = parked_x as f64;
+    parked_odom.pose.pose.position.y = parked_y as f64;
+
+    let mut parked_dock_status = DockStatus::default();
+    parked_dock_status.state = DockStatus::STATE_DOCKED;
+    parked_dock_status.dock_id = "dock_conveyor_r1_c1".to_string();
+
+    let mut mover_odom = Odometry::default();
+    mover_odom.pose.pose.position.x = 2.5;
+    mover_odom.pose.pose.position.y = 1.5;
+
+    let republish = || {
+        let _ = discovery_pub.publish(&discovery_msg);
+        let _ = parked_odom_pub.publish(&parked_odom);
+        let _ = mover_odom_pub.publish(&mover_odom);
+        let _ = parked_dock_status_pub.publish(&parked_dock_status);
+    };
+
+    // Only the mover is ever given a task, so the only reason a negotiation
+    // runs at all is the mover, and the only reason the parked robot appears in
+    // it is as an obstacle.
+    let mut mover_dest = Destination::default();
+    let mut constraints = DestinationConstraints::default();
+    constraints.regions.push(TargetRegion {
+        region: Region {
+            points: vec![0.0, 2.0],
+            hint: Region::HINT_POINT,
+        },
+        ..Default::default()
+    });
+    mover_dest.constraints = constraints;
+
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5) {
+        let _ = mover_dest_pub.publish(&mover_dest);
+        republish();
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+        if mover_plan.lock().unwrap().is_some() {
+            break;
+        }
+    }
+    assert!(
+        mover_plan.lock().unwrap().is_some(),
+        "Timed out waiting for the peer's plan; without one the planner was never called and \
+         there is nothing to assert about"
+    );
+
+    // These tests share a ROS domain, so other tests' robots can appear in the
+    // claims too. What matters is that ours is among them.
+    let claims = recorded_claims.lock().unwrap();
+    let parked_was_claimed = claims.iter().any(|path| {
+        path.iter()
+            .any(|p| (p[0] - parked_x).abs() < 0.01 && (p[1] - parked_y).abs() < 0.01)
+    });
+    assert!(
+        parked_was_claimed,
+        "A robot parked in a dock was not handed to the planner as an obstacle. It holds no \
+         destination, so it is not being routed either - the space it occupies is invisible and \
+         a peer can be planned straight through it. Claims seen: {:?}",
+        claims
     );
 
     Ok(())

@@ -423,6 +423,27 @@ impl<P: MapfPlanner> PlanServer<P> {
         let was_committed = self.is_committed(robot_id);
         self.latest_progress.insert(robot_id.to_string(), msg);
 
+        // A destination that has been reached is not a goal any more. Nothing
+        // ever removed one, so every robot that finished a task stayed a
+        // participant in every negotiation for the life of the process, and had
+        // a plan regenerated and republished for a destination it was already
+        // standing on. For a robot parked in a dock that republished plan is not
+        // merely wasted work: `rmf_nav2_traffic` reverses a docked robot out of
+        // its dock before it will drive anywhere, so reissuing the plan it was
+        // already executing undocks it.
+        if self.destination_is_served(robot_id) {
+            rclrs::log!(
+                self.node.logger(),
+                "Robot {} has reached the end of the plan for its destination; retiring it",
+                robot_id
+            );
+            self.active_destinations.remove(robot_id);
+            // The dock suffix was requested by the destination being retired.
+            // Left behind it would be appended again to whatever plan the robot
+            // is given next, sending it back to a dock nobody asked for.
+            self.target_actions.remove(robot_id);
+        }
+
         if !was_committed || self.is_committed(robot_id) {
             return;
         }
@@ -432,13 +453,15 @@ impl<P: MapfPlanner> PlanServer<P> {
         // negotiation for as long as it was committed - but it is only owed a
         // plan if a destination arrived during that time.
         //
-        // Re-queuing unconditionally looks harmless and is not. A destination
-        // that resolved to a dock is still sitting in `active_destinations`
-        // after the dock *succeeds*, so the replan regenerates the very same
-        // dock suffix; the new plan_id makes the executor re-issue the maneuver;
-        // and the robot undocks and re-docks forever. It is committed for almost
-        // all of that cycle, so every genuinely new destination is filtered out
-        // by `replan` and the robot looks permanently unassignable.
+        // Re-queuing unconditionally looks harmless and is not. Retirement
+        // happens on the arrival report, which need not be the report that
+        // released the robot, so there is a window in which a served
+        // destination is still present. Replanning in that window regenerates
+        // the very same dock suffix; the new plan_id makes the executor
+        // re-issue the maneuver; and the robot undocks and re-docks forever. It
+        // is committed for almost all of that cycle, so every genuinely new
+        // destination is filtered out by `replan` and the robot looks
+        // permanently unassignable.
         if !self.has_unplanned_destination(robot_id) {
             rclrs::log_debug!(
                 self.node.logger(),
@@ -466,6 +489,41 @@ impl<P: MapfPlanner> PlanServer<P> {
             self.active_destinations.get(robot_id),
             self.active_plan_ids.get(robot_id),
         )
+    }
+
+    /// Whether `robot_id` has run the plan that serves its destination all the
+    /// way to the end, so the destination can be retired.
+    ///
+    /// `EXECUTION_STATE_IDLE` is the executor saying precisely this: it is
+    /// emitted when `reached_waypoint + 1 >= plan.waypoints.len()`. A completed
+    /// dock lands on it too, because finishing the arrival action clears
+    /// `active_action` and leaves the robot at the final waypoint - so one rule
+    /// covers a plain arrival and a finished dock alike, and we do not have to
+    /// correlate dock reports against the destination that asked for the dock.
+    ///
+    /// Both guards are load-bearing:
+    ///
+    /// * The report must be about the plan we last published. Progress means
+    ///   nothing except against the plan it was measured on. `reached_waypoint`
+    ///   and `plan_id` are taken from the same `SafeZone` by the executor, so
+    ///   the index and the plan it indexes into are always consistent.
+    /// * The plan must be the one built for the destination we are retiring.
+    ///   Without this, a destination that arrived while the robot was finishing
+    ///   its previous plan would be thrown away unserved on the first IDLE
+    ///   report, and the robot would sit still with nobody left to ask for it.
+    fn destination_is_served(&self, robot_id: &str) -> bool {
+        if !self.active_destinations.contains_key(robot_id) {
+            return false;
+        }
+        let (Some(progress), Some(active_plan_id)) = (
+            self.latest_progress.get(robot_id),
+            self.active_plan_ids.get(robot_id),
+        ) else {
+            return false;
+        };
+        progress.plan_id == *active_plan_id
+            && progress.execution_state == Progress::EXECUTION_STATE_IDLE
+            && !self.has_unplanned_destination(robot_id)
     }
 
     /// Whether `robot_id` is physically committed to an action and so must not
@@ -568,13 +626,18 @@ impl<P: MapfPlanner> PlanServer<P> {
         self.is_docked(robot_id) && !self.has_queued_request(robot_id)
     }
 
-    /// The space a committed robot has to be treated as holding, as an ordered
-    /// swept path.
+    /// The space a robot this negotiation will not route has to be treated as
+    /// holding, as an ordered swept path.
     ///
-    /// Where it is, then the dock vertex named by `active_action`. It is
-    /// somewhere on the line between the two and we cannot tell where, so the
-    /// planner is handed the whole segment and rasterises it; claiming only the
-    /// two endpoints would leave the cells it crosses in between open.
+    /// For a robot that is simply parked -- in a dock, or anywhere else with no
+    /// task outstanding -- that is just where it is. A single point, which the
+    /// planner rasterises into the one cell it occupies.
+    ///
+    /// For a robot part-way through an action it is where it is, then the dock
+    /// vertex named by `active_action`. It is somewhere on the line between the
+    /// two and we cannot tell where, so the planner is handed the whole segment
+    /// and rasterises it; claiming only the two endpoints would leave the cells
+    /// it crosses in between open.
     ///
     /// The *staging* vertex is deliberately not claimed even though the robot
     /// passes through it. Staging sits on the travel network, and at the
@@ -760,7 +823,13 @@ impl<P: MapfPlanner> PlanServer<P> {
                             }
                         }
 
-                        self.active_destinations = goals;
+                        // `goals` is deliberately not written back over
+                        // `active_destinations`. It is a snapshot taken when
+                        // this planning run started, so assigning it would
+                        // resurrect any destination retired while the run was in
+                        // flight. It never held anything `active_destinations`
+                        // lacks in the first place: `handle_destination` writes
+                        // there directly before it queues the replan.
                     }
                     PlanResult::Failure { session_id, error } => {
                         // TODO(arjoc): Publish error message
@@ -872,24 +941,45 @@ impl<P: MapfPlanner> PlanServer<P> {
             });
         }
 
-        // A robot part-way through a dock cannot be replanned and will not move
-        // aside, so it is not a participant in this negotiation. It keeps the
-        // plan and the plan_id it already has; the planner is told about the
-        // space it is holding instead of being asked to route it.
+        // Every robot this negotiation is not going to route. It still occupies
+        // space, so the planner is told where it is instead of being asked to
+        // move it.
         //
-        // The same applies, for a different reason, to a robot already parked in
-        // a dock that nobody has asked to move: see [`Self::is_idle_in_dock`].
-        // Between them these two cases cover a robot for the whole time it is in
-        // a dock, from the approach through to being asked to leave.
+        // A robot lands here for one of three reasons:
         //
-        // Their destinations deliberately stay in `goals`, and so survive into
-        // `active_destinations` below. Dropping them there would strand the robot
-        // at the dock with nothing to return to once the action finishes.
-        let frozen: Vec<String> = goals
+        // * It holds no destination at all. Until destinations were retired this
+        //   could not happen after a robot's first task, which is why the set
+        //   used to be drawn from `goals.keys()`. Now it is the normal resting
+        //   state, and it is the dangerous one to get wrong: the robot is
+        //   standing somewhere perfectly ordinary with nothing marking it.
+        // * It is part-way through a dock. It cannot be replanned and will not
+        //   move aside, and it keeps the plan and plan_id it already has.
+        // * It is parked in a dock nobody has asked it to leave: see
+        //   [`Self::is_idle_in_dock`]. Between them the last two cover a robot
+        //   for the whole time it is in a dock, from the approach through to
+        //   being asked to leave.
+        //
+        // Being frozen never costs a robot its destination. Only reaching the
+        // end of the plan built for it retires one, so a robot held out of this
+        // negotiation still has somewhere to be routed once it is released.
+        //
+        // The roster is the union of every map that can tell us a robot exists.
+        // A robot missing from all of them is one we have never heard from, and
+        // there is nothing to claim on its behalf anyway.
+        let mut frozen: Vec<String> = self
+            .latest_pose_estimate
             .keys()
-            .filter(|robot_id| self.is_committed(robot_id) || self.is_idle_in_dock(robot_id))
+            .chain(self.latest_progress.keys())
+            .chain(self.latest_dock_status.keys())
+            .filter(|robot_id| {
+                !goals.contains_key(robot_id.as_str())
+                    || self.is_committed(robot_id)
+                    || self.is_idle_in_dock(robot_id)
+            })
             .cloned()
             .collect();
+        frozen.sort();
+        frozen.dedup();
 
         // Everyone we are about to plan for has had their request taken up, so
         // their queue entries can go. A frozen robot's cannot: it is not in this
@@ -899,8 +989,11 @@ impl<P: MapfPlanner> PlanServer<P> {
         // the robot released picks the request up - instead of depending on
         // catching the exact moment the action ends.
         //
-        // A robot frozen for being idle in a dock has no entry to hold by
-        // definition, so this only ever concerns the committed ones.
+        // Only a committed robot can hold an entry here. A robot frozen for
+        // being idle in a dock has no queued request by definition, and one
+        // frozen for having no destination is not in `goals`, so it cannot be in
+        // the queue either - everything in the queue is merged into `goals`
+        // above.
         self.replan_queue
             .retain(|(robot_id, _)| frozen.contains(robot_id));
         // One swept path per frozen robot, not one flat list of points: the
@@ -919,12 +1012,18 @@ impl<P: MapfPlanner> PlanServer<P> {
                     "Robot {} is executing an action; holding its plan and excluding it from this negotiation",
                     robot_id
                 );
-            } else {
+            } else if self.is_docked(robot_id) {
                 rclrs::log!(
                     self.node.logger(),
                     "Robot {} is parked in dock {} and has not been asked to move; leaving it there rather than planning it out",
                     robot_id,
                     self.docked_at(robot_id).unwrap_or_default()
+                );
+            } else {
+                rclrs::log_debug!(
+                    self.node.logger(),
+                    "Robot {} has no destination; treating it as an obstacle rather than a participant",
+                    robot_id
                 );
             }
         }
