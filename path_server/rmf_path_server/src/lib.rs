@@ -76,20 +76,32 @@ pub struct PlanIndices {
 /// action, and so must be left alone.
 ///
 /// Split out from [`PlanServer::is_committed`] so the rule can be exercised
-/// without standing up a ROS node. Three things have to hold, and each of them
-/// fails safe towards "not committed", i.e. towards replanning a robot rather
-/// than abandoning one:
+ // without standing up a ROS node.
 ///
-/// * there is a report at all;
-/// * it is about the plan we last published, since progress measured against a
-///   plan that no longer exists says nothing about the current one;
-/// * it reports `EXECUTION_STATE_EXECUTING_ACTION`.
-pub fn reports_commitment(progress: Option<&Progress>, active_plan_id: Option<&PlanId>) -> bool {
-    let (Some(progress), Some(active_plan_id)) = (progress, active_plan_id) else {
-        return false;
-    };
-    progress.plan_id == *active_plan_id
-        && progress.execution_state == Progress::EXECUTION_STATE_EXECUTING_ACTION
+/// The only thing asked is what the robot says it is doing. Which plan the
+/// report cites is deliberately not consulted: a docking controller either has
+/// the robot or it does not, and that is a fact about the world rather than
+/// about our bookkeeping. `Progress.msg` states the obligation in the same
+/// terms -- while a robot reports this state it "must NOT be given a new
+/// plan" -- with no qualification about plan ids.
+///
+/// This did once require the report to be about the plan we last published, on
+/// the grounds that progress measured against a superseded plan is
+/// meaningless. That holds for `progress` and `reached_waypoint`, which are
+/// indices into one specific plan, and it is why
+/// [`PlanServer::destination_is_served`] still insists on the match. It does
+/// not hold for `execution_state`. Worse, the mismatch arises precisely when
+/// we have published a new plan to a robot that was already mid-action, so the
+/// old rule let our own publication cancel the robot's commitment and clear
+/// the way to do it again -- while the space it needed to finish the maneuver
+/// went unmarked.
+///
+/// Silence is still not commitment. A robot we have never heard from has to be
+/// routable, or it could never be given its first plan.
+pub fn reports_commitment(progress: Option<&Progress>) -> bool {
+    progress.is_some_and(|progress| {
+        progress.execution_state == Progress::EXECUTION_STATE_EXECUTING_ACTION
+    })
 }
 
 /// Whether a dock status report says its robot is parked in a dock.
@@ -154,6 +166,9 @@ pub struct PlanSuccess {
     pub maneuvers: HashMap<String, DockManeuvers>,
     /// Per-agent waypoint indices, recorded before padding obscured them.
     pub plan_indices: Vec<PlanIndices>,
+    /// The dock lanes this plan commits each robot to, keyed by robot and then
+    /// by the name of the action that occupies the lane.
+    pub dock_lanes: HashMap<String, HashMap<String, Vec<[f32; 2]>>>,
 }
 
 pub enum PlanResult {
@@ -191,6 +206,19 @@ pub struct PlanServer<P: MapfPlanner> {
     /// plan it was measured on, whereas being parked in a dock outlives any
     /// plan. See [`PlanServer::is_docked`].
     pub latest_dock_status: HashMap<String, DockStatus>,
+    /// The dock lanes each robot has been committed to, keyed by robot and
+    /// then by the name of the action that occupies the lane.
+    ///
+    /// Recorded when a plan containing a dock or undock is published, because
+    /// that is the only moment the geometry exists: by the time the robot is
+    /// halfway down the lane all that survives is the *name* of the action it
+    /// is running. Keying by that name is what turns the name back into
+    /// geometry - see [`PlanServer::lane_in_use`].
+    ///
+    /// A recorded lane is not an occupied one. A robot holds a lane only while
+    /// it is actually running the action, which is a small fraction of the time
+    /// it holds the plan.
+    pub dock_lanes: HashMap<String, HashMap<String, Vec<[f32; 2]>>>,
 }
 
 impl<P: MapfPlanner> PlanServer<P> {
@@ -229,6 +257,7 @@ impl<P: MapfPlanner> PlanServer<P> {
             target_actions: HashMap::new(),
             latest_progress: HashMap::new(),
             latest_dock_status: HashMap::new(),
+            dock_lanes: HashMap::new(),
         }
     }
 
@@ -535,14 +564,10 @@ impl<P: MapfPlanner> PlanServer<P> {
     /// currently has the robot, and the indices cannot distinguish "parked at
     /// the last waypoint" from "driving into the dock".
     ///
-    /// A report about any plan other than the one we last published is ignored.
-    /// Progress means nothing except against the plan it was measured on, and a
-    /// robot cannot be committed to an action in a plan that no longer exists.
+    /// A report about a plan other than the one we last published still counts.
+    /// See [`reports_commitment`] for why.
     pub fn is_committed(&self, robot_id: &str) -> bool {
-        reports_commitment(
-            self.latest_progress.get(robot_id),
-            self.active_plan_ids.get(robot_id),
-        )
+        reports_commitment(self.latest_progress.get(robot_id))
     }
 
     /// Record a dock state report. See [`PlanServer::is_docked`].
@@ -575,6 +600,10 @@ impl<P: MapfPlanner> PlanServer<P> {
         self.active_destinations.remove(robot_id);
         self.active_plan_ids.remove(robot_id);
         self.target_actions.remove(robot_id);
+        // Lanes are only ever held by a robot that is running an action, and a
+        // robot we can no longer hear from is not running anything we know
+        // about. Keeping the lane would wall off a dock indefinitely.
+        self.dock_lanes.remove(robot_id);
         // A queued request for a robot that is gone would otherwise carry
         // `replan()` past its early return on every tick, forcing a full
         // negotiation ten times a second on behalf of a participant nobody can
@@ -626,51 +655,55 @@ impl<P: MapfPlanner> PlanServer<P> {
         self.is_docked(robot_id) && !self.has_queued_request(robot_id)
     }
 
-    /// The space a robot this negotiation will not route has to be treated as
-    /// holding, as an ordered swept path.
+    /// Where a robot this negotiation will not route is standing.
     ///
-    /// For a robot that is simply parked -- in a dock, or anywhere else with no
-    /// task outstanding -- that is just where it is. A single point, which the
-    /// planner rasterises into the one cell it occupies.
+    /// A single point: the last pose it reported. Nothing is inferred about
+    /// where it might be heading, because a robot that is not being routed is
+    /// by definition not going anywhere under our direction. The one exception
+    /// -- a robot part-way down a dock lane, which really is somewhere on a
+    /// line rather than at a point -- is covered by [`Self::lane_in_use`],
+    /// which knows the actual geometry instead of guessing it.
     ///
-    /// For a robot part-way through an action it is where it is, then the dock
-    /// vertex named by `active_action`. It is somewhere on the line between the
-    /// two and we cannot tell where, so the planner is handed the whole segment
-    /// and rasterises it; claiming only the two endpoints would leave the cells
-    /// it crosses in between open.
-    ///
-    /// The *staging* vertex is deliberately not claimed even though the robot
-    /// passes through it. Staging sits on the travel network, and at the
-    /// planner's 1 m resolution claiming it would blank a cell the through
-    /// route shares, cutting the aisle in half for as long as the dock takes.
-    /// The robot's own odometry already covers staging for as long as it is
-    /// actually standing there.
-    fn frozen_claims(&self, robot_id: &str) -> Vec<[f32; 2]> {
-        let mut claims = Vec::new();
-
-        if let Some(odom) = self.latest_pose_estimate.get(robot_id) {
-            claims.push([
-                odom.pose.pose.position.x as f32,
-                odom.pose.pose.position.y as f32,
-            ]);
-        }
-
-        let action = self
-            .latest_progress
+    /// Empty if we have never heard from the robot, in which case there is
+    /// nothing to hold on its behalf.
+    fn footprint_of(&self, robot_id: &str) -> Vec<[f32; 2]> {
+        self.latest_pose_estimate
             .get(robot_id)
-            .map(|progress| progress.active_action.as_str())
-            .unwrap_or_default();
-        if let Some(nav_graph) = &self.nav_graph {
-            if let Some(vertex) = nav_graph
-                .vertices_by_name
-                .get(action)
-                .and_then(|id| nav_graph.vertices_by_id.get(id))
-            {
-                claims.push(vertex.position);
-            }
-        }
+            .map(|odom| {
+                vec![[
+                    odom.pose.pose.position.x as f32,
+                    odom.pose.pose.position.y as f32,
+                ]]
+            })
+            .unwrap_or_default()
+    }
 
-        claims
+    /// The dock lane `robot_id` is physically inside right now, if any.
+    ///
+    /// A lane counts as in use only while the robot is running the action that
+    /// occupies it. Merely being parked at the end of one does not hold the
+    /// lane: the robot's own footprint covers where it is standing, and holding
+    /// the whole lane on top of that would blank a cell of the through route
+    /// for as long as the robot sits there.
+    ///
+    /// [`Self::is_committed`] asks only what the robot reports it is doing, so
+    /// a lane is held whenever a docking controller might have the robot --
+    /// including when the report cites a plan we have already replaced. That is
+    /// the direction to err in: marking a lane the robot has left costs a
+    /// detour, while missing one it is inside costs a collision with a robot
+    /// nothing can stop.
+    ///
+    /// The name is resolved against `dock_lanes`, which is rewritten for every
+    /// participant each time a plan is published. A robot whose latest plan has
+    /// no dock has no entry to find, and one whose latest plan docks under the
+    /// same name resolves to the current geometry, so a stale name cannot
+    /// conjure up a lane from two plans ago.
+    fn lane_in_use(&self, robot_id: &str) -> Option<&Vec<[f32; 2]>> {
+        if !self.is_committed(robot_id) {
+            return None;
+        }
+        let action = &self.latest_progress.get(robot_id)?.active_action;
+        self.dock_lanes.get(robot_id)?.get(action)
     }
 
     pub fn replan(&mut self) {
@@ -695,8 +728,26 @@ impl<P: MapfPlanner> PlanServer<P> {
                             target_actions,
                             maneuvers,
                             plan_indices,
+                            dock_lanes,
                             ..
                         } = success;
+
+                        // Each participant's lanes are replaced outright rather
+                        // than merged: this plan supersedes whatever it was
+                        // given before, so a robot routed away from a dock must
+                        // stop holding the lane it is no longer going to use.
+                        // Robots outside this negotiation keep theirs, which is
+                        // the whole reason a mid-dock robot's lane survives.
+                        for robot_id in &robot_ids {
+                            match dock_lanes.get(robot_id) {
+                                Some(lanes) => {
+                                    self.dock_lanes.insert(robot_id.clone(), lanes.clone());
+                                }
+                                None => {
+                                    self.dock_lanes.remove(robot_id);
+                                }
+                            }
+                        }
 
                         // First update the active_plan_ids for each robot with their new PlanId
                         for robot_id in &robot_ids {
@@ -996,15 +1047,6 @@ impl<P: MapfPlanner> PlanServer<P> {
         // above.
         self.replan_queue
             .retain(|(robot_id, _)| frozen.contains(robot_id));
-        // One swept path per frozen robot, not one flat list of points: the
-        // planner has to know which claims are joined to which, or it cannot
-        // tell a robot's approach from the straight line between two unrelated
-        // robots.
-        let frozen_claims: Vec<Vec<[f32; 2]>> = frozen
-            .iter()
-            .map(|robot_id| self.frozen_claims(robot_id))
-            .filter(|path| !path.is_empty())
-            .collect();
         for robot_id in &frozen {
             if self.is_committed(robot_id) {
                 rclrs::log!(
@@ -1042,6 +1084,52 @@ impl<P: MapfPlanner> PlanServer<P> {
             return;
         }
 
+        // The map the planner will be given: the site, plus everywhere a robot
+        // we are not routing is holding space.
+        //
+        // Marking here rather than inside the planner is what keeps the two
+        // concerns apart. The planner's job is to route across occupied space;
+        // deciding *which* space a robot occupies needs the dock status, the
+        // progress reports and the lane registry, none of which a MAPF solver
+        // should have to know about. It also means every cost and distance
+        // structure the solver builds sees the marks, which is the part that
+        // actually redirects peers -- an earlier attempt passed frozen robots
+        // in as hetpibt external tracks, and those never reached the BFS
+        // distance field, so peers were aimed straight at the parked robot and
+        // only discovered it as a rejected move, one cell at a time.
+        let mut map = if self.map.is_usable() {
+            (*self.map).clone()
+        } else {
+            // No map yet. An open field bounded by the robots is a poor
+            // substitute for the site, but it is somewhere to record who is
+            // standing where, which a zero-sized grid is not.
+            Map::bounding(robot_ids.iter().flat_map(|robot_id| {
+                let start = starts.get(robot_id).map(|odom| {
+                    [
+                        odom.pose.pose.position.x as f32,
+                        odom.pose.pose.position.y as f32,
+                    ]
+                });
+                let goal = goals
+                    .get(robot_id)
+                    .and_then(|dest| dest.constraints.regions.first())
+                    .filter(|region| region.region.points.len() >= 2)
+                    .map(|region| [region.region.points[0], region.region.points[1]]);
+                start.into_iter().chain(goal)
+            }))
+        };
+
+        for robot_id in &frozen {
+            map.mark(&self.footprint_of(robot_id));
+            // A robot mid-dock is not at a point, it is somewhere along a lane,
+            // and we cannot tell where. Marking the whole lane is the honest
+            // answer; marking only its ends would leave the cells in between
+            // open for a peer to aim through.
+            if let Some(lane) = self.lane_in_use(robot_id) {
+                map.mark(lane);
+            }
+        }
+
         // Perform MAPF plan in background thread
         rclrs::log!(self.node.logger(), "Triggering new plan in background");
 
@@ -1056,7 +1144,6 @@ impl<P: MapfPlanner> PlanServer<P> {
         let planner_clone = Arc::clone(&self.planner);
         let footprints_clone = Arc::clone(&self.footprints);
         let sender_clone = self.plan_sender.clone();
-        let map_clone = self.map.clone();
         let target_actions_clone = self.target_actions.clone();
         let maneuvers_clone = maneuvers.clone();
 
@@ -1088,8 +1175,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                 &goals,
                 &footprints_map,
                 &robot_ids,
-                map_clone.as_ref(),
-                &frozen_claims,
+                &map,
                 Arc::clone(&cancellation),
             ) {
                 Ok(plan) => plan,
@@ -1134,6 +1220,7 @@ impl<P: MapfPlanner> PlanServer<P> {
             // docking robot occupies only becomes visible to its peers if it is
             // present here.
             let mut plan_indices = vec![PlanIndices::default(); basic_plan.len()];
+            let mut dock_lanes: HashMap<String, HashMap<String, Vec<[f32; 2]>>> = HashMap::new();
             for (agent_idx, robot_id) in robot_ids.iter().enumerate() {
                 let Some(traj) = basic_plan.get_mut(agent_idx) else {
                     continue;
@@ -1143,14 +1230,49 @@ impl<P: MapfPlanner> PlanServer<P> {
                 // shifts every planned index along with it.
                 let prefix = maneuver.map_or(0, |m| m.prefix_len(traj.first()));
                 let dock = maneuver.and_then(|m| splice_dock_maneuvers(traj, m));
+                let destination = prefix + motion_ends[agent_idx];
 
                 plan_indices[agent_idx] = PlanIndices {
                     dock,
                     // Where the robot first arrives at the planner's goal. That
                     // is neither the dock, which is a commitment beyond the
                     // goal, nor any of the repeats holding it there afterwards.
-                    destination: prefix + motion_ends[agent_idx],
+                    destination,
                 };
+
+                // Write down the lanes this plan commits the robot to, now,
+                // while the geometry is in front of us. Later on all that
+                // survives is the name of the action, and a name cannot be
+                // rasterised.
+                //
+                // Each lane is taken as a slice of the spliced trajectory
+                // rather than rebuilt from the maneuver, so it is by
+                // construction the same space the robot was told to drive
+                // through -- including the staging vertex at the join, which
+                // the robot does pass through on its way.
+                let lanes = dock_lanes.entry(robot_id.clone()).or_default();
+                let as_points = |poses: &[Isometry2<f32>]| -> Vec<[f32; 2]> {
+                    poses
+                        .iter()
+                        .map(|pose| [pose.translation.x, pose.translation.y])
+                        .collect()
+                };
+                if prefix > 0 {
+                    // The undock: docked pose, optional dock vertex, staging.
+                    lanes.insert("undock".to_string(), as_points(&traj[..=prefix]));
+                }
+                if let (Some(dock), Some(target)) = (dock, target_actions_clone.get(robot_id)) {
+                    // The dock: staging through to the dock pose. Any padding
+                    // repeats caught in between are duplicates of the staging
+                    // vertex, which is harmless to rasterise twice.
+                    lanes.insert(
+                        target.action.name.clone(),
+                        as_points(&traj[destination..=dock]),
+                    );
+                }
+                if lanes.is_empty() {
+                    dock_lanes.remove(robot_id);
+                }
             }
 
             // Splicing makes the lengths uneven again: an undock prefix is one
@@ -1196,6 +1318,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                 target_actions: target_actions_clone,
                 maneuvers: maneuvers_clone,
                 plan_indices,
+                dock_lanes,
             }));
         });
     }
@@ -1652,33 +1775,45 @@ mod tests {
     #[test]
     fn a_robot_executing_an_action_on_the_current_plan_is_committed() {
         let active = plan_id(1, 0);
-        let report = progress(active.clone(), Progress::EXECUTION_STATE_EXECUTING_ACTION);
-        assert!(reports_commitment(Some(&report), Some(&active)));
+        let report = progress(active, Progress::EXECUTION_STATE_EXECUTING_ACTION);
+        assert!(reports_commitment(Some(&report)));
     }
 
     #[test]
     fn a_robot_that_has_never_reported_is_not_committed() {
         // Silence is not commitment. Freezing on it would strand any robot
         // whose executor has not come up yet.
-        assert!(!reports_commitment(None, Some(&plan_id(1, 0))));
+        assert!(!reports_commitment(None));
     }
 
+    /// A robot can be mid-action without us having given it the plan that
+    /// started the action -- after a path server restart, for instance. It is
+    /// still inside whatever it is doing.
     #[test]
-    fn a_robot_with_no_plan_of_ours_is_not_committed() {
+    fn a_robot_executing_an_action_we_never_planned_is_still_committed() {
         let report = progress(plan_id(1, 0), Progress::EXECUTION_STATE_EXECUTING_ACTION);
-        assert!(!reports_commitment(Some(&report), None));
+        assert!(reports_commitment(Some(&report)));
     }
 
-    /// The subtle one. The robot really is mid-action, but against a plan we
-    /// have already superseded. Honouring it would hold the robot to a plan
-    /// nobody is executing, and the waypoint indices in that report do not
-    /// refer to the plan we would be reasoning about.
+    /// The subtle one, and it used to assert the opposite.
+    ///
+    /// The robot is mid-action against a plan we have already superseded. The
+    /// old rule read that as "not committed" and replanned it -- but a docking
+    /// controller does not let go because we published something, and this
+    /// mismatch arises exactly when we have published to a robot that was
+    /// already committed. Ignoring the report unfroze the robot, invited
+    /// another plan, and left the lane it was driving down unmarked for peers.
+    ///
+    /// The cost accepted in exchange is that a robot which reports
+    /// `EXECUTING_ACTION` forever is now frozen forever rather than being
+    /// replanned. Replanning it was never a recovery: by its own report it is
+    /// not in a position to accept a plan, and publishing one to a robot in a
+    /// dock reverses it out.
     #[test]
-    fn commitment_reported_against_a_superseded_plan_is_ignored() {
+    fn commitment_reported_against_a_superseded_plan_still_counts() {
         let report = progress(plan_id(1, 0), Progress::EXECUTION_STATE_EXECUTING_ACTION);
 
-        assert!(!reports_commitment(Some(&report), Some(&plan_id(1, 1))));
-        assert!(!reports_commitment(Some(&report), Some(&plan_id(2, 0))));
+        assert!(reports_commitment(Some(&report)));
     }
 
     fn dock_status(state: u8, dock_id: &str) -> DockStatus {
@@ -1744,7 +1879,7 @@ mod tests {
         ] {
             let report = progress(active.clone(), state);
             assert!(
-                !reports_commitment(Some(&report), Some(&active)),
+                !reports_commitment(Some(&report)),
                 "execution_state {state} should not freeze a robot"
             );
         }

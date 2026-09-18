@@ -15,7 +15,7 @@
 use mapf_post::na::Isometry2;
 use rclrs::{Context, CreateBasicExecutor, InitOptions, IntoPrimitiveOptions, SpinOptions};
 use rmf_path_server::{start_path_server_with_nav_graph, Map, MapfPlanner, NavGraphData};
-use ros_env::nav_msgs::msg::Odometry;
+use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
 use ros_env::rmf_prototype_msgs::msg::{
     Destination, DestinationConstraints, DockStatus, GraphElementKey, Participant, ParticipantList,
     Plan, Progress, Region, TargetNode, TargetOrientation, TargetRegion,
@@ -207,7 +207,6 @@ impl MapfPlanner for MockPathPlanner {
         _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
         _map: &Map,
-        _frozen_claims: &[Vec<[f32; 2]>],
         _cancellation: Arc<AtomicBool>,
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
         let mut plans = Vec::new();
@@ -230,19 +229,19 @@ impl MapfPlanner for MockPathPlanner {
     }
 }
 
-/// `MockPathPlanner` with the frozen claims it was handed written down.
+/// `MockPathPlanner` with the map it was handed written down.
 ///
-/// The claims are the entire interface between "the path server knows this
-/// robot is standing there" and "the planner treats that cell as wall", so a
-/// test that wants to prove a robot was marked as a static obstacle has to look
-/// at what actually crossed that boundary. Asserting on the resulting route
-/// instead would prove nothing here, because `MockPathPlanner` draws a straight
-/// line and ignores obstacles entirely.
-struct ClaimRecordingPlanner {
-    claims: Arc<Mutex<Vec<Vec<[f32; 2]>>>>,
+/// The map is the entire interface between "the path server knows this robot is
+/// standing there" and "the planner treats that cell as wall", so a test that
+/// wants to prove a robot was marked as a static obstacle has to look at what
+/// actually crossed that boundary. Asserting on the resulting route instead
+/// would prove nothing here, because `MockPathPlanner` draws a straight line
+/// and ignores the map entirely.
+struct MapRecordingPlanner {
+    map: Arc<Mutex<Option<Map>>>,
 }
 
-impl MapfPlanner for ClaimRecordingPlanner {
+impl MapfPlanner for MapRecordingPlanner {
     fn plan(
         &self,
         starts: &HashMap<String, Odometry>,
@@ -250,24 +249,10 @@ impl MapfPlanner for ClaimRecordingPlanner {
         footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
         map: &Map,
-        frozen_claims: &[Vec<[f32; 2]>],
         cancellation: Arc<AtomicBool>,
     ) -> Result<Vec<Vec<Isometry2<f32>>>, Box<dyn std::error::Error>> {
-        self.claims.lock().unwrap().extend(
-            frozen_claims
-                .iter()
-                .filter(|path| !path.is_empty())
-                .cloned(),
-        );
-        MockPathPlanner.plan(
-            starts,
-            goals,
-            footprints,
-            robot_ids,
-            map,
-            frozen_claims,
-            cancellation,
-        )
+        *self.map.lock().unwrap() = Some(map.clone());
+        MockPathPlanner.plan(starts, goals, footprints, robot_ids, map, cancellation)
     }
 }
 
@@ -1222,17 +1207,17 @@ fn test_path_server_retires_a_destination_once_it_is_reached(
     Ok(())
 }
 
-/// A robot parked in a dock is handed to the planner as a static obstacle, even
-/// though it is not a participant in the negotiation.
+/// A robot parked in a dock is marked on the map as occupied space, even though
+/// it is not a participant in the negotiation.
 ///
-/// The two halves of this are tested in different places. That a claim reaching
-/// the planner is burned into the grid and routed around is
-/// `planner::tests::a_frozen_claim_is_never_entered_or_displaced`. This test is
-/// the other half: that the path server actually produces the claim.
+/// The two halves of this are tested in different places. That marked space is
+/// burned into the planning grid and routed around is
+/// `planner::tests::marked_space_is_never_entered_or_displaced`. This test is
+/// the other half: that the path server actually marks it.
 ///
 /// The parked robot here is never given a destination at all. That is the whole
 /// point. While the frozen set was drawn from `goals.keys()`, a robot with no
-/// destination could not be represented -- it was neither routed nor claimed,
+/// destination could not be represented -- it was neither routed nor marked,
 /// so it was simply a hole in the map that a peer could be sent straight
 /// through. Destinations being retired on arrival turns that from a corner case
 /// into the normal resting state of every idle robot.
@@ -1248,11 +1233,11 @@ fn test_path_server_claims_a_parked_robot_as_an_obstacle() -> Result<(), Box<dyn
         serde_json::from_str(SAMPLE_SITE_JSON).expect("failed to parse site json");
     let nav_graph = Arc::new(NavGraphData::from_site(&site));
 
-    let recorded_claims = Arc::new(Mutex::new(Vec::new()));
+    let recorded_map = Arc::new(Mutex::new(None));
     let _path_server_guard = start_path_server_with_nav_graph(
         Arc::clone(&server_node),
-        ClaimRecordingPlanner {
-            claims: Arc::clone(&recorded_claims),
+        MapRecordingPlanner {
+            map: Arc::clone(&recorded_map),
         },
         Some(nav_graph),
     )?;
@@ -1261,7 +1246,7 @@ fn test_path_server_claims_a_parked_robot_as_an_obstacle() -> Result<(), Box<dyn
     let mover_id = "test_mir_obstacle_peer";
 
     // The parked robot is the one sitting in the dock contact zone of
-    // `conveyor_r1_c1`. Its pose is the claim we expect to see.
+    // `conveyor_r1_c1`. Its pose is the cell we expect to find blocked.
     let parked_x = 0.0f32;
     let parked_y = 0.95f32;
 
@@ -1353,19 +1338,497 @@ fn test_path_server_claims_a_parked_robot_as_an_obstacle() -> Result<(), Box<dyn
          there is nothing to assert about"
     );
 
-    // These tests share a ROS domain, so other tests' robots can appear in the
-    // claims too. What matters is that ours is among them.
-    let claims = recorded_claims.lock().unwrap();
-    let parked_was_claimed = claims.iter().any(|path| {
-        path.iter()
-            .any(|p| (p[0] - parked_x).abs() < 0.01 && (p[1] - parked_y).abs() < 0.01)
-    });
+    let recorded = recorded_map.lock().unwrap();
+    let map = recorded
+        .as_ref()
+        .expect("The planner produced a plan without being handed a map");
     assert!(
-        parked_was_claimed,
-        "A robot parked in a dock was not handed to the planner as an obstacle. It holds no \
+        map.is_occupied([parked_x, parked_y]),
+        "A robot parked in a dock was not marked on the map the planner was given. It holds no \
          destination, so it is not being routed either - the space it occupies is invisible and \
-         a peer can be planned straight through it. Claims seen: {:?}",
-        claims
+         a peer can be planned straight through it."
+    );
+
+    Ok(())
+}
+
+/// A dock lane is held against peers while the robot is driving down it, and
+/// released the moment it is not.
+///
+/// `Progress.msg` states the contract this implements: while a robot reports
+/// `EXECUTION_STATE_EXECUTING_ACTION`, "the space it needs in order to finish
+/// the action must be treated as claimed, which in general is larger than its
+/// footprint". Larger than its footprint is the entire difficulty. A robot
+/// part-way into a dock is somewhere on a line and there is no way to tell
+/// where, so the whole line is held.
+///
+/// The release half matters just as much. A lane is a corridor, and a robot
+/// that has merely finished parking at the end of one is fully described by
+/// where it is standing. Keeping the corridor marked after the action ends
+/// would blank a stretch of the through route for as long as the robot sat
+/// there, which is why commitment, not dockedness, is the gate.
+///
+/// Both halves are asserted against the same robot at the same pose, so the
+/// only thing separating the two outcomes is what it reports about itself.
+#[test]
+fn test_path_server_marks_a_dock_lane_only_while_it_is_in_use(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let context = isolated_context();
+    let mut executor = context.create_basic_executor();
+    let test_node = Arc::new(executor.create_node("test_dock_lane_node")?);
+    let server_node = Arc::new(executor.create_node("path_server_dock_lane")?);
+
+    let site: rmf_site_format::Site =
+        serde_json::from_str(SAMPLE_SITE_JSON).expect("failed to parse site json");
+    let nav_graph = Arc::new(NavGraphData::from_site(&site));
+
+    let recorded_map = Arc::new(Mutex::new(None));
+    let _path_server_guard = start_path_server_with_nav_graph(
+        Arc::clone(&server_node),
+        MapRecordingPlanner {
+            map: Arc::clone(&recorded_map),
+        },
+        Some(nav_graph),
+    )?;
+
+    let docker_id = "test_mir_lane_docker";
+    let peer_a_id = "test_mir_lane_peer_a";
+    let peer_b_id = "test_mir_lane_peer_b";
+
+    // The lane runs from the staging vertex to the dock, half a metre. The
+    // midpoint is what the two phases are told apart by: it is 0.25 m from the
+    // pose the robot reports, so a footprint can never reach it and only the
+    // lane can put a mark there.
+    let staging = [0.0f32, 2.0];
+    let lane_midpoint = [0.0f32, 1.75];
+
+    let docker_plan = Arc::new(Mutex::new(None));
+    let docker_plan_clone = Arc::clone(&docker_plan);
+    let _docker_plan_sub = test_node.create_subscription::<Plan, _>(
+        format!("{}/plan", docker_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+        move |msg: Plan| {
+            *docker_plan_clone.lock().unwrap() = Some(msg);
+        },
+    )?;
+
+    let discovery_pub = test_node.create_publisher::<ParticipantList>(
+        "/destination/discovery".transient_local().reliable(),
+    )?;
+    let map_pub =
+        test_node.create_publisher::<OccupancyGrid>("/map".transient_local().reliable())?;
+    let docker_odom_pub = test_node
+        .create_publisher::<Odometry>(format!("{}/odom", docker_id).as_str().reliable())?;
+    let peer_a_odom_pub = test_node
+        .create_publisher::<Odometry>(format!("{}/odom", peer_a_id).as_str().reliable())?;
+    let peer_b_odom_pub = test_node
+        .create_publisher::<Odometry>(format!("{}/odom", peer_b_id).as_str().reliable())?;
+    let docker_dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", docker_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+    let peer_a_dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", peer_a_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+    let peer_b_dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", peer_b_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+    let docker_progress_pub = test_node
+        .create_publisher::<Progress>(format!("{}/plan/progress", docker_id).as_str().reliable())?;
+
+    let mut discovery_msg = ParticipantList::default();
+    for name in [docker_id, peer_a_id, peer_b_id] {
+        discovery_msg.participants.push(Participant {
+            name: name.to_string(),
+            components: vec![],
+        });
+    }
+
+    // A real map, at 0.1 m. The synthesised fallback is 1 m, and at 1 m this
+    // whole lane collapses into the cell the robot is already standing in --
+    // the test would pass on the footprint alone and prove nothing about lanes.
+    let mut map_msg = OccupancyGrid::default();
+    map_msg.info.resolution = 0.1;
+    map_msg.info.width = 60;
+    map_msg.info.height = 60;
+    map_msg.info.origin.position.x = -1.0;
+    map_msg.info.origin.position.y = -1.0;
+    map_msg.data = vec![0; 60 * 60];
+
+    // Starts away from the dock, so the plan it gets is not degenerate.
+    let mut docker_odom = Odometry::default();
+    docker_odom.pose.pose.position.x = 2.5;
+    docker_odom.pose.pose.position.y = 1.5;
+
+    let mut peer_a_odom = Odometry::default();
+    peer_a_odom.pose.pose.position.x = 2.5;
+    peer_a_odom.pose.pose.position.y = 2.0;
+
+    let mut peer_b_odom = Odometry::default();
+    peer_b_odom.pose.pose.position.x = 2.5;
+    peer_b_odom.pose.pose.position.y = 1.0;
+
+    // The docking robot's pose changes between phases, so it is passed in
+    // rather than captured.
+    let republish = |docker_odom: &Odometry| {
+        let _ = discovery_pub.publish(&discovery_msg);
+        let _ = map_pub.publish(&map_msg);
+        let _ = docker_odom_pub.publish(docker_odom);
+        let _ = peer_a_odom_pub.publish(&peer_a_odom);
+        let _ = peer_b_odom_pub.publish(&peer_b_odom);
+    };
+
+    let point_destination = |x: f32, y: f32| {
+        let mut dest = Destination::default();
+        let mut constraints = DestinationConstraints::default();
+        constraints.regions.push(TargetRegion {
+            region: Region {
+                points: vec![x, y],
+                hint: Region::HINT_POINT,
+            },
+            ..Default::default()
+        });
+        dest.constraints = constraints;
+        dest
+    };
+
+    // Phase 1: the robot is sent to the dock, which is what makes the path
+    // server write the lane down in the first place. The lane only exists as
+    // geometry at the moment the plan is spliced.
+    let mut docker_dest = Destination::default();
+    let mut key = GraphElementKey::default();
+    key.key = vec![12i64].try_into().unwrap();
+    let mut constraints = DestinationConstraints::default();
+    constraints.nodes.push(TargetNode {
+        key,
+        orientations: vec![],
+    });
+    docker_dest.constraints = constraints;
+
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5)
+        && docker_plan.lock().unwrap().is_none()
+    {
+        let _ = docker_dest_pub.publish(&docker_dest);
+        republish(&docker_odom);
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+    }
+    let plan = docker_plan
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("Timed out waiting for the docking robot's plan");
+    let dock_idx = waypoint_with_action(&plan, "dock_conveyor_r1_c1");
+    assert_eq!(
+        plan.waypoints[dock_idx].position,
+        [0.0, 1.5],
+        "The lane under test is the one ending at the dock"
+    );
+    let docker_plan_id = plan.plan_id.clone();
+
+    // Phase 2: the robot has reached staging and is driving into the dock. It
+    // is physically committed, so the lane is its to hold.
+    docker_odom.pose.pose.position.x = staging[0] as f64;
+    docker_odom.pose.pose.position.y = staging[1] as f64;
+
+    let mut docking = Progress::default();
+    docking.plan_id = docker_plan_id.clone();
+    docking.execution_state = Progress::EXECUTION_STATE_EXECUTING_ACTION;
+    docking.active_action = "dock_conveyor_r1_c1".to_string();
+
+    *recorded_map.lock().unwrap() = None;
+    let peer_a_dest = point_destination(2.5, 1.5);
+
+    let mut lane_was_held = false;
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5) {
+        let _ = docker_dest_pub.publish(&docker_dest);
+        let _ = docker_progress_pub.publish(&docking);
+        let _ = peer_a_dest_pub.publish(&peer_a_dest);
+        republish(&docker_odom);
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+        if let Some(map) = recorded_map.lock().unwrap().as_ref() {
+            if map.is_occupied(lane_midpoint) {
+                lane_was_held = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        lane_was_held,
+        "A robot reporting EXECUTING_ACTION did not hold the middle of the dock lane it was \
+         driving down. Its own pose is 0.25 m away, so a peer routed through {lane_midpoint:?} \
+         drives into a corridor that is already occupied by a robot nobody can stop"
+    );
+
+    // Phase 3: the action is finished. The robot has not moved -- same pose,
+    // same recorded lane -- but it is parked at the end of the lane rather
+    // than inside it. Its destination retires on this report, so it stays out
+    // of the negotiation as an obstacle.
+    //
+    // `docker_dest` is deliberately not republished from here on: a repeat
+    // would read as a fresh request and make the robot a participant again.
+    let mut parked = Progress::default();
+    parked.plan_id = docker_plan_id;
+    parked.execution_state = Progress::EXECUTION_STATE_IDLE;
+
+    *recorded_map.lock().unwrap() = None;
+    let peer_b_dest = point_destination(2.5, 1.5);
+
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5)
+        && recorded_map.lock().unwrap().is_none()
+    {
+        let _ = docker_progress_pub.publish(&parked);
+        let _ = peer_b_dest_pub.publish(&peer_b_dest);
+        republish(&docker_odom);
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+    }
+    // Settle, so the map asserted on is the server's last word rather than a
+    // negotiation that slipped through while the progress report was still in
+    // flight and the robot still looked committed.
+    let settle = std::time::Instant::now();
+    while settle.elapsed() < std::time::Duration::from_secs(1) {
+        let _ = docker_progress_pub.publish(&parked);
+        let _ = peer_b_dest_pub.publish(&peer_b_dest);
+        republish(&docker_odom);
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+    }
+
+    let recorded = recorded_map.lock().unwrap();
+    let map = recorded
+        .as_ref()
+        .expect("Timed out waiting for a negotiation once the dock action had finished");
+
+    // Positive control. Without this the assertion below would also pass on a
+    // map with nothing marked on it at all -- including one where the robot
+    // had quietly stopped being treated as an obstacle.
+    assert!(
+        map.is_occupied(staging),
+        "The parked robot's own footprint was not marked, so this map says nothing about \
+         whether its lane was released or whether it was simply forgotten"
+    );
+    assert!(
+        !map.is_occupied(lane_midpoint),
+        "A robot that had finished docking was still holding the whole lane. It is standing at \
+         one end of a corridor, not occupying it, and keeping {lane_midpoint:?} blocked costs \
+         every peer the route through for as long as the robot rests there"
+    );
+
+    Ok(())
+}
+
+/// A robot mid-action still holds its lane when its progress report cites a
+/// plan the server has already replaced.
+///
+/// This is the case the commitment rule used to get wrong, and the way it went
+/// wrong was self-reinforcing. A stale `plan_id` means the server published a
+/// new plan to a robot that was already inside a dock maneuver. Reading that
+/// as "not committed" put the robot back into the negotiation, which published
+/// another plan, which kept the report stale -- and for the whole of that loop
+/// the lane it was physically driving down was left unmarked, because only
+/// robots held out of the negotiation get marked.
+///
+/// A docking controller does not let go of a robot because we published
+/// something. The report is about the world; the plan id is about our
+/// bookkeeping.
+#[test]
+fn test_path_server_holds_a_lane_reported_against_a_superseded_plan(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let context = isolated_context();
+    let mut executor = context.create_basic_executor();
+    let test_node = Arc::new(executor.create_node("test_stale_lane_node")?);
+    let server_node = Arc::new(executor.create_node("path_server_stale_lane")?);
+
+    let site: rmf_site_format::Site =
+        serde_json::from_str(SAMPLE_SITE_JSON).expect("failed to parse site json");
+    let nav_graph = Arc::new(NavGraphData::from_site(&site));
+
+    let recorded_map = Arc::new(Mutex::new(None));
+    let _path_server_guard = start_path_server_with_nav_graph(
+        Arc::clone(&server_node),
+        MapRecordingPlanner {
+            map: Arc::clone(&recorded_map),
+        },
+        Some(nav_graph),
+    )?;
+
+    let docker_id = "test_mir_stale_docker";
+    let peer_id = "test_mir_stale_peer";
+
+    let staging = [0.0f32, 2.0];
+    let lane_midpoint = [0.0f32, 1.75];
+
+    let docker_plan = Arc::new(Mutex::new(None));
+    let docker_plan_count = Arc::new(AtomicUsize::new(0));
+    let docker_plan_clone = Arc::clone(&docker_plan);
+    let docker_plan_count_clone = Arc::clone(&docker_plan_count);
+    let _docker_plan_sub = test_node.create_subscription::<Plan, _>(
+        format!("{}/plan", docker_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+        move |msg: Plan| {
+            docker_plan_count_clone.fetch_add(1, Ordering::SeqCst);
+            *docker_plan_clone.lock().unwrap() = Some(msg);
+        },
+    )?;
+
+    let discovery_pub = test_node.create_publisher::<ParticipantList>(
+        "/destination/discovery".transient_local().reliable(),
+    )?;
+    let map_pub =
+        test_node.create_publisher::<OccupancyGrid>("/map".transient_local().reliable())?;
+    let docker_odom_pub = test_node
+        .create_publisher::<Odometry>(format!("{}/odom", docker_id).as_str().reliable())?;
+    let peer_odom_pub =
+        test_node.create_publisher::<Odometry>(format!("{}/odom", peer_id).as_str().reliable())?;
+    let docker_dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", docker_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+    let peer_dest_pub = test_node.create_publisher::<Destination>(
+        format!("{}/destination", peer_id)
+            .as_str()
+            .transient_local()
+            .reliable(),
+    )?;
+    let docker_progress_pub = test_node
+        .create_publisher::<Progress>(format!("{}/plan/progress", docker_id).as_str().reliable())?;
+
+    let mut discovery_msg = ParticipantList::default();
+    for name in [docker_id, peer_id] {
+        discovery_msg.participants.push(Participant {
+            name: name.to_string(),
+            components: vec![],
+        });
+    }
+
+    // 0.1 m, so the lane is more than the one cell the robot stands in. See
+    // `test_path_server_marks_a_dock_lane_only_while_it_is_in_use`.
+    let mut map_msg = OccupancyGrid::default();
+    map_msg.info.resolution = 0.1;
+    map_msg.info.width = 60;
+    map_msg.info.height = 60;
+    map_msg.info.origin.position.x = -1.0;
+    map_msg.info.origin.position.y = -1.0;
+    map_msg.data = vec![0; 60 * 60];
+
+    let mut docker_odom = Odometry::default();
+    docker_odom.pose.pose.position.x = 2.5;
+    docker_odom.pose.pose.position.y = 1.5;
+
+    let mut peer_odom = Odometry::default();
+    peer_odom.pose.pose.position.x = 2.5;
+    peer_odom.pose.pose.position.y = 2.0;
+
+    let republish = |docker_odom: &Odometry| {
+        let _ = discovery_pub.publish(&discovery_msg);
+        let _ = map_pub.publish(&map_msg);
+        let _ = docker_odom_pub.publish(docker_odom);
+        let _ = peer_odom_pub.publish(&peer_odom);
+    };
+
+    // Send the robot to the dock, so the server records the lane.
+    let mut docker_dest = Destination::default();
+    let mut key = GraphElementKey::default();
+    key.key = vec![12i64].try_into().unwrap();
+    let mut constraints = DestinationConstraints::default();
+    constraints.nodes.push(TargetNode {
+        key,
+        orientations: vec![],
+    });
+    docker_dest.constraints = constraints;
+
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5)
+        && docker_plan.lock().unwrap().is_none()
+    {
+        let _ = docker_dest_pub.publish(&docker_dest);
+        republish(&docker_odom);
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+    }
+    let plan = docker_plan
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("Timed out waiting for the docking robot's plan");
+    let _ = waypoint_with_action(&plan, "dock_conveyor_r1_c1");
+
+    // The robot is driving into the dock, and says so -- but against a plan id
+    // that is not the one it was just given. Bumping the version is what the
+    // server itself would have produced had it replanned this robot a moment
+    // after the maneuver began, which is exactly how this state arises.
+    docker_odom.pose.pose.position.x = staging[0] as f64;
+    docker_odom.pose.pose.position.y = staging[1] as f64;
+
+    let mut stale = Progress::default();
+    stale.plan_id = plan.plan_id.clone();
+    stale.plan_id.plan_version = plan.plan_id.plan_version.wrapping_add(1);
+    stale.execution_state = Progress::EXECUTION_STATE_EXECUTING_ACTION;
+    stale.active_action = "dock_conveyor_r1_c1".to_string();
+    assert_ne!(
+        stale.plan_id, plan.plan_id,
+        "The report has to cite a different plan or there is no stale case to test"
+    );
+
+    *recorded_map.lock().unwrap() = None;
+    let plans_before = docker_plan_count.load(Ordering::SeqCst);
+
+    let mut peer_dest = Destination::default();
+    let mut peer_constraints = DestinationConstraints::default();
+    peer_constraints.regions.push(TargetRegion {
+        region: Region {
+            points: vec![2.5, 1.5],
+            hint: Region::HINT_POINT,
+        },
+        ..Default::default()
+    });
+    peer_dest.constraints = peer_constraints;
+
+    let mut lane_was_held = false;
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(5) {
+        let _ = docker_progress_pub.publish(&stale);
+        let _ = peer_dest_pub.publish(&peer_dest);
+        republish(&docker_odom);
+        executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100)));
+        if let Some(map) = recorded_map.lock().unwrap().as_ref() {
+            if map.is_occupied(lane_midpoint) {
+                lane_was_held = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        lane_was_held,
+        "A robot driving into a dock stopped holding its lane because its progress report \
+         named a plan the server had moved on from. The robot is still in the lane; the \
+         disagreement is about bookkeeping, and a peer routed through {lane_midpoint:?} meets \
+         a robot under a docking controller that will not yield"
+    );
+
+    // The other half of the same rule. A committed robot must be held out of
+    // the negotiation entirely -- and publishing to one in a dock is not a
+    // harmless no-op, since `rmf_nav2_traffic` undocks before servicing a new
+    // goal.
+    assert_eq!(
+        docker_plan_count.load(Ordering::SeqCst),
+        plans_before,
+        "A robot that reported itself mid-action was handed a fresh plan because the report \
+         cited a superseded plan id"
     );
 
     Ok(())

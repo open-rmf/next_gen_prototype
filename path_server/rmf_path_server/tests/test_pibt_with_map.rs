@@ -65,7 +65,6 @@ fn test_pibt_planner_with_obstacle() {
         &footprints,
         &robot_ids,
         &map,
-        &[],
         Arc::new(AtomicBool::new(false)),
     );
 
