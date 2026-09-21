@@ -209,6 +209,71 @@ impl PlanExecutor {
         self.active_robots.keys().position(|k| k == robot_id) // TODO(arjoc): Peak tier AI-SLOP code.
     }
 
+    /// Every robot the executor is currently tracking, in agent-index order.
+    ///
+    /// The order is the one [`Self::get_agent_index`] reports against, so the
+    /// nth name here is agent n as far as `mapf_post` is concerned.
+    fn all_robots(&self) -> Vec<String> {
+        self.active_robots.keys().cloned().collect()
+    }
+
+    /// The subset of [`Self::all_robots`] that is actually participating in the
+    /// plan being executed.
+    ///
+    /// A robot participates by holding a plan it has not yet run to the end.
+    /// One that does not is not idle by choice of the traffic system -- it
+    /// simply has nowhere to be -- and so nothing in the allocation will route
+    /// around it unless we say so.
+    fn robots_in_plan(&self) -> HashSet<String> {
+        self.active_robots
+            .iter()
+            .filter(|(name, state)| {
+                state
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| !self.plan_is_finished(name, plan))
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// [`Self::all_robots`] minus [`Self::robots_in_plan`], in agent-index
+    /// order.
+    ///
+    /// These robots are standing somewhere real, but nothing in the plan being
+    /// executed accounts for them, so the spatial allocation will happily route
+    /// a peer straight through where they are parked.
+    fn robots_not_in_plan(&self) -> Vec<String> {
+        let in_plan = self.robots_in_plan();
+        self.all_robots()
+            .into_iter()
+            .filter(|name| !in_plan.contains(name))
+            .collect()
+    }
+
+    /// Whether `robot_id` has run `plan` all the way to the end, so the plan it
+    /// still holds no longer says anything about where it is going.
+    ///
+    /// `EXECUTION_STATE_IDLE` is the fleet saying precisely this: it is emitted
+    /// when `reached_waypoint + 1 >= plan.waypoints.len()` with no action in
+    /// flight, so a completed dock lands on it too. This is the same rule the
+    /// path server retires a destination on.
+    ///
+    /// The plan id guard is load-bearing. That state is derived from waypoint
+    /// indices, and an index means nothing except against the plan it was
+    /// measured on: a robot that finished plan 3 and has just been handed plan
+    /// 4 goes on reporting IDLE until its next progress message arrives, and
+    /// writing it off in that window would park an obstacle on a robot that is
+    /// about to drive away. Note this is the opposite call to the one
+    /// `reports_commitment` makes, and deliberately so -- EXECUTING_ACTION is a
+    /// fact about the world, whereas IDLE is a fact about indices.
+    fn plan_is_finished(&self, robot_id: &str, plan: &Plan) -> bool {
+        self.latest_progress.get(robot_id).is_some_and(|progress| {
+            progress.plan_id == plan.plan_id
+                && progress.execution_state == Progress::EXECUTION_STATE_IDLE
+        })
+    }
+
     fn reindex_followers(&mut self) {
         let sorted_names: Vec<String> = self.active_robots.keys().cloned().collect();
         for (agent_idx, name) in sorted_names.iter().enumerate() {
@@ -689,6 +754,38 @@ impl PlanExecutor {
             .collect();
         if !reserved_by_peers.is_empty() {
             positions.retain(|cell| !reserved_by_peers.contains(cell));
+        }
+
+        // A robot the plan says nothing about was never an agent in the
+        // allocation, so nothing above routed around it - but it is still
+        // physically there. Subtract where it is standing.
+        //
+        // `robot_id` is excluded unconditionally. It can appear in this set
+        // itself, having run its own plan to the end, and a robot must never be
+        // denied the ground it is standing on: the safe zone would exclude its
+        // own position and it could not move at all.
+        //
+        // A robot with no odometry yet contributes nothing. We do not know where
+        // it is, and guessing would be worse than the gap.
+        let parked_robots: HashSet<(usize, usize)> = self
+            .robots_not_in_plan()
+            .iter()
+            .filter(|parked| parked.as_str() != robot_id)
+            .filter_map(|parked| {
+                let state = self.active_robots.get(parked)?;
+                let odom = state.latest_odom.as_ref()?;
+                Some(self.claim_cells_along(
+                    &[[
+                        odom.pose.pose.position.x as f32,
+                        odom.pose.pose.position.y as f32,
+                    ]],
+                    state.radius,
+                ))
+            })
+            .flatten()
+            .collect();
+        if !parked_robots.is_empty() {
+            positions.retain(|cell| !parked_robots.contains(cell));
         }
 
         let target_x = plan.waypoints[released_wp_idx].position[0];

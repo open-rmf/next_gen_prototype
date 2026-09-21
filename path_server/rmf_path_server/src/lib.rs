@@ -76,7 +76,7 @@ pub struct PlanIndices {
 /// action, and so must be left alone.
 ///
 /// Split out from [`PlanServer::is_committed`] so the rule can be exercised
- // without standing up a ROS node.
+/// without standing up a ROS node.
 ///
 /// The only thing asked is what the robot says it is doing. Which plan the
 /// report cites is deliberately not consulted: a docking controller either has
