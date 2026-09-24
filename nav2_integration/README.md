@@ -91,8 +91,23 @@ graph TD
 
 ## Try out the demo
 
+### Docker Setup
 
-### Setup
+Follow the steps below to use pre-made `docker/Dockerfile.base` to run the demo containerized without fuss:  
+
+<details>
+   <summary><b>Click here 🐳.</b></summary>
+
+```bash
+docker build --load -t ros2_rust_base:jazzy -f docker/Dockerfile.base .
+```
+
+</details>
+
+> [!WARNING]
+> This process typically takes about **20 minutes**, depending on internet connectivity strength.
+
+### Manual Setup
 
 Do a fresh update & upgrade:
 ```
@@ -133,18 +148,86 @@ colcon build --packages-up-to sp_demo_nav2_bringup rmf_nav2_traffic rmf_path_ser
 With the workspace built and sourced, run the following nodes:
 
 Spin up the Nav2 simulation:
-```
+```bash
 ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py   robots:="robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};"
 ```
 
-In a separate terminal, run the demo launch file containing the path server, plan executor, destination server, path visualizer and Nav2 traffic nodes:
+<details>
+   <summary><b>Click here if running in docker container (GPU + X11) 🐳.</b></summary>
+
+```bash
+xhost +local:docker
+
+docker run -it --rm \
+--name ros2_rust_base_c \
+--gpus all \
+--env="DISPLAY" \
+--env="QT_X11_NO_MITSHM=1" \
+-v /tmp/.X11-unix:/tmp/.X11-unix \
+--device=/dev/dri \
+ros2_rust_base:jazzy \
+bash -c "source /nav2_traffic_ws/install/setup.bash && \
+ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py \
+robots:=\"robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};\""
 ```
+</details>
+
+<details>
+   <summary><b>Click here if running in docker container (GPU + Wayland) 🐳.</b></summary>
+
+```bash
+xhost +local:docker
+
+docker run -it --rm \
+--name ros2_rust_base_c \
+--gpus all \
+--env="DISPLAY=${DISPLAY}" \
+--env="QT_X11_NO_MITSHM=1" \
+-v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+--device=/dev/dri \
+ros2_rust_base:jazzy \
+bash -c "source /nav2_traffic_ws/install/setup.bash && \
+  ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py \
+  robots:=\"robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};\""
+```
+</details>
+
+<details>
+   <summary><b>Click here if running in docker container (CPU) 🐳.</b></summary>
+
+```bash
+xhost +local:docker
+
+docker run -it --rm \
+--name ros2_rust_base_c \
+--env="DISPLAY=${DISPLAY}" \
+--env="QT_X11_NO_MITSHM=1" \
+-v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+--device=/dev/dri \
+ros2_rust_base:jazzy \
+bash -c "source /nav2_traffic_ws/install/setup.bash && \
+  ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py \
+  robots:=\"robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};\""
+```
+</details>
+
+In a separate terminal, run the demo launch file containing the path server, plan executor, destination server, path visualizer and Nav2 traffic nodes:
+```bash
 ros2 launch rmf_path_server_demo demo_nav2.launch.py robots:="robot0 robot1"
 ```
 
+<details>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
+
+```bash
+docker exec -it ros2_rust_base_c bash -c "source /nav2_traffic_ws/install/setup.bash && ros2 launch rmf_path_server_demo demo_nav2.launch.py robots:=\"robot0 robot1\""
+```
+
+</details>
+
 Send action goals to the robots:
 
-```
+```bash
 ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
   pose: {
     header: {
@@ -158,8 +241,28 @@ ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
   }
 }"
 ```
+<details>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
 
+```bash
+docker exec -it ros2_rust_base_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
+    ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose \"{
+      pose: {
+        header: {
+          stamp: {sec: 0, nanosec: 0},
+          frame_id: 'map'
+        },
+        pose: {
+          position: {x: 5.0, y: 5.0, z: 0.0},
+          orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+        }
+      }
+    }\"
+"
 ```
+</details>
+
+```bash
 ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
   pose: {
     header: {
@@ -174,9 +277,30 @@ ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
 }"
 ```
 
+<details>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
+
+```bash
+docker exec -it ros2_rust_base_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
+    ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose \"{
+      pose: {
+        header: {
+          stamp: {sec: 0, nanosec: 0},
+          frame_id: 'map'
+        },
+        pose: {
+          position: {x: 0.0, y: 3.0, z: 0.0},
+          orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+        }
+      }
+    }\"
+"
+```
+</details>
+
 Alternate navigation goals:
 
-```
+```bash
 ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
   pose: {
     header: {
@@ -191,7 +315,28 @@ ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
 }"
 ```
 
+<details>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
+
+```bash
+docker exec -it ros2_rust_base_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
+    ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose \"{
+      pose: {
+        header: {
+          stamp: {sec: 0, nanosec: 0},
+          frame_id: 'map'
+        },
+        pose: {
+          position: {x: 9.0, y: 3.0, z: 0.0},
+          orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+        }
+      }
+    }\"
+"
 ```
+</details>
+
+```bash
 ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
   pose: {
     header: {
@@ -205,3 +350,24 @@ ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
   }
 }"
 ```
+
+<details>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
+
+```bash
+docker exec -it ros2_rust_base_c bash -c "source /nav2_traffic_ws/install/setup.bash && \
+    ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose \"{
+      pose: {
+        header: {
+          stamp: {sec: 0, nanosec: 0},
+          frame_id: 'map'
+        },
+        pose: {
+          position: {x: 9.0, y: 6.0, z: 0.0},
+          orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+        }
+      }
+    }\"
+"
+```
+</details>

@@ -10,7 +10,8 @@ on discourse.
 
 # Setup & Building
 
-:warning: As this is a project under construction, these instructions are likely to change rapidly.
+> [!WARNING] 
+> As this is a project under construction, these instructions are likely to change rapidly.
 
 ## Pre-requisites
 
@@ -48,12 +49,21 @@ on discourse.
 </details>
 
 <details>
-   <summary><b>Method 2: Using a container (click here)</b></summary>
+   <summary><b>Method 2: Using distrobox (click here)</b></summary>
 
 > We pre-build base containers with all the dependencies you can use `rocker`, `distrobox`, `podman` or any other oci compliant tool to get a base dev environment. For the purposes of this set of instructions we use distrobox:
 > ```bash
 > distrobox create --image ghcr.io/open-rmf/ros2_rust_base:jazzy -n ros2_rust_base
 > distrobox enter ros2_rust_base
+> ```
+</details>
+
+<details>
+   <summary><b>Method 3: Using docker container (click here)</b></summary>
+
+> If you prefer to build the base Docker image from scratch. Please use the following command:
+> ```bash
+> docker build --load -t ros2_rust_base:jazzy -f docker/Dockerfile.base .
 > ```
 </details>
 
@@ -85,7 +95,10 @@ Verify core scenario coordination and robust following behavior:
 colcon test --packages-select rmf_path_server_test --event-handlers console_direct+
 ```
 
-## Running the Interactive Web Demonstration
+## Running Interactive Web Demonstration
+
+> [!NOTE]
+> This provides a lightweight visualization of how `next_gen_prototype` utilizes `mapf` to guide multiple robot agents towards their goal while managing their traffic.
 
 https://github.com/user-attachments/assets/d5793eee-515d-49a9-a92c-9926617b48ed
 
@@ -98,3 +111,10 @@ ros2 launch rmf_path_server_demo demo.launch.py
 2. Click **Add Robot** to drop active participants onto the canvas.
 3. Select a robot and click a cell to place its goal.
 4. Click **Send Scenario** to observe multi-agent trajectory generation and live execution progress.
+
+## Running Nav2 Integration Demonstration
+
+> [!NOTE]
+> This shows users how `next_gen_prototype`'s prototype messages and traffic management design is used for multi-robot coordinations through [Nav2](https://docs.nav2.org/) navigation system.
+
+Follow instructions in [nav2_integration/README.md](./nav2_integration/README.md).
