@@ -90,6 +90,54 @@ impl BlockageMonitor {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanExecutorConfig {
+    pub grid_width: u32,
+    pub grid_height: u32,
+    pub grid_resolution: f32,
+    pub grid_origin: Pose,
+}
+
+impl Default for PlanExecutorConfig {
+    fn default() -> Self {
+        let mut origin = Pose::default();
+        origin.orientation.w = 1.0;
+        Self {
+            grid_width: 20,
+            grid_height: 20,
+            grid_resolution: 1.0,
+            grid_origin: origin,
+        }
+    }
+}
+
+impl PlanExecutorConfig {
+    pub fn new(grid_width: u32, grid_height: u32, grid_resolution: f32, grid_origin: Pose) -> Self {
+        Self {
+            grid_width,
+            grid_height,
+            grid_resolution,
+            grid_origin,
+        }
+    }
+
+    pub fn with_grid_size(mut self, width: u32, height: u32) -> Self {
+        self.grid_width = width;
+        self.grid_height = height;
+        self
+    }
+
+    pub fn with_resolution(mut self, resolution: f32) -> Self {
+        self.grid_resolution = resolution;
+        self
+    }
+
+    pub fn with_origin(mut self, origin: Pose) -> Self {
+        self.grid_origin = origin;
+        self
+    }
+}
+
 pub struct PlanExecutor {
     pub node: Node,
     // TODO(arjoc) The use of BTreeMap here is to make sure robts are ordered by their names
@@ -134,19 +182,29 @@ fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
 
 impl PlanExecutor {
     pub fn new(node: Node) -> Self {
-        let mut origin = Pose::default();
-        origin.orientation.w = 1.0;
+        Self::with_config(node, PlanExecutorConfig::default())
+    }
+
+    pub fn new_with_config(node: Node, config: PlanExecutorConfig) -> Self {
+        Self::with_config(node, config)
+    }
+
+    pub fn with_config(node: Node, config: PlanExecutorConfig) -> Self {
+        let grid = Arc::new(Grid2D::new(
+            vec![vec![0; config.grid_height as usize]; config.grid_width as usize],
+            config.grid_resolution,
+        ));
         Self {
             node,
             active_robots: BTreeMap::new(),
             plan_release_publishers: HashMap::new(),
             safezone_publishers: HashMap::new(),
             plan_error_publishers: HashMap::new(),
-            grid: Arc::new(Grid2D::new(vec![vec![0; 20]; 20], 1.0)),
-            grid_width: 20,
-            grid_height: 20,
-            grid_resolution: 1.0,
-            grid_origin: origin,
+            grid,
+            grid_width: config.grid_width,
+            grid_height: config.grid_height,
+            grid_resolution: config.grid_resolution,
+            grid_origin: config.grid_origin,
             latest_map: None,
         }
     }
@@ -250,6 +308,26 @@ impl PlanExecutor {
     }
 
     pub fn handle_map(&mut self, msg: OccupancyGrid) {
+        if msg.info.width > 0 && msg.info.height > 0 && msg.info.resolution > 0.0 {
+            rclrs::log!(
+                self.node.logger(),
+                "PlanExecutor reconfiguring grid from map: width={}, height={}, resolution={}, origin=({}, {})",
+                msg.info.width,
+                msg.info.height,
+                msg.info.resolution,
+                msg.info.origin.position.x,
+                msg.info.origin.position.y
+            );
+            self.grid_width = msg.info.width;
+            self.grid_height = msg.info.height;
+            self.grid_resolution = msg.info.resolution;
+            self.grid_origin = msg.info.origin.clone();
+            self.grid = Arc::new(Grid2D::new(
+                vec![vec![0; self.grid_height as usize]; self.grid_width as usize],
+                self.grid_resolution,
+            ));
+        }
+
         self.latest_map = Some(msg);
         let robot_ids: Vec<_> = self.active_robots.keys().cloned().collect();
         for robot_id in robot_ids {
@@ -932,5 +1010,70 @@ mod tests {
             "After waiting at 10.0 (2nd time): index is {}",
             follower.get_semantic_waypoint().trajectory_index
         );
+    }
+
+    #[test]
+    fn test_plan_executor_config_default_and_builders() {
+        use crate::PlanExecutorConfig;
+        use ros_env::geometry_msgs::msg::Pose;
+
+        let config = PlanExecutorConfig::default();
+        assert_eq!(config.grid_width, 20);
+        assert_eq!(config.grid_height, 20);
+        assert_eq!(config.grid_resolution, 1.0);
+        assert_eq!(config.grid_origin.orientation.w, 1.0);
+
+        let mut custom_origin = Pose::default();
+        custom_origin.position.x = -10.0;
+        custom_origin.position.y = -5.0;
+        custom_origin.orientation.w = 1.0;
+
+        let custom_config = PlanExecutorConfig::new(50, 60, 0.5, custom_origin.clone());
+        assert_eq!(custom_config.grid_width, 50);
+        assert_eq!(custom_config.grid_height, 60);
+        assert_eq!(custom_config.grid_resolution, 0.5);
+        assert_eq!(custom_config.grid_origin.position.x, -10.0);
+
+        let builder_config = PlanExecutorConfig::default()
+            .with_grid_size(100, 200)
+            .with_resolution(0.2)
+            .with_origin(custom_origin.clone());
+        assert_eq!(builder_config.grid_width, 100);
+        assert_eq!(builder_config.grid_height, 200);
+        assert_eq!(builder_config.grid_resolution, 0.2);
+        assert_eq!(builder_config.grid_origin, custom_origin);
+    }
+
+    #[test]
+    fn test_handle_map() {
+        use crate::PlanExecutor;
+        use rclrs::{Context, CreateBasicExecutor};
+        use ros_env::nav_msgs::msg::OccupancyGrid;
+
+        if let Ok(context) = Context::default_from_env() {
+            let executor = context.create_basic_executor();
+            if let Ok(node) = executor.create_node("test_handle_map_node") {
+                let mut plan_executor = PlanExecutor::new(node);
+                assert_eq!(plan_executor.grid_width, 20);
+                assert_eq!(plan_executor.grid_height, 20);
+                assert_eq!(plan_executor.grid_resolution, 1.0);
+
+                let mut map_msg = OccupancyGrid::default();
+                map_msg.info.width = 150;
+                map_msg.info.height = 200;
+                map_msg.info.resolution = 0.05;
+                map_msg.info.origin.position.x = -15.0;
+                map_msg.info.origin.position.y = -10.0;
+                map_msg.info.origin.orientation.w = 1.0;
+
+                plan_executor.handle_map(map_msg);
+
+                assert_eq!(plan_executor.grid_width, 150);
+                assert_eq!(plan_executor.grid_height, 200);
+                assert_eq!(plan_executor.grid_resolution, 0.05);
+                assert_eq!(plan_executor.grid_origin.position.x, -15.0);
+                assert_eq!(plan_executor.grid_origin.position.y, -10.0);
+            }
+        }
     }
 }
