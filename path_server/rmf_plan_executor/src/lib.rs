@@ -220,12 +220,6 @@ impl PlanExecutor {
         for (agent_idx, name) in sorted_names.iter().enumerate() {
             let robot_state = self.active_robots.get_mut(name).unwrap();
             if let Some(plan) = &robot_state.plan {
-                let traj_poses: Vec<Isometry2<f32>> = plan
-                    .waypoints
-                    .iter()
-                    .map(|wp| Isometry2::new(Vector2::new(wp.position[0], wp.position[1]), 0.0))
-                    .collect();
-
                 let mut follower = ActionExecutingFollower::from_plan(agent_idx, plan);
                 if let Some(odom) = &robot_state.latest_odom {
                     let current_x = odom.pose.pose.position.x as f32;
@@ -255,6 +249,10 @@ impl PlanExecutor {
         //self.plan_registry.add_robot_plan(robot_id.to_string(), msg);
 
         //Old method
+        let Some(agent_idx) = self.get_agent_index(robot_id) else {
+            return;
+        };
+
         let Some(state) = self.active_robots.get_mut(robot_id) else {
             return;
         };
@@ -265,11 +263,19 @@ impl PlanExecutor {
             return;
         }
 
+        let mut follower = ActionExecutingFollower::from_plan(agent_idx, &msg);
+        if let Some(odom) = &state.latest_odom {
+            let current_x = odom.pose.pose.position.x as f32;
+            let current_y = odom.pose.pose.position.y as f32;
+            let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
+            follower.update_position_estimate(&position, 0.5);
+        }
+
         state.plan = Some(msg);
+        state.waypoint_follower = Some(follower);
         state.safe_zone_version = 0;
         state.last_incremental_target_wp = None;
         state.blockage_monitor.begin_plan();
-        self.reindex_followers();
     }
 
     pub fn handle_map(&mut self, msg: OccupancyGrid) {
@@ -314,6 +320,13 @@ impl PlanExecutor {
         let Some(s) = self.active_robots.get_mut(robot_id) else {
             return;
         };
+
+        if s.plan
+            .as_ref()
+            .is_none_or(|plan| plan.plan_id != msg.plan_id)
+        {
+            return;
+        }
 
         let Some(follower) = s.waypoint_follower.as_mut() else {
             return;

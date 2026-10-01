@@ -85,7 +85,7 @@ impl ActionExecutingFollower {
                         .get_semantic_waypoint()
                         .trajectory_index
                 {
-                    if progress.reached_waypoint as usize > self.poses.len() {
+                    if progress.reached_waypoint as usize >= self.poses.len() {
                         // TODO(arjoc): Misbehaving fleetadapter
                         println!("Reached waypoint index is invalid. Assuming we have reached final destination");
                         return;
