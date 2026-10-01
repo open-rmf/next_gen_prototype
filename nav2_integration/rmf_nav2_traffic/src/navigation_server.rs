@@ -279,6 +279,7 @@ impl NavigationRequest {
             plan_id: PlanId {
                 destination_session: new_uuid(),
                 plan_version: 0,
+                mapf_session: 0,
             },
             target,
             threshold: 0.5,

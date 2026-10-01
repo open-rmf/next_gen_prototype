@@ -765,6 +765,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                             let plan_id = PlanId {
                                 destination_session: dest.session.clone(),
                                 plan_version: new_version,
+                                mapf_session: success.session_id,
                             };
 
                             self.active_plan_ids.insert(robot_id.clone(), plan_id);
