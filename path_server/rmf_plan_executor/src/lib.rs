@@ -269,6 +269,7 @@ impl PlanExecutor {
         state.safe_zone_version = 0;
         state.last_incremental_target_wp = None;
         state.blockage_monitor.begin_plan();
+        self.reindex_followers();
     }
 
     pub fn handle_map(&mut self, msg: OccupancyGrid) {
@@ -280,7 +281,7 @@ impl PlanExecutor {
     }
 
     pub fn handle_progress(&mut self, robot_id: &str, msg: Progress) {
-        /*let entering_action = msg.execution_state == Progress::EXECUTION_STATE_EXECUTING_ACTION
+        let entering_action = msg.execution_state == Progress::EXECUTION_STATE_EXECUTING_ACTION
             && self
                 .latest_progress
                 .get(robot_id)
@@ -307,7 +308,8 @@ impl PlanExecutor {
             }
         }
 
-        self.latest_progress.insert(robot_id.to_string(), msg);*/
+        self.latest_progress
+            .insert(robot_id.to_string(), msg.clone());
 
         let Some(s) = self.active_robots.get_mut(robot_id) else {
             return;
@@ -385,7 +387,7 @@ impl PlanExecutor {
         // Cache all semantic waypoints first because get_semantic_waypoint requires &mut self.
         // Doing this first avoids borrowing active_robots as mutable during later immutable reads.
         let mut semantic_waypoints = HashMap::new();
-        let robot_index = 0usize;
+        let mut robot_index = 0usize;
         for (name, r_state) in &mut self.active_robots {
             if let Some(fw) = &mut r_state.waypoint_follower {
                 semantic_waypoints.insert(
@@ -396,6 +398,7 @@ impl PlanExecutor {
                     },
                 );
             }
+            robot_index += 1;
         }
 
         // 1. Calculate PlanRelease
