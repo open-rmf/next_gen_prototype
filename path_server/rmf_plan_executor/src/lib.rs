@@ -174,7 +174,7 @@ impl PlanExecutor {
     }
 
     pub fn handle_robot_added(&mut self, robot_id: &str, radius: f32) {
-        self.plan_registry.add_robot(robot_id.to_string());
+        self.plan_registry.add_robot(robot_id.to_string(), radius);
 
         if !self.active_robots.contains_key(robot_id) {
             rclrs::log!(
