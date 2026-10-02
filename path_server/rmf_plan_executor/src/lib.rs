@@ -17,7 +17,7 @@ mod plan_registry;
 use mapf_post::{
     na::{Isometry2, Vector2},
     spatial_allocation::{CurrentPosition, Grid2D},
-    MapfResult, SemanticWaypoint,
+    SemanticWaypoint,
 };
 use rclrs::{IntoPrimitiveOptions, Node};
 use rmf_nav_graph::NavGraphData;
@@ -200,6 +200,7 @@ impl PlanExecutor {
     }
 
     pub fn handle_robot_removed(&mut self, robot_id: &str) {
+        self.plan_registry.remove_robot(robot_id);
         if self.active_robots.remove(robot_id).is_some() {
             rclrs::log!(
                 self.node.logger(),
@@ -246,9 +247,6 @@ impl PlanExecutor {
             robot_id
         );
 
-        //self.plan_registry.add_robot_plan(robot_id.to_string(), msg);
-
-        //Old method
         let Some(agent_idx) = self.get_agent_index(robot_id) else {
             return;
         };
@@ -262,6 +260,9 @@ impl PlanExecutor {
             rclrs::log_error!(self.node.logger(), "Received empty plan. Ignoring.");
             return;
         }
+
+        self.plan_registry
+            .add_robot_plan(robot_id.to_string(), msg.clone());
 
         let mut follower = ActionExecutingFollower::from_plan(agent_idx, &msg);
         if let Some(odom) = &state.latest_odom {
@@ -366,6 +367,10 @@ impl PlanExecutor {
     pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) {
         let current_x = msg.pose.pose.position.x as f32;
         let current_y = msg.pose.pose.position.y as f32;
+        let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
+
+        self.plan_registry
+            .update_stationary_position(robot_id, position);
 
         {
             let Some(state) = self.active_robots.get_mut(robot_id) else {
@@ -376,9 +381,12 @@ impl PlanExecutor {
 
             if let Some(fw) = &mut state.waypoint_follower {
                 let before = fw.get_index_along_plan();
-                let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
                 fw.update_position_estimate(&position, 0.5);
                 let after = fw.get_index_along_plan();
+                if let Some(plan) = &state.plan {
+                    self.plan_registry
+                        .update_progress(robot_id, after, plan.plan_id.clone());
+                }
                 rclrs::log_debug!(
                     self.node.logger(),
                     "[Executor Debug] Robot {} pos=({}, {}) index before={}, after={}",
@@ -563,10 +571,18 @@ impl PlanExecutor {
         // --- End dynamic grid resizing ---
 
         // 2. Generate and publish SafeZone
-        let mut trajectories = Vec::new();
-        let mut footprints = Vec::new();
-        let mut current_positions = Vec::new();
+        let mut snapshot = self.plan_registry.get_mapf_snapshot();
+        let origin_offset = Vector2::new(
+            self.grid_origin.position.x as f32,
+            self.grid_origin.position.y as f32,
+        );
+        for traj in &mut snapshot.mapf_result.trajectories {
+            for pose in &mut traj.poses {
+                pose.translation.vector -= origin_offset;
+            }
+        }
 
+        let mut current_positions = Vec::new();
         for (idx, (r_name, r_state)) in self.active_robots.iter().enumerate() {
             let r_odom = r_state.latest_odom.as_ref().unwrap();
             let real_position = (
@@ -574,56 +590,31 @@ impl PlanExecutor {
                 r_odom.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
             );
 
-            // A robot with no plan is stationary as far as we know, so we model it
-            // as a single-pose trajectory at its current location. That keeps it
-            // visible to the spatial allocation as an obstacle instead of halting
-            // safe zone generation for every other robot.
-            let traj_poses: Vec<Isometry2<f32>> = match r_state.plan.as_ref() {
-                Some(r_plan) => r_plan
-                    .waypoints
-                    .iter()
-                    .map(|wp| {
-                        Isometry2::new(
-                            Vector2::new(
-                                wp.position[0] - self.grid_origin.position.x as f32,
-                                wp.position[1] - self.grid_origin.position.y as f32,
-                            ),
-                            0.0,
-                        )
-                    })
-                    .collect(),
-                None => vec![Isometry2::new(
-                    Vector2::new(real_position.0, real_position.1),
-                    0.0,
-                )],
-            };
-            trajectories.push(mapf_post::Trajectory { poses: traj_poses });
-            footprints.push(Arc::new(mapf_post::shape::Ball::new(r_state.radius))
-                as Arc<dyn mapf_post::shape::Shape>);
+            let plan_offset = r_state
+                .plan
+                .as_ref()
+                .and_then(|p| snapshot.get_plan_offset(&p.plan_id))
+                .unwrap_or(0);
 
-            let semantic_position =
-                semantic_waypoints
-                    .get(r_name)
-                    .cloned()
-                    .unwrap_or(SemanticWaypoint {
-                        agent: idx,
-                        trajectory_index: 0,
-                    });
+            let semantic_position = semantic_waypoints
+                .get(r_name)
+                .map(|sem| SemanticWaypoint {
+                    agent: sem.agent,
+                    trajectory_index: sem.trajectory_index + plan_offset,
+                })
+                .unwrap_or(SemanticWaypoint {
+                    agent: idx,
+                    trajectory_index: 0,
+                });
             current_positions.push(CurrentPosition {
                 semantic_position,
                 real_position,
             });
         }
 
-        let mapf_result = MapfResult {
-            trajectories,
-            footprints,
-            discretization_timestep: 1.0,
-        };
-
         let allocation_field = self
             .grid
-            .allocate_trajectory(&mapf_result, &current_positions);
+            .allocate_trajectory(&snapshot.mapf_result, &current_positions);
 
         let positions = allocation_field
             .get_alloc_for_agent(agent_idx)

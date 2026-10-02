@@ -90,6 +90,15 @@ impl PlanRegistry {
         self.inactive_robots.insert(robot, None);
     }
 
+    pub(crate) fn remove_robot(&mut self, robot: &str) {
+        if let Some(old_plan) = self.robot_to_session.remove(robot) {
+            self.invalidate_entry(robot, &old_plan.mapf_session);
+        }
+        self.robot_to_progress.remove(robot);
+        self.inactive_robots.remove(robot);
+        self.robot_radii.remove(robot);
+    }
+
     pub(crate) fn update_stationary_position(&mut self, robot: &str, position: Isometry2<f32>) {
         if let Some(pos) = self.inactive_robots.get_mut(robot) {
             *pos = Some(position);
