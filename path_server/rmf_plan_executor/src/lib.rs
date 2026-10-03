@@ -20,7 +20,6 @@ use mapf_post::{
     SemanticWaypoint,
 };
 use rclrs::{IntoPrimitiveOptions, Node};
-use rmf_nav_graph::NavGraphData;
 use ros_env::builtin_interfaces;
 use ros_env::geometry_msgs::msg::Pose;
 use ros_env::nav2_msgs;
@@ -33,7 +32,7 @@ use ros_env::rmf_prototype_msgs::msg::{
 };
 use ros_env::std_msgs;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -100,7 +99,7 @@ pub struct PlanExecutor {
     // TODO(arjoc) The use of BTreeMap here is to make sure robts are ordered by their names
     // this helps with maintaining correspondance between their `mapf_post` ids and the input.
     // We should re-visit this after re-designing the mapf-post API a little.
-    pub active_robots: BTreeMap<String, RobotState>,
+    pub robots: BTreeMap<String, RobotState>,
     pub plan_release_publishers: HashMap<String, rclrs::Publisher<PlanRelease>>,
     pub safezone_publishers: HashMap<String, rclrs::Publisher<SafeZone>>,
     pub plan_error_publishers: HashMap<String, rclrs::Publisher<PlanError>>,
@@ -114,10 +113,6 @@ pub struct PlanExecutor {
     /// the authoritative account of how far a robot has actually got, as opposed
     /// to our own projection of its odometry onto its plan.
     pub latest_progress: HashMap<String, Progress>,
-    /// Site navigation graph, if one was configured. Only used to resolve the
-    /// space a robot holds while it is executing an action; everything else the
-    /// executor does works without it.
-    pub nav_graph: Option<Arc<NavGraphData>>,
 
     plan_registry: PlanRegistry,
 }
@@ -149,15 +144,11 @@ fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
 
 impl PlanExecutor {
     pub fn new(node: Node) -> Self {
-        Self::new_with_nav_graph(node, None)
-    }
-
-    pub fn new_with_nav_graph(node: Node, nav_graph: Option<Arc<NavGraphData>>) -> Self {
         let mut origin = Pose::default();
         origin.orientation.w = 1.0;
         Self {
             node,
-            active_robots: BTreeMap::new(),
+            robots: BTreeMap::new(),
             plan_release_publishers: HashMap::new(),
             safezone_publishers: HashMap::new(),
             plan_error_publishers: HashMap::new(),
@@ -169,21 +160,20 @@ impl PlanExecutor {
             latest_map: None,
             latest_progress: HashMap::new(),
             plan_registry: PlanRegistry::default(),
-            nav_graph,
         }
     }
 
     pub fn handle_robot_added(&mut self, robot_id: &str, radius: f32) {
         self.plan_registry.add_robot(robot_id.to_string(), radius);
 
-        if !self.active_robots.contains_key(robot_id) {
+        if !self.robots.contains_key(robot_id) {
             rclrs::log!(
                 self.node.logger(),
                 "PlanExecutor adding participant: {} with radius {}",
                 robot_id,
                 radius
             );
-            self.active_robots.insert(
+            self.robots.insert(
                 robot_id.to_string(),
                 RobotState {
                     radius,
@@ -201,7 +191,7 @@ impl PlanExecutor {
 
     pub fn handle_robot_removed(&mut self, robot_id: &str) {
         self.plan_registry.remove_robot(robot_id);
-        if self.active_robots.remove(robot_id).is_some() {
+        if self.robots.remove(robot_id).is_some() {
             rclrs::log!(
                 self.node.logger(),
                 "PlanExecutor removing participant: {}",
@@ -217,9 +207,9 @@ impl PlanExecutor {
     }
 
     fn reindex_followers(&mut self) {
-        let sorted_names: Vec<String> = self.active_robots.keys().cloned().collect();
+        let sorted_names: Vec<String> = self.robots.keys().cloned().collect();
         for (agent_idx, name) in sorted_names.iter().enumerate() {
-            let robot_state = self.active_robots.get_mut(name).unwrap();
+            let robot_state = self.robots.get_mut(name).unwrap();
             if let Some(plan) = &robot_state.plan {
                 let mut follower = ActionExecutingFollower::from_plan(agent_idx, plan);
                 if let Some(odom) = &robot_state.latest_odom {
@@ -235,7 +225,7 @@ impl PlanExecutor {
     }
 
     fn get_agent_index(&self, robot_id: &str) -> Option<usize> {
-        self.active_robots.keys().position(|k| k == robot_id) // TODO(arjoc): Peak tier AI-SLOP code.
+        self.robots.keys().position(|k| k == robot_id) // TODO(arjoc): Peak tier AI-SLOP code.
     }
 
     pub fn handle_plan(&mut self, robot_id: &str, msg: Plan) {
@@ -251,7 +241,7 @@ impl PlanExecutor {
             return;
         };
 
-        let Some(state) = self.active_robots.get_mut(robot_id) else {
+        let Some(state) = self.robots.get_mut(robot_id) else {
             return;
         };
 
@@ -281,44 +271,17 @@ impl PlanExecutor {
 
     pub fn handle_map(&mut self, msg: OccupancyGrid) {
         self.latest_map = Some(msg);
-        let robot_ids: Vec<_> = self.active_robots.keys().cloned().collect();
+        let robot_ids: Vec<_> = self.robots.keys().cloned().collect();
         for robot_id in robot_ids {
             self.update_route_blockage(&robot_id);
         }
     }
 
     pub fn handle_progress(&mut self, robot_id: &str, msg: Progress) {
-        let entering_action = msg.execution_state == Progress::EXECUTION_STATE_EXECUTING_ACTION
-            && self
-                .latest_progress
-                .get(robot_id)
-                .is_none_or(|prev| prev.execution_state != msg.execution_state);
-        if entering_action {
-            match &self.nav_graph {
-                None => rclrs::log_warn!(
-                    self.node.logger(),
-                    "{} is executing action '{}' but no site_file was configured, so its dock \
-                     corridor cannot be reserved against other robots",
-                    robot_id,
-                    msg.active_action
-                ),
-                Some(graph) if graph.find_vertex_by_name(&msg.active_action).is_none() => {
-                    rclrs::log_warn!(
-                        self.node.logger(),
-                        "{} is executing action '{}', which is not a vertex in the nav graph. \
-                         Falling back to its ordinary spatial allocation.",
-                        robot_id,
-                        msg.active_action
-                    )
-                }
-                Some(_) => {}
-            }
-        }
-
         self.latest_progress
             .insert(robot_id.to_string(), msg.clone());
 
-        let Some(s) = self.active_robots.get_mut(robot_id) else {
+        let Some(s) = self.robots.get_mut(robot_id) else {
             return;
         };
 
@@ -373,7 +336,7 @@ impl PlanExecutor {
             .update_stationary_position(robot_id, position);
 
         {
-            let Some(state) = self.active_robots.get_mut(robot_id) else {
+            let Some(state) = self.robots.get_mut(robot_id) else {
                 return;
             };
 
@@ -406,10 +369,10 @@ impl PlanExecutor {
         }
 
         // Cache all semantic waypoints first because get_semantic_waypoint requires &mut self.
-        // Doing this first avoids borrowing active_robots as mutable during later immutable reads.
+        // Doing this first avoids borrowing robots as mutable during later immutable reads.
         let mut semantic_waypoints = HashMap::new();
         let mut robot_index = 0usize;
-        for (name, r_state) in &mut self.active_robots {
+        for (name, r_state) in &mut self.robots {
             if let Some(fw) = &mut r_state.waypoint_follower {
                 semantic_waypoints.insert(
                     name.clone(),
@@ -424,7 +387,7 @@ impl PlanExecutor {
 
         // 1. Calculate PlanRelease
         let agent_idx = self.get_agent_index(robot_id).unwrap();
-        let robot_state = &self.active_robots[robot_id];
+        let robot_state = &self.robots[robot_id];
         let plan = robot_state.plan.as_ref().unwrap();
         let curr_wp_idx = semantic_waypoints
             .get(robot_id)
@@ -467,7 +430,7 @@ impl PlanExecutor {
 
         if released_wp_idx < plan.waypoints.len() {
             let wp_pos = &plan.waypoints[released_wp_idx].position;
-            for (r_name, r_state) in &self.active_robots {
+            for (r_name, r_state) in &self.robots {
                 if r_name == robot_id {
                     continue;
                 }
@@ -517,7 +480,7 @@ impl PlanExecutor {
         let mut max_x = f32::MIN;
         let mut max_y = f32::MIN;
 
-        for r_state in self.active_robots.values() {
+        for r_state in self.robots.values() {
             let Some(r_odom) = r_state.latest_odom.as_ref() else {
                 continue;
             };
@@ -583,7 +546,7 @@ impl PlanExecutor {
         }
 
         let mut current_positions = Vec::new();
-        for (idx, (r_name, r_state)) in self.active_robots.iter().enumerate() {
+        for (idx, (r_name, r_state)) in self.robots.iter().enumerate() {
             let r_odom = r_state.latest_odom.as_ref().unwrap();
             let real_position = (
                 r_odom.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
@@ -647,7 +610,7 @@ impl PlanExecutor {
         // We need to update safezones all the time.
         // TODO(arjoc) see if we can update safezones only when there are changes in the
         // shape of the safe zone or target to limit network traffic.
-        let state = self.active_robots.get_mut(robot_id).unwrap();
+        let state = self.robots.get_mut(robot_id).unwrap();
         state.safe_zone_version += 1;
 
         let safe_zone = SafeZone {
@@ -702,7 +665,7 @@ impl PlanExecutor {
             return;
         };
 
-        let Some(state) = self.active_robots.get_mut(robot_id) else {
+        let Some(state) = self.robots.get_mut(robot_id) else {
             return;
         };
         let (Some(plan), Some(odom), Some(follower)) = (
@@ -781,17 +744,17 @@ impl PlanExecutor {
     /// parked or docked with no active destination must not stall the rest of
     /// the fleet.
     fn ready_to_execute(&self, robot_id: &str) -> bool {
-        if self.active_robots.is_empty() {
+        if self.robots.is_empty() {
             return false;
         }
         if self
-            .active_robots
+            .robots
             .values()
             .any(|state| state.latest_odom.is_none())
         {
             return false;
         }
-        self.active_robots
+        self.robots
             .get(robot_id)
             .is_some_and(|state| state.plan.is_some() && state.waypoint_follower.is_some())
     }
@@ -832,72 +795,6 @@ impl PlanExecutor {
             data,
         }
     }
-}
-
-/// The allocation grid a claim is being rasterised against.
-pub struct ClaimGrid<'a> {
-    pub grid: &'a Grid2D,
-    /// World coordinates of the grid's origin, subtracted before indexing.
-    pub origin: (f32, f32),
-    pub width: usize,
-    pub height: usize,
-    pub cell_size: f32,
-}
-
-/// Rasterise a polyline into allocation-grid cells, inflated by `radius`.
-///
-/// Cells are produced with `Grid2D::from_world_coords` so that they index
-/// identically to the cells `allocate_trajectory` returns - including its
-/// top-left origin y flip, which `to_costmap_msg` later undoes. Anything off
-/// the grid is dropped rather than clamped, so a claim never lands on a cell
-/// nobody is standing in.
-pub fn claim_cells_along(
-    grid: ClaimGrid<'_>,
-    path: &[[f32; 2]],
-    radius: f32,
-) -> Vec<(usize, usize)> {
-    let cell_size = grid.cell_size.max(1e-3);
-    // A Chebyshev ring wide enough for the footprint. This matches the one-ring
-    // `blur` that mapf_post applies to its own claims, so a dock corridor is
-    // neither systematically fatter nor thinner than the claims it displaces.
-    let ring = (radius / cell_size).ceil().max(1.0) as isize;
-
-    let stamp = |point: [f32; 2], cells: &mut HashSet<(usize, usize)>| {
-        let (cx, cy) = grid
-            .grid
-            .from_world_coords(point[0] - grid.origin.0, point[1] - grid.origin.1);
-        for dx in -ring..=ring {
-            for dy in -ring..=ring {
-                let (x, y) = (cx + dx, cy + dy);
-                if x < 0 || y < 0 {
-                    continue;
-                }
-                let (x, y) = (x as usize, y as usize);
-                if x < grid.width && y < grid.height {
-                    cells.insert((x, y));
-                }
-            }
-        }
-    };
-
-    let Some(first) = path.first() else {
-        return Vec::new();
-    };
-    let mut cells = HashSet::new();
-    stamp(*first, &mut cells);
-
-    for pair in path.windows(2) {
-        let (from, to) = (pair[0], pair[1]);
-        let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
-        // Quarter-cell steps, so a segment cannot skip a cell it crosses.
-        let steps = ((dx.hypot(dy) / (cell_size * 0.25)).ceil() as usize).max(1);
-        for step in 1..=steps {
-            let t = step as f32 / steps as f32;
-            stamp([from[0] + dx * t, from[1] + dy * t], &mut cells);
-        }
-    }
-
-    cells.into_iter().collect()
 }
 
 fn route_intersects_map(map: &OccupancyGrid, route: &[(f32, f32)], radius: f32) -> bool {
@@ -1135,90 +1032,5 @@ mod tests {
             "After waiting at 10.0 (2nd time): index is {}",
             follower.get_semantic_waypoint().trajectory_index
         );
-    }
-}
-
-#[cfg(test)]
-mod dock_claim_tests {
-    use super::*;
-
-    /// 20x20 grid of 1 m cells with its origin at the world origin, matching
-    /// what `PlanExecutor::new` starts with.
-    fn grid() -> Grid2D {
-        Grid2D::new(vec![vec![0; 20]; 20], 1.0)
-    }
-
-    fn claim(grid: &Grid2D, path: &[[f32; 2]], radius: f32) -> Vec<(usize, usize)> {
-        claim_cells_along(
-            ClaimGrid {
-                grid,
-                origin: (0.0, 0.0),
-                width: 20,
-                height: 20,
-                cell_size: 1.0,
-            },
-            path,
-            radius,
-        )
-    }
-
-    #[test]
-    fn a_claim_indexes_the_same_way_the_allocation_does() {
-        let grid = grid();
-        // The allocation's own conversion is the definition of correct here. If
-        // these ever diverge the overlay would subtract cells from the wrong
-        // place, which is worse than not subtracting at all.
-        let cells = claim(&grid, &[[5.0, 6.0]], 0.0);
-        let expected = grid.from_world_coords(5.0, 6.0);
-        assert!(
-            cells.contains(&(expected.0 as usize, expected.1 as usize)),
-            "claim {cells:?} does not contain the allocation's own cell for (5, 6): {expected:?}"
-        );
-    }
-
-    #[test]
-    fn a_claim_covers_every_cell_between_its_ends() {
-        let grid = grid();
-        // A dock approach: staging at (5, 8) driving in to (5, 5). Three metres
-        // at 1 m cells, so nothing may be left open in the middle.
-        let cells = claim(&grid, &[[5.0, 8.0], [5.0, 5.0]], 0.0);
-
-        for y in [5.0f32, 6.0, 7.0, 8.0] {
-            let (cx, cy) = grid.from_world_coords(5.0, y);
-            assert!(
-                cells.contains(&(cx as usize, cy as usize)),
-                "the approach skipped (5, {y}): {cells:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_claim_is_inflated_by_the_footprint() {
-        let grid = grid();
-        let bare = claim(&grid, &[[5.0, 5.0]], 0.0);
-        let inflated = claim(&grid, &[[5.0, 5.0]], 0.49);
-
-        // Both get at least the one-ring that mapf_post's own `blur` applies,
-        // so a dock claim is never thinner than the claims it displaces.
-        assert_eq!(bare.len(), 9, "expected a one-ring minimum: {bare:?}");
-        assert!(
-            inflated.len() >= bare.len(),
-            "a footprint must not shrink the claim: {inflated:?} vs {bare:?}"
-        );
-    }
-
-    #[test]
-    fn claims_off_the_grid_are_dropped_not_clamped() {
-        let grid = grid();
-        // Clamping would plant this on the boundary and block a cell nobody is
-        // standing in.
-        assert!(claim(&grid, &[[-500.0, -500.0]], 0.0).is_empty());
-        assert!(claim(&grid, &[[500.0, 500.0]], 0.0).is_empty());
-    }
-
-    #[test]
-    fn an_empty_path_claims_nothing() {
-        let grid = grid();
-        assert!(claim(&grid, &[], 0.49).is_empty());
     }
 }
