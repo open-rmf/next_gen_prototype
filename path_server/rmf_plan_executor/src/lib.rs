@@ -505,6 +505,7 @@ impl PlanExecutor {
         let target_x = plan.waypoints[released_wp_idx].position[0];
         let target_y = plan.waypoints[released_wp_idx].position[1];
         let target_yaw = target_yaw(plan, released_wp_idx);
+        let target_progress = plan.waypoints[released_wp_idx].progress;
 
         let costmap = Self::to_costmap_msg(
             &positions,
@@ -542,8 +543,8 @@ impl PlanExecutor {
             },
             costmap,
             target_waypoint: vec![released_wp_idx as u64].try_into().unwrap(),
-            last_waypoint: released_wp_idx as u64,
-            target_progress: 0.0,
+            last_waypoint: curr_wp_idx as u64,
+            target_progress,
             id: SafeZoneId {
                 plan_id,
                 safe_zone_version: state.safe_zone_version,

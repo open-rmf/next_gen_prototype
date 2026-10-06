@@ -157,7 +157,7 @@ fn create_progress_publisher(
         return;
     };
     let topic = agent_name + "/plan/progress";
-    let publisher = Arc::new(RosPublisher::<Progress>::new(&node, topic));
+    let publisher = Arc::new(RosPublisher::<Progress>::new_transient_local(&node, topic));
     commands.entity(e).insert(ProgressPublisher {
         publisher: Arc::clone(&publisher),
     });
@@ -223,7 +223,7 @@ fn update_incremental_target(
 
         // Publish progress
         let Ok(_) = progress_pub.publisher.publish(Progress {
-            progress: safe_zone.target_progress,
+            progress: safe_zone.last_waypoint as f32,
             reached_waypoint: safe_zone.last_waypoint,
             target_waypoint: safe_zone.target_waypoint[0], // TODO(@xiyuoh) review
             reached_keys: vec![],                          // TODO(@xiyuoh)
