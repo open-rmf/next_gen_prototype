@@ -12,12 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod blockage_monitor;
+pub mod ros_node;
+
+pub use ros_node::PlanExecutorRosNode;
+
+use blockage_monitor::{route_intersects_map, BlockageMonitor};
 use mapf_post::{
     na::{Isometry2, Vector2},
     spatial_allocation::{CurrentPosition, Grid2D},
     MapfResult, WaypointFollower,
 };
-use rclrs::{IntoPrimitiveOptions, Node};
 use ros_env::builtin_interfaces;
 use ros_env::geometry_msgs::msg::Pose;
 use ros_env::nav2_msgs;
@@ -25,19 +30,14 @@ use ros_env::nav2_msgs::msg::Costmap;
 use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
 use ros_env::rmf_prototype_msgs;
 use ros_env::rmf_prototype_msgs::msg::{
-    DestinationConstraints, Plan, PlanError, PlanId, PlanRelease, SafeZone, SafeZoneId,
-    TargetOrientation,
+    DestinationConstraints, Plan, PlanError, PlanRelease, SafeZone, SafeZoneId, TargetOrientation,
 };
 use ros_env::std_msgs;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
-
-const BLOCKAGE_DEBOUNCE: Duration = Duration::from_millis(300);
-const REPLAN_COOLDOWN: Duration = Duration::from_secs(2);
-const OCCUPIED_THRESHOLD: i8 = 50;
 
 pub struct RobotState {
     pub radius: f32,
@@ -49,45 +49,11 @@ pub struct RobotState {
     blockage_monitor: BlockageMonitor,
 }
 
-#[derive(Default)]
-struct BlockageMonitor {
-    blocked_since: Option<Instant>,
-    reported_plan: Option<PlanId>,
-    last_reported_at: Option<Instant>,
-}
-
-impl BlockageMonitor {
-    fn begin_plan(&mut self) {
-        self.blocked_since = None;
-    }
-
-    fn observe(&mut self, blocked: bool, plan_id: &PlanId, now: Instant) -> bool {
-        if !blocked {
-            self.blocked_since = None;
-            return false;
-        }
-
-        if self.reported_plan.as_ref() == Some(plan_id) {
-            return false;
-        }
-
-        let blocked_since = self.blocked_since.get_or_insert(now);
-        if now.duration_since(*blocked_since) < BLOCKAGE_DEBOUNCE {
-            return false;
-        }
-
-        if self
-            .last_reported_at
-            .is_some_and(|last| now.duration_since(last) < REPLAN_COOLDOWN)
-        {
-            return false;
-        }
-
-        self.reported_plan = Some(plan_id.clone());
-        self.last_reported_at = Some(now);
-        self.blocked_since = None;
-        true
-    }
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExecutionStepOutput {
+    pub plan_release: Option<PlanRelease>,
+    pub safe_zone: Option<SafeZone>,
+    pub plan_error: Option<PlanError>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -139,20 +105,22 @@ impl PlanExecutorConfig {
 }
 
 pub struct PlanExecutor {
-    pub node: Node,
-    // TODO(arjoc) The use of BTreeMap here is to make sure robts are ordered by their names
-    // this helps with maintaining correspondance between their `mapf_post` ids and the input.
+    // TODO(arjoc) The use of BTreeMap here is to make sure robots are ordered by their names
+    // this helps with maintaining correspondence between their `mapf_post` ids and the input.
     // We should re-visit this after re-designing the mapf-post API a little.
     pub active_robots: BTreeMap<String, RobotState>,
-    pub plan_release_publishers: HashMap<String, rclrs::Publisher<PlanRelease>>,
-    pub safezone_publishers: HashMap<String, rclrs::Publisher<SafeZone>>,
-    pub plan_error_publishers: HashMap<String, rclrs::Publisher<PlanError>>,
     pub grid: Arc<Grid2D>,
     pub grid_width: u32,
     pub grid_height: u32,
     pub grid_resolution: f32,
     pub grid_origin: Pose,
     pub latest_map: Option<OccupancyGrid>,
+}
+
+impl Default for PlanExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
@@ -181,25 +149,21 @@ fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
 }
 
 impl PlanExecutor {
-    pub fn new(node: Node) -> Self {
-        Self::with_config(node, PlanExecutorConfig::default())
+    pub fn new() -> Self {
+        Self::with_config(PlanExecutorConfig::default())
     }
 
-    pub fn new_with_config(node: Node, config: PlanExecutorConfig) -> Self {
-        Self::with_config(node, config)
+    pub fn new_with_config(config: PlanExecutorConfig) -> Self {
+        Self::with_config(config)
     }
 
-    pub fn with_config(node: Node, config: PlanExecutorConfig) -> Self {
+    pub fn with_config(config: PlanExecutorConfig) -> Self {
         let grid = Arc::new(Grid2D::new(
             vec![vec![0; config.grid_height as usize]; config.grid_width as usize],
             config.grid_resolution,
         ));
         Self {
-            node,
             active_robots: BTreeMap::new(),
-            plan_release_publishers: HashMap::new(),
-            safezone_publishers: HashMap::new(),
-            plan_error_publishers: HashMap::new(),
             grid,
             grid_width: config.grid_width,
             grid_height: config.grid_height,
@@ -209,14 +173,8 @@ impl PlanExecutor {
         }
     }
 
-    pub fn handle_robot_added(&mut self, robot_id: &str, radius: f32) {
+    pub fn handle_robot_added(&mut self, robot_id: &str, radius: f32) -> bool {
         if !self.active_robots.contains_key(robot_id) {
-            rclrs::log!(
-                self.node.logger(),
-                "PlanExecutor adding participant: {} with radius {}",
-                robot_id,
-                radius
-            );
             self.active_robots.insert(
                 robot_id.to_string(),
                 RobotState {
@@ -230,21 +188,17 @@ impl PlanExecutor {
                 },
             );
             self.reindex_followers();
+            return true;
         }
+        false
     }
 
-    pub fn handle_robot_removed(&mut self, robot_id: &str) {
+    pub fn handle_robot_removed(&mut self, robot_id: &str) -> bool {
         if self.active_robots.remove(robot_id).is_some() {
-            rclrs::log!(
-                self.node.logger(),
-                "PlanExecutor removing participant: {}",
-                robot_id
-            );
-            self.plan_release_publishers.remove(robot_id);
-            self.safezone_publishers.remove(robot_id);
-            self.plan_error_publishers.remove(robot_id);
             self.reindex_followers();
+            return true;
         }
+        false
     }
 
     fn get_agent_index(&self, robot_id: &str) -> Option<usize> {
@@ -296,23 +250,13 @@ impl PlanExecutor {
         }
     }
 
-    pub fn handle_plan(&mut self, robot_id: &str, msg: Plan) {
-        rclrs::log!(
-            self.node.logger(),
-            "Received plan version {} with {} waypoints for robot {}",
-            msg.plan_id.plan_version,
-            msg.waypoints.len(),
-            robot_id
-        );
-
+    pub fn handle_plan(&mut self, robot_id: &str, msg: Plan) -> bool {
         let Some(state) = self.active_robots.get_mut(robot_id) else {
-            return;
+            return false;
         };
 
-        if msg.waypoints.len() == 0 {
-            // TODO(arjoc): publish an error message
-            rclrs::log_error!(self.node.logger(), "Received empty plan. Ignoring.");
-            return;
+        if msg.waypoints.is_empty() {
+            return false;
         }
 
         state.plan = Some(msg);
@@ -322,19 +266,11 @@ impl PlanExecutor {
 
         // Reindex because we updated the plan
         self.reindex_followers();
+        true
     }
 
-    pub fn handle_map(&mut self, msg: OccupancyGrid) {
+    pub fn handle_map(&mut self, msg: OccupancyGrid) -> Vec<(String, PlanError)> {
         if msg.info.width > 0 && msg.info.height > 0 && msg.info.resolution > 0.0 {
-            rclrs::log!(
-                self.node.logger(),
-                "PlanExecutor reconfiguring grid from map: width={}, height={}, resolution={}, origin=({}, {})",
-                msg.info.width,
-                msg.info.height,
-                msg.info.resolution,
-                msg.info.origin.position.x,
-                msg.info.origin.position.y
-            );
             self.grid_width = msg.info.width;
             self.grid_height = msg.info.height;
             self.grid_resolution = msg.info.resolution;
@@ -347,47 +283,44 @@ impl PlanExecutor {
 
         self.latest_map = Some(msg);
         let robot_ids: Vec<_> = self.active_robots.keys().cloned().collect();
+        let mut errors = Vec::new();
         for robot_id in robot_ids {
-            self.update_route_blockage(&robot_id);
+            if let Some(error) = self.update_route_blockage(&robot_id) {
+                errors.push((robot_id, error));
+            }
         }
+        errors
     }
 
-    pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) {
+    pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) -> ExecutionStepOutput {
         let current_x = msg.pose.pose.position.x as f32;
         let current_y = msg.pose.pose.position.y as f32;
 
         {
             let Some(state) = self.active_robots.get_mut(robot_id) else {
-                return;
+                return ExecutionStepOutput::default();
             };
 
             state.latest_odom = Some(msg.clone());
 
             if let Some(fw) = &mut state.waypoint_follower {
-                let before = fw.get_semantic_waypoint().trajectory_index;
                 let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
                 fw.update_position_estimate(&position, 0.5);
-                let after = fw.get_semantic_waypoint().trajectory_index;
-                rclrs::log_debug!(
-                    self.node.logger(),
-                    "[Executor Debug] Robot {} pos=({}, {}) index before={}, after={}",
-                    robot_id,
-                    current_x,
-                    current_y,
-                    before,
-                    after
-                );
             } else {
                 self.reindex_followers();
             }
         }
 
-        self.update_route_blockage(robot_id);
+        let plan_error = self.update_route_blockage(robot_id);
 
         // Only robots with an active plan need to compute and publish PlanRelease & SafeZone
         let robot_state = &self.active_robots[robot_id];
         if robot_state.plan.is_none() {
-            return;
+            return ExecutionStepOutput {
+                plan_release: None,
+                safe_zone: None,
+                plan_error,
+            };
         }
 
         // Cache all semantic waypoints first because get_semantic_waypoint requires &mut self.
@@ -408,13 +341,6 @@ impl PlanExecutor {
             .map(|w| w.trajectory_index)
             .unwrap_or(0);
 
-        rclrs::log_debug!(
-            self.node.logger(),
-            "[Executor Debug] Robot {} curr_wp_idx={} (semantic waypoint trajectory index)",
-            robot_id,
-            curr_wp_idx
-        );
-
         let mut released_wp_idx = curr_wp_idx;
         while released_wp_idx < plan.waypoints.len() {
             let wp = &plan.waypoints[released_wp_idx];
@@ -423,27 +349,11 @@ impl PlanExecutor {
                 if let Some(blocker_sem) = semantic_waypoints.get(&blocker.name) {
                     let blocker_progress = blocker_sem.trajectory_index;
                     let required_progress = blocker.required_progress.round() as usize;
-                    rclrs::log_debug!(
-                        self.node.logger(),
-                        "[Executor Debug] Blocker check for robot {} wp {}: blocker={} blocker_progress={} required={}",
-                        robot_id,
-                        released_wp_idx,
-                        blocker.name,
-                        blocker_progress,
-                        required_progress
-                    );
                     if blocker_progress < required_progress {
                         blocked = true;
                         break;
                     }
                 } else {
-                    rclrs::log_debug!(
-                        self.node.logger(),
-                        "[Executor Debug] Blocker check for robot {} wp {}: blocker={} is missing semantic waypoint",
-                        robot_id,
-                        released_wp_idx,
-                        blocker.name
-                    );
                     blocked = true;
                     break;
                 }
@@ -472,8 +382,6 @@ impl PlanExecutor {
         }
 
         if released_wp_idx >= plan.waypoints.len() {
-            // Plan validation takes place in the ros2 callback so it should
-            // be safe to subtract the waypoint length.
             released_wp_idx = plan.waypoints.len() - 1;
         }
 
@@ -481,24 +389,6 @@ impl PlanExecutor {
             waypoint_id: released_wp_idx as u64,
             plan_id: plan.plan_id.clone(),
         };
-
-        // Publish PlanRelease
-        if let Some(plan_release_pub) = self.plan_release_publishers.get_mut(robot_id) {
-            let _ = plan_release_pub.publish(pr);
-        } else {
-            let publisher = self
-                .node
-                .create_publisher(
-                    format!("{}/plan/release", robot_id)
-                        .as_str()
-                        .transient_local()
-                        .reliable(),
-                )
-                .unwrap();
-            let _ = publisher.publish(pr);
-            self.plan_release_publishers
-                .insert(robot_id.to_string(), publisher);
-        }
 
         // --- Dynamic grid resizing ---
         let mut min_x = f32::MAX;
@@ -552,7 +442,7 @@ impl PlanExecutor {
         }
         // --- End dynamic grid resizing ---
 
-        // 2. Generate and publish SafeZone
+        // 2. Generate SafeZone
         let mut trajectories = Vec::new();
         let mut footprints = Vec::new();
         let mut current_positions = Vec::new();
@@ -678,38 +568,22 @@ impl PlanExecutor {
             },
         };
 
-        if let Some(safe_zone_pub) = self.safezone_publishers.get_mut(robot_id) {
-            let _ = safe_zone_pub.publish(safe_zone);
-        } else {
-            let publisher = self
-                .node
-                .create_publisher(
-                    format!("{}/plan/safe_zone", robot_id)
-                        .as_str()
-                        .transient_local()
-                        .reliable(),
-                )
-                .unwrap();
-            let _ = publisher.publish(safe_zone);
-            self.safezone_publishers
-                .insert(robot_id.to_string(), publisher);
+        ExecutionStepOutput {
+            plan_release: Some(pr),
+            safe_zone: Some(safe_zone),
+            plan_error,
         }
     }
 
-    fn update_route_blockage(&mut self, robot_id: &str) {
-        let Some(map) = self.latest_map.as_ref() else {
-            return;
-        };
-
-        let Some(state) = self.active_robots.get_mut(robot_id) else {
-            return;
-        };
+    fn update_route_blockage(&mut self, robot_id: &str) -> Option<PlanError> {
+        let map = self.latest_map.as_ref()?;
+        let state = self.active_robots.get_mut(robot_id)?;
         let (Some(plan), Some(odom), Some(follower)) = (
             state.plan.as_ref(),
             state.latest_odom.as_ref(),
             state.waypoint_follower.as_mut(),
         ) else {
-            return;
+            return None;
         };
 
         let remaining = follower.remaining_trajectory();
@@ -726,51 +600,19 @@ impl PlanExecutor {
             .blockage_monitor
             .observe(blocked, &plan_id, Instant::now())
         {
-            return;
+            return None;
         }
 
-        let publisher = match self.plan_error_publishers.entry(robot_id.to_string()) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let topic = format!("{robot_id}/plan/error");
-                match self.node.create_publisher(topic.as_str()) {
-                    Ok(publisher) => entry.insert(publisher),
-                    Err(error) => {
-                        rclrs::log_error!(
-                            self.node.logger(),
-                            "Failed to create plan error publisher for {}: {:?}",
-                            robot_id,
-                            error
-                        );
-                        return;
-                    }
-                }
-            }
-        };
-
-        let error = PlanError {
+        Some(PlanError {
             error: rmf_prototype_msgs::msg::Error {
                 code: PlanError::CODE_PATH_BLOCKED,
                 message: format!("Updated map blocks the remaining route for {robot_id}"),
                 parameters: String::new(),
             },
             plan_id,
-        };
-        if let Err(error) = publisher.publish(error) {
-            rclrs::log_error!(
-                self.node.logger(),
-                "Failed to publish path blockage for {}: {:?}",
-                robot_id,
-                error
-            );
-        } else {
-            rclrs::log_warn!(
-                self.node.logger(),
-                "Updated map blocks the remaining route for {}. Requesting a replan.",
-                robot_id
-            );
-        }
+        })
     }
+
     pub fn to_costmap_msg(
         positions: &[(usize, usize)],
         width: u32,
@@ -809,86 +651,16 @@ impl PlanExecutor {
     }
 }
 
-fn route_intersects_map(map: &OccupancyGrid, route: &[(f32, f32)], radius: f32) -> bool {
-    if route.len() < 2 || map.info.resolution <= 0.0 {
-        return false;
-    }
-
-    let width = map.info.width as isize;
-    let height = map.info.height as isize;
-    if width == 0 || height == 0 {
-        return false;
-    }
-
-    let resolution = map.info.resolution;
-    let q = &map.info.origin.orientation;
-    let yaw = (2.0 * (q.w * q.z + q.x * q.y)).atan2(1.0 - 2.0 * (q.y * q.y + q.z * q.z)) as f32;
-    let cos_yaw = yaw.cos();
-    let sin_yaw = yaw.sin();
-    let origin_x = map.info.origin.position.x as f32;
-    let origin_y = map.info.origin.position.y as f32;
-    let clearance = radius.max(0.0) + resolution * std::f32::consts::FRAC_1_SQRT_2;
-    let clearance_squared = clearance * clearance;
-
-    let to_map = |(x, y): (f32, f32)| {
-        let dx = x - origin_x;
-        let dy = y - origin_y;
-        (cos_yaw * dx + sin_yaw * dy, -sin_yaw * dx + cos_yaw * dy)
-    };
-
-    for segment in route.windows(2) {
-        let start = to_map(segment[0]);
-        let end = to_map(segment[1]);
-        let min_x = (((start.0.min(end.0) - clearance) / resolution).floor() as isize).max(0);
-        let max_x =
-            (((start.0.max(end.0) + clearance) / resolution).floor() as isize).min(width - 1);
-        let min_y = (((start.1.min(end.1) - clearance) / resolution).floor() as isize).max(0);
-        let max_y =
-            (((start.1.max(end.1) + clearance) / resolution).floor() as isize).min(height - 1);
-
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let index = y as usize * width as usize + x as usize;
-                if map.data.get(index).copied().unwrap_or(-1) <= OCCUPIED_THRESHOLD {
-                    continue;
-                }
-
-                let center = ((x as f32 + 0.5) * resolution, (y as f32 + 0.5) * resolution);
-                if distance_squared_to_segment(center, start, end) <= clearance_squared {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-fn distance_squared_to_segment(point: (f32, f32), start: (f32, f32), end: (f32, f32)) -> f32 {
-    let segment = (end.0 - start.0, end.1 - start.1);
-    let length_squared = segment.0 * segment.0 + segment.1 * segment.1;
-    if length_squared <= f32::EPSILON {
-        return (point.0 - start.0).powi(2) + (point.1 - start.1).powi(2);
-    }
-
-    let offset = (point.0 - start.0, point.1 - start.1);
-    let t = ((offset.0 * segment.0 + offset.1 * segment.1) / length_squared).clamp(0.0, 1.0);
-    let closest = (start.0 + t * segment.0, start.1 + t * segment.1);
-    (point.0 - closest.0).powi(2) + (point.1 - closest.1).powi(2)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        route_intersects_map, target_yaw, BlockageMonitor, BLOCKAGE_DEBOUNCE, REPLAN_COOLDOWN,
-    };
+    use super::{target_yaw, PlanExecutor, PlanExecutorConfig};
     use mapf_post::na::{Isometry2, Vector2};
     use mapf_post::{Trajectory, WaypointFollower};
     use ros_env::{
-        nav_msgs::msg::OccupancyGrid,
-        rmf_prototype_msgs::msg::{Plan, PlanId, Waypoint},
+        geometry_msgs::msg::Pose,
+        nav_msgs::msg::{OccupancyGrid, Odometry},
+        rmf_prototype_msgs::msg::{Plan, TrafficDependency, Waypoint},
     };
-    use std::time::Instant;
 
     fn plan_with_positions(positions: &[[f32; 2]]) -> Plan {
         Plan {
@@ -922,71 +694,6 @@ mod tests {
         let plan = plan_with_positions(&[[3.0, 4.0], [3.0, 4.0]]);
 
         assert_eq!(target_yaw(&plan, 1), 0.0);
-    }
-
-    #[test]
-    fn occupied_cell_on_remaining_route_is_blocked() {
-        let mut map = OccupancyGrid::default();
-        map.info.resolution = 1.0;
-        map.info.width = 10;
-        map.info.height = 10;
-        map.info.origin.orientation.w = 1.0;
-        map.data = vec![0; 100];
-        map.data[5 * 10 + 5] = 100;
-
-        assert!(route_intersects_map(&map, &[(1.5, 5.5), (8.5, 5.5)], 0.25));
-        assert!(!route_intersects_map(&map, &[(1.5, 8.5), (8.5, 8.5)], 0.25));
-    }
-
-    #[test]
-    fn blockage_must_persist_before_reporting() {
-        let mut monitor = BlockageMonitor::default();
-        let plan_id = PlanId::default();
-        let start = Instant::now();
-
-        assert!(!monitor.observe(true, &plan_id, start));
-        assert!(!monitor.observe(true, &plan_id, start + BLOCKAGE_DEBOUNCE / 2));
-        assert!(monitor.observe(true, &plan_id, start + BLOCKAGE_DEBOUNCE));
-        let later = start + BLOCKAGE_DEBOUNCE + REPLAN_COOLDOWN;
-        assert!(!monitor.observe(true, &plan_id, later));
-    }
-
-    #[test]
-    fn clear_route_resets_the_debounce_window() {
-        let mut monitor = BlockageMonitor::default();
-        let plan_id = PlanId::default();
-        let start = Instant::now();
-
-        assert!(!monitor.observe(true, &plan_id, start));
-        assert!(!monitor.observe(false, &plan_id, start + BLOCKAGE_DEBOUNCE));
-        assert!(!monitor.observe(true, &plan_id, start + BLOCKAGE_DEBOUNCE));
-        let before_debounce = start + BLOCKAGE_DEBOUNCE * 3 / 2;
-        assert!(!monitor.observe(true, &plan_id, before_debounce));
-        assert!(monitor.observe(true, &plan_id, start + BLOCKAGE_DEBOUNCE * 2));
-    }
-
-    #[test]
-    fn cooldown_delays_a_blockage_on_the_next_plan() {
-        let mut monitor = BlockageMonitor::default();
-        let first_plan = PlanId::default();
-        let second_plan = PlanId {
-            plan_version: 1,
-            ..Default::default()
-        };
-        let start = Instant::now();
-
-        assert!(!monitor.observe(true, &first_plan, start));
-        assert!(monitor.observe(true, &first_plan, start + BLOCKAGE_DEBOUNCE));
-        monitor.begin_plan();
-        let during_cooldown = start + BLOCKAGE_DEBOUNCE * 2;
-        assert!(!monitor.observe(true, &second_plan, during_cooldown));
-        let after_debounce = start + BLOCKAGE_DEBOUNCE * 3;
-        assert!(!monitor.observe(true, &second_plan, after_debounce));
-        assert!(monitor.observe(
-            true,
-            &second_plan,
-            start + BLOCKAGE_DEBOUNCE + REPLAN_COOLDOWN,
-        ));
     }
 
     #[test]
@@ -1028,29 +735,11 @@ mod tests {
         assert_eq!(follower.get_semantic_waypoint().trajectory_index, 6);
 
         follower.update_position_estimate(&Isometry2::new(Vector2::new(10.0, 0.0), 0.0), 0.5);
-        println!(
-            "After reaching 10.0: index is {}",
-            follower.get_semantic_waypoint().trajectory_index
-        );
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(10.0, 0.0), 0.0), 0.5);
-        println!(
-            "After waiting at 10.0 (1st time): index is {}",
-            follower.get_semantic_waypoint().trajectory_index
-        );
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(10.0, 0.0), 0.0), 0.5);
-        println!(
-            "After waiting at 10.0 (2nd time): index is {}",
-            follower.get_semantic_waypoint().trajectory_index
-        );
+        assert!(follower.get_semantic_waypoint().trajectory_index >= 7);
     }
 
     #[test]
     fn test_plan_executor_config_default_and_builders() {
-        use crate::PlanExecutorConfig;
-        use ros_env::geometry_msgs::msg::Pose;
-
         let config = PlanExecutorConfig::default();
         assert_eq!(config.grid_width, 20);
         assert_eq!(config.grid_height, 20);
@@ -1080,88 +769,121 @@ mod tests {
 
     #[test]
     fn test_handle_map() {
-        use crate::PlanExecutor;
-        use rclrs::{Context, CreateBasicExecutor};
-        use ros_env::nav_msgs::msg::OccupancyGrid;
+        let mut plan_executor = PlanExecutor::new();
+        assert_eq!(plan_executor.grid_width, 20);
+        assert_eq!(plan_executor.grid_height, 20);
+        assert_eq!(plan_executor.grid_resolution, 1.0);
 
-        if let Ok(context) = Context::default_from_env() {
-            let executor = context.create_basic_executor();
-            if let Ok(node) = executor.create_node("test_handle_map_node") {
-                let mut plan_executor = PlanExecutor::new(node);
-                assert_eq!(plan_executor.grid_width, 20);
-                assert_eq!(plan_executor.grid_height, 20);
-                assert_eq!(plan_executor.grid_resolution, 1.0);
+        let mut map_msg = OccupancyGrid::default();
+        map_msg.info.width = 150;
+        map_msg.info.height = 200;
+        map_msg.info.resolution = 0.05;
+        map_msg.info.origin.position.x = -15.0;
+        map_msg.info.origin.position.y = -10.0;
+        map_msg.info.origin.orientation.w = 1.0;
 
-                let mut map_msg = OccupancyGrid::default();
-                map_msg.info.width = 150;
-                map_msg.info.height = 200;
-                map_msg.info.resolution = 0.05;
-                map_msg.info.origin.position.x = -15.0;
-                map_msg.info.origin.position.y = -10.0;
-                map_msg.info.origin.orientation.w = 1.0;
+        let errors = plan_executor.handle_map(map_msg);
+        assert!(errors.is_empty());
 
-                plan_executor.handle_map(map_msg);
-
-                assert_eq!(plan_executor.grid_width, 150);
-                assert_eq!(plan_executor.grid_height, 200);
-                assert_eq!(plan_executor.grid_resolution, 0.05);
-                assert_eq!(plan_executor.grid_origin.position.x, -15.0);
-                assert_eq!(plan_executor.grid_origin.position.y, -10.0);
-            }
-        }
+        assert_eq!(plan_executor.grid_width, 150);
+        assert_eq!(plan_executor.grid_height, 200);
+        assert_eq!(plan_executor.grid_resolution, 0.05);
+        assert_eq!(plan_executor.grid_origin.position.x, -15.0);
+        assert_eq!(plan_executor.grid_origin.position.y, -10.0);
     }
 
     #[test]
     fn test_uncommanded_robot_execution() {
-        use crate::PlanExecutor;
-        use rclrs::{Context, CreateBasicExecutor};
-        use ros_env::nav_msgs::msg::Odometry;
-        use ros_env::rmf_prototype_msgs::msg::{Plan, Waypoint};
+        let mut plan_executor = PlanExecutor::new();
 
-        if let Ok(context) = Context::default_from_env() {
-            let executor = context.create_basic_executor();
-            if let Ok(node) = executor.create_node("test_uncommanded_robot_node") {
-                let mut plan_executor = PlanExecutor::new(node);
+        // Add two robots
+        assert!(plan_executor.handle_robot_added("robot_1", 0.5));
+        assert!(plan_executor.handle_robot_added("robot_2", 0.5));
 
-                // Add two robots
-                plan_executor.handle_robot_added("robot_1", 0.5);
-                plan_executor.handle_robot_added("robot_2", 0.5);
+        // Send odometry for both robots
+        let mut odom1 = Odometry::default();
+        odom1.pose.pose.position.x = 0.0;
+        odom1.pose.pose.position.y = 0.0;
+        let out1 = plan_executor.handle_odometry("robot_1", odom1.clone());
+        assert!(out1.plan_release.is_none());
+        assert!(out1.safe_zone.is_none());
 
-                // Send odometry for both robots
-                let mut odom1 = Odometry::default();
-                odom1.pose.pose.position.x = 0.0;
-                odom1.pose.pose.position.y = 0.0;
-                plan_executor.handle_odometry("robot_1", odom1.clone());
+        let mut odom2 = Odometry::default();
+        odom2.pose.pose.position.x = 5.0;
+        odom2.pose.pose.position.y = 5.0;
+        let out2 = plan_executor.handle_odometry("robot_2", odom2.clone());
+        assert!(out2.plan_release.is_none());
+        assert!(out2.safe_zone.is_none());
 
-                let mut odom2 = Odometry::default();
-                odom2.pose.pose.position.x = 5.0;
-                odom2.pose.pose.position.y = 5.0;
-                plan_executor.handle_odometry("robot_2", odom2.clone());
+        // Only give a plan to robot_1. robot_2 remains uncommanded!
+        let mut plan1 = Plan::default();
+        let mut wp0 = Waypoint::default();
+        wp0.position = [0.0, 0.0];
+        let mut wp1 = Waypoint::default();
+        wp1.position = [2.0, 0.0];
+        plan1.waypoints = vec![wp0, wp1];
 
-                // Only give a plan to robot_1. robot_2 remains uncommanded!
-                let mut plan1 = Plan::default();
-                let mut wp0 = Waypoint::default();
-                wp0.position = vec![0.0, 0.0].try_into().unwrap();
-                let mut wp1 = Waypoint::default();
-                wp1.position = vec![2.0, 0.0].try_into().unwrap();
-                plan1.waypoints = vec![wp0, wp1];
+        assert!(plan_executor.handle_plan("robot_1", plan1));
 
-                plan_executor.handle_plan("robot_1", plan1);
+        // robot_1 odometry arrives: it should execute without error even though robot_2 has no plan!
+        let out1 = plan_executor.handle_odometry("robot_1", odom1);
+        assert!(out1.plan_release.is_some());
+        assert_eq!(out1.plan_release.unwrap().waypoint_id, 1);
+        assert!(out1.safe_zone.is_some());
 
-                // robot_1 odometry arrives: it should execute without error even though robot_2 has no plan!
-                plan_executor.handle_odometry("robot_1", odom1);
+        // robot_2 has no plan, so its odometry produces no release or safe zone
+        let out2 = plan_executor.handle_odometry("robot_2", odom2);
+        assert!(out2.plan_release.is_none());
+        assert!(out2.safe_zone.is_none());
+    }
 
-                // Verify robot_1 published plan release and safe zone
-                assert!(plan_executor
-                    .plan_release_publishers
-                    .contains_key("robot_1"));
-                assert!(plan_executor.safezone_publishers.contains_key("robot_1"));
+    #[test]
+    fn test_blocker_holds_and_releases_plan() {
+        let mut plan_executor = PlanExecutor::new();
+        plan_executor.handle_robot_added("robot_1", 0.5);
+        plan_executor.handle_robot_added("robot_2", 0.5);
 
-                // robot_2 has no plan, so it does not create publishers
-                assert!(!plan_executor
-                    .plan_release_publishers
-                    .contains_key("robot_2"));
-            }
-        }
+        // robot_1 moves from (0,0) -> (1,0) -> (2,0), blocked at wp 1 until robot_2 reaches wp 1
+        let mut wp0_r1 = Waypoint::default();
+        wp0_r1.position = [0.0, 0.0];
+        let mut wp1_r1 = Waypoint::default();
+        wp1_r1.position = [1.0, 0.0];
+        wp1_r1.departure_blockers = vec![TrafficDependency {
+            name: "robot_2".to_string(),
+            required_progress: 1.0,
+            ..Default::default()
+        }];
+        let mut wp2_r1 = Waypoint::default();
+        wp2_r1.position = [2.0, 0.0];
+
+        let mut plan1 = Plan::default();
+        plan1.waypoints = vec![wp0_r1, wp1_r1, wp2_r1];
+
+        let plan2 = plan_with_positions(&[[0.0, 5.0], [2.0, 5.0]]);
+
+        plan_executor.handle_plan("robot_1", plan1);
+        plan_executor.handle_plan("robot_2", plan2);
+
+        let mut odom2 = Odometry::default();
+        odom2.pose.pose.position.x = 0.0;
+        odom2.pose.pose.position.y = 5.0;
+        plan_executor.handle_odometry("robot_2", odom2);
+
+        let mut odom1 = Odometry::default();
+        odom1.pose.pose.position.x = 0.0;
+        odom1.pose.pose.position.y = 0.0;
+        let out1 = plan_executor.handle_odometry("robot_1", odom1.clone());
+        // Held at waypoint 1 because robot_2 is still at waypoint 0
+        assert_eq!(out1.plan_release.unwrap().waypoint_id, 1);
+
+        // Advance robot_2 to waypoint 1 (2.0, 5.0)
+        let mut odom2_reached = Odometry::default();
+        odom2_reached.pose.pose.position.x = 2.0;
+        odom2_reached.pose.pose.position.y = 5.0;
+        plan_executor.handle_odometry("robot_2", odom2_reached);
+
+        // Now robot_1 should be released up to waypoint 2
+        let out1_released = plan_executor.handle_odometry("robot_1", odom1);
+        assert_eq!(out1_released.plan_release.unwrap().waypoint_id, 2);
     }
 }
