@@ -28,6 +28,7 @@ from rmf_prototype_msgs.msg import (
     Participant,
     ParticipantList,
     Region,
+    TargetOrientation,
     TargetRegion,
 )
 
@@ -61,7 +62,7 @@ class TestReservation(unittest.TestCase):
     def tearDown(self):
         self.node.destroy_node()
 
-    def create_goal(self, session_id, x, y, size):
+    def create_goal(self, session_id, x, y, size, orientation_rad=-1.5707963):
         msg = DestinationGoal()
         msg.session.uuid = [session_id] * 16
         constraint = DestinationConstraints()
@@ -73,6 +74,9 @@ class TestReservation(unittest.TestCase):
             float(x + size),
             float(y + size),
         ]
+        target_ori = TargetOrientation()
+        target_ori.orientation_radians = float(orientation_rad)
+        target_region.orientations.append(target_ori)
         constraint.regions.append(target_region)
         msg.one_of.append(constraint)
         return msg
@@ -124,7 +128,7 @@ class TestReservation(unittest.TestCase):
 
         time.sleep(0.5)
 
-        goal = self.create_goal(1, 0.0, 0.0, 1.0)
+        goal = self.create_goal(1, 0.0, 0.0, 1.0, orientation_rad=-1.5707963)
 
         start_time = time.time()
         timeout = 5.0
@@ -139,4 +143,12 @@ class TestReservation(unittest.TestCase):
         self.assertTrue(
             len(received_dest) > 0,
             'Did not receive Destination message',
+        )
+        dest_msg = received_dest[-1]
+        self.assertGreater(len(dest_msg.constraints.regions), 0)
+        self.assertGreater(len(dest_msg.constraints.regions[0].orientations), 0)
+        self.assertAlmostEqual(
+            dest_msg.constraints.regions[0].orientations[0].orientation_radians,
+            -1.5707963,
+            places=5,
         )
