@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
-use rmf_plan_executor::{PlanExecutor, PlanExecutorConfig};
+use rmf_plan_executor::{PlanExecutorConfig, PlanExecutorRosNode};
 use ros_env::geometry_msgs::msg::Pose;
 use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
 use ros_env::rmf_prototype_msgs::msg::{ParticipantList, Plan};
@@ -21,18 +21,18 @@ use std::collections::HashMap;
 use std::env;
 
 struct RobotConnections {
-    _odom_subscription: rclrs::WorkerSubscription<Odometry, PlanExecutor>,
-    _plan_subscription: rclrs::WorkerSubscription<Plan, PlanExecutor>,
+    _odom_subscription: rclrs::WorkerSubscription<Odometry, PlanExecutorRosNode>,
+    _plan_subscription: rclrs::WorkerSubscription<Plan, PlanExecutorRosNode>,
 }
 
 struct ExecutorDiscoveryServer {
     node: rclrs::Node,
     active_robots: HashMap<String, RobotConnections>,
-    executor_worker: rclrs::Worker<PlanExecutor>,
+    executor_worker: rclrs::Worker<PlanExecutorRosNode>,
 }
 
 impl ExecutorDiscoveryServer {
-    fn new(node: rclrs::Node, executor_worker: rclrs::Worker<PlanExecutor>) -> Self {
+    fn new(node: rclrs::Node, executor_worker: rclrs::Worker<PlanExecutorRosNode>) -> Self {
         Self {
             node,
             active_robots: HashMap::new(),
@@ -150,12 +150,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Create the executor worker
-    let executor_worker = node.create_worker(PlanExecutor::with_config(node.clone(), config));
+    let executor_worker =
+        node.create_worker(PlanExecutorRosNode::with_config(node.clone(), config));
 
     // Subscribe to map to auto-reconfigure grid size, resolution, and origin
     let _map_subscription = executor_worker.create_subscription::<OccupancyGrid, _>(
         "/map".transient_local().reliable(),
-        move |executor: &mut PlanExecutor, msg: OccupancyGrid| {
+        move |executor: &mut PlanExecutorRosNode, msg: OccupancyGrid| {
             executor.handle_map(msg);
         },
     )?;
@@ -173,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .transient_local()
             .reliable()
             .keep_last(10),
-        move |executor: &mut PlanExecutor, msg: ParticipantList| {
+        move |executor: &mut PlanExecutorRosNode, msg: ParticipantList| {
             let (added, removed) = tracker.update(&msg);
             for robot_id in removed {
                 executor.handle_robot_removed(&robot_id);
@@ -205,7 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let odom_sub = match server.executor_worker.create_subscription::<Odometry, _>(
                     odom_topic.as_str().reliable(),
-                    move |executor: &mut PlanExecutor, msg: Odometry| {
+                    move |executor: &mut PlanExecutorRosNode, msg: Odometry| {
                         executor.handle_odometry(&robot_id_clone, msg);
                     },
                 ) {
@@ -223,7 +224,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let plan_sub = match server.executor_worker.create_subscription::<Plan, _>(
                     plan_topic.as_str().transient_local().reliable(),
-                    move |executor: &mut PlanExecutor, msg: Plan| {
+                    move |executor: &mut PlanExecutorRosNode, msg: Plan| {
                         executor.handle_plan(&robot_id_clone2, msg);
                     },
                 ) {
