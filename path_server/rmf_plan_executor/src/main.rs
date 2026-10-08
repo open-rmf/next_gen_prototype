@@ -199,6 +199,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     robot_id
                 );
 
+                let register_id = robot_id.to_string();
+                std::mem::drop(server.executor_worker.run(
+                    move |executor: &mut PlanExecutorRosNode| {
+                        executor.handle_robot_added(&register_id, 0.49);
+                    },
+                ));
+
                 let robot_id_clone = robot_id.to_string();
                 let robot_id_clone2 = robot_id.to_string();
                 let odom_topic = robot_id.to_string() + "/odom";

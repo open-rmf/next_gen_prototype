@@ -52,6 +52,7 @@ fn parking_constraints(spot: &ParkingSpot) -> DomainDestinationConstraints {
                 points: spot.region.points.clone(),
                 hint: spot.region.hint,
             },
+            orientations: Vec::new(),
         }],
     }
 }
@@ -336,6 +337,7 @@ mod tests {
                         hint: DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE,
                         points,
                     },
+                    orientations: Vec::new(),
                 }],
             }],
             cost_bias: vec![],

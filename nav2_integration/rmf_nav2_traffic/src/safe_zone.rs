@@ -56,7 +56,40 @@ impl CurrentSafeZone {
             return true;
         }
 
+        // Resend when targeting a new waypoint in the plan (e.g. short step or final approach).
+        if !other.target_waypoint.is_empty() && current.target_waypoint != other.target_waypoint {
+            return true;
+        }
+
+        // Resend if target orientation has significantly changed.
+        if let (Some(cur_yaw), Some(other_yaw)) =
+            (Self::get_orientation(current), Self::get_orientation(other))
+        {
+            let diff = (cur_yaw - other_yaw)
+                .abs()
+                .rem_euclid(std::f32::consts::TAU);
+            let norm_diff = diff.min(std::f32::consts::TAU - diff);
+            if norm_diff > 0.05 {
+                return true;
+            }
+        }
+
         self.distancesq_to_target(other) >= 0.5
+    }
+
+    fn get_orientation(safe_zone: &SafeZone) -> Option<f32> {
+        safe_zone
+            .incremental_target
+            .regions
+            .first()
+            .and_then(|r| r.orientations.first().map(|o| o.orientation_radians))
+            .or_else(|| {
+                safe_zone
+                    .incremental_target
+                    .nodes
+                    .first()
+                    .and_then(|n| n.orientations.first().map(|o| o.orientation_radians))
+            })
     }
 
     pub fn distancesq_to_target(&self, other: &SafeZone) -> f64 {
@@ -382,5 +415,41 @@ mod tests {
         let next = safe_zone(2, 3, 0, 4.0, 4.0);
 
         assert!(current.should_update_target(&next));
+    }
+
+    #[test]
+    fn target_update_sent_when_waypoint_advances_even_if_nearby() {
+        let mut current_sz = safe_zone(1, 0, 0, 0.0, 2.0);
+        current_sz.target_waypoint = vec![0].try_into().unwrap();
+        let current = CurrentSafeZone(Some(current_sz));
+
+        // Next waypoint is only 0.5m away (distancesq = 0.25 < 0.5)
+        let mut next_sz = safe_zone(1, 0, 1, 0.0, 1.5);
+        next_sz.target_waypoint = vec![1].try_into().unwrap();
+
+        assert!(current.should_update_target(&next_sz));
+    }
+
+    #[test]
+    fn target_update_sent_when_orientation_changes() {
+        use ros_env::rmf_prototype_msgs::msg::TargetOrientation;
+
+        let mut current_sz = safe_zone(1, 0, 0, 0.0, 1.5);
+        let mut ori1 = TargetOrientation::default();
+        ori1.orientation_radians = 0.0;
+        current_sz.incremental_target.regions[0]
+            .orientations
+            .push(ori1);
+        let current = CurrentSafeZone(Some(current_sz));
+
+        // Same position, but orientation changes to -pi/2
+        let mut next_sz = safe_zone(1, 0, 1, 0.0, 1.5);
+        let mut ori2 = TargetOrientation::default();
+        ori2.orientation_radians = -std::f32::consts::FRAC_PI_2;
+        next_sz.incremental_target.regions[0]
+            .orientations
+            .push(ori2);
+
+        assert!(current.should_update_target(&next_sz));
     }
 }

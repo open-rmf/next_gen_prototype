@@ -300,6 +300,22 @@ impl MapfPlanner for PibtPlanner {
             }
         }
 
+        // Clamp the final waypoint to exact goal coordinates to prevent coarse grid discretization errors
+        for (agent_idx, id) in robot_ids.iter().enumerate() {
+            if let Some(dest) = goals.get(id) {
+                if let Some(region) = dest.constraints.regions.first() {
+                    if region.region.points.len() >= 2 {
+                        let gx_f32 = region.region.points[0];
+                        let gy_f32 = region.region.points[1];
+                        if let Some(last_pose) = trajectories[agent_idx].last_mut() {
+                            last_pose.translation.vector[0] = gx_f32;
+                            last_pose.translation.vector[1] = gy_f32;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(trajectories)
     }
 }
@@ -307,6 +323,7 @@ impl MapfPlanner for PibtPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ros_env::rmf_prototype_msgs::msg::{Region, TargetRegion};
 
     #[test]
     fn fine_occupancy_cells_are_conservatively_downsampled() {
@@ -367,5 +384,38 @@ mod tests {
         assert!(PibtPlanner::with_grid_resolution(100, 0.5).is_ok());
         assert!(PibtPlanner::with_grid_resolution(100, 0.0).is_err());
         assert!(PibtPlanner::with_grid_resolution(100, -0.5).is_err());
+    }
+
+    #[test]
+    fn final_waypoint_clamped_to_exact_goal_coordinates() {
+        let planner = PibtPlanner::default();
+        let mut starts = HashMap::new();
+        let mut odom = Odometry::default();
+        odom.pose.pose.position.x = 0.0;
+        odom.pose.pose.position.y = 0.0;
+        starts.insert("robot_1".to_string(), odom);
+
+        let mut goals = HashMap::new();
+        let mut dest = Destination::default();
+        dest.constraints.regions.push(TargetRegion {
+            region: Region {
+                points: vec![2.35, 1.75],
+                hint: Region::HINT_POINT,
+            },
+            ..Default::default()
+        });
+        goals.insert("robot_1".to_string(), dest);
+
+        let footprints = HashMap::new();
+        let robot_ids = vec!["robot_1".to_string()];
+        let map = Map::default();
+        let cancellation = Arc::new(AtomicBool::new(false));
+
+        let trajectories = planner
+            .plan(&starts, &goals, &footprints, &robot_ids, &map, cancellation)
+            .unwrap();
+        let last_pose = trajectories[0].last().unwrap();
+        assert!((last_pose.translation.x - 2.35).abs() < 1e-6);
+        assert!((last_pose.translation.y - 1.75).abs() < 1e-6);
     }
 }

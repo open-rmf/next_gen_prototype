@@ -127,6 +127,19 @@ fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
     let Some(target) = plan.waypoints.get(target_idx) else {
         return 0.0;
     };
+
+    for node in &target.arrival_constraints.nodes {
+        if let Some(target_ori) = node.orientations.first() {
+            return target_ori.orientation_radians;
+        }
+    }
+
+    for region in &target.arrival_constraints.regions {
+        if let Some(target_ori) = region.orientations.first() {
+            return target_ori.orientation_radians;
+        }
+    }
+
     let [target_x, target_y] = target.position;
 
     for waypoint in plan.waypoints[..target_idx].iter().rev() {
@@ -694,6 +707,21 @@ mod tests {
         let plan = plan_with_positions(&[[3.0, 4.0], [3.0, 4.0]]);
 
         assert_eq!(target_yaw(&plan, 1), 0.0);
+    }
+
+    #[test]
+    fn target_yaw_prefers_explicit_arrival_constraint_orientation() {
+        use ros_env::rmf_prototype_msgs::msg::{TargetOrientation, TargetRegion};
+
+        let mut plan = plan_with_positions(&[[0.0, 0.0], [5.0, 0.0]]);
+        let mut region = TargetRegion::default();
+        region.orientations.push(TargetOrientation {
+            orientation_radians: -std::f32::consts::FRAC_PI_2,
+            ..Default::default()
+        });
+        plan.waypoints[1].arrival_constraints.regions.push(region);
+
+        assert!((target_yaw(&plan, 1) - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-6);
     }
 
     #[test]
