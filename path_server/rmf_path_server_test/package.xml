@@ -12,14 +12,19 @@
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
+  <test_depend>geometry_msgs</test_depend>
   <test_depend>launch_testing</test_depend>
   <test_depend>launch_testing_ros</test_depend>
+  <test_depend>nav2_msgs</test_depend>
+  <test_depend>nav_msgs</test_depend>
   <test_depend>python3-pytest</test_depend>
   <test_depend>rclpy</test_depend>
   <test_depend>rmf_mock_robot_sim</test_depend>
+  <test_depend>rmf_nav2_traffic</test_depend>
   <test_depend>rmf_path_server</test_depend>
   <test_depend>rmf_plan_executor</test_depend>
   <test_depend>rmf_prototype_msgs</test_depend>
+  <test_depend>rmf_reservation_destination_server</test_depend>
   
   <export>
     <build_type>ament_python</build_type>
