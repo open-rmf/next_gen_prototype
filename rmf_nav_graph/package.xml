@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rmf_nav_graph</name>
+  <version>0.0.1</version>
+  <description>Shared navigation graph parsing for the RMF next generation prototype. Loads a .site.json into an in-memory vertex index so that both the traffic planner and the plan executor can resolve named locations and dock geometry from the same source.</description>
+  <maintainer email="arjoc@google.com">Arjoc</maintainer>
+  <license>Apache License 2.0</license>
+
+  <buildtool_depend>ament_cargo</buildtool_depend>
+
+  <build_depend>rmf_prototype_msgs</build_depend>
+
+  <exec_depend>rmf_prototype_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_cargo</build_type>
+  </export>
+</package>

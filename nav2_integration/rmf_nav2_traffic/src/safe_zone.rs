@@ -346,8 +346,10 @@ fn next_target(safe_zone: &SafeZone) -> Option<(f32, f32, f32)> {
             // TODO(@xiyuoh) some processing using spread and tolerance
         }
     }
-    for _target_node in constraints.nodes.iter() {
-        // TODO(@xiyuoh)
+    for target_node in constraints.nodes.iter() {
+        for target_ori in target_node.orientations.iter() {
+            yaw = Some(target_ori.orientation_radians);
+        }
     }
 
     xy.zip(yaw).map(|((x, y), yaw)| (x, y, yaw))

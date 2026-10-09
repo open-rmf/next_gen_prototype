@@ -23,7 +23,7 @@ use ros_env::rmf_next_gen_reservation_msgs::msg::{
 };
 use ros_env::rmf_prototype_msgs::msg::{
     Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, Region,
-    TargetOrientation, TargetRegion,
+    TargetNode, TargetOrientation, TargetRegion,
 };
 use ros_env::unique_identifier_msgs::msg::UUID;
 use std::collections::HashMap;
@@ -113,6 +113,7 @@ impl DomainTargetRegion {
 #[derive(Clone, Debug, PartialEq)]
 struct DomainDestinationConstraints {
     pub regions: Vec<DomainTargetRegion>,
+    pub nodes: Vec<TargetNode>,
 }
 
 impl DomainDestinationConstraints {
@@ -123,12 +124,14 @@ impl DomainDestinationConstraints {
                 .iter()
                 .map(DomainTargetRegion::from_ros)
                 .collect(),
+            nodes: ros.nodes.clone(),
         }
     }
 
     fn to_ros(&self) -> DestinationConstraints {
         DestinationConstraints {
             regions: self.regions.iter().map(|r| r.to_ros()).collect(),
+            nodes: self.nodes.clone(),
             ..Default::default()
         }
     }
@@ -767,6 +770,7 @@ mod tests {
                     },
                     orientations: Vec::new(),
                 }],
+                nodes: vec![],
             },
             DomainDestinationConstraints {
                 regions: vec![DomainTargetRegion {
@@ -777,6 +781,7 @@ mod tests {
                     },
                     orientations: Vec::new(),
                 }],
+                nodes: vec![],
             },
         ];
 
@@ -822,5 +827,47 @@ mod tests {
         let domain = DomainTargetRegion::from_ros(&ros_region);
         let roundtrip = domain.to_ros();
         assert_eq!(roundtrip.orientations, ros_region.orientations);
+    }
+
+    #[test]
+    fn test_destination_ros_roundtrip() {
+        let mut ros_goal = DestinationGoal::default();
+        ros_goal.session.uuid = [5; 16];
+        let mut constraint = DestinationConstraints::default();
+        let mut target_node = TargetNode::default();
+        target_node.key.key = vec![42].try_into().unwrap();
+        target_node.key.name = vec!["dock_spot".to_string().into()].try_into().unwrap();
+        constraint.nodes.push(target_node);
+        ros_goal.one_of.push(constraint);
+
+        let domain_goal = DomainDestinationGoal::from_ros(&ros_goal);
+        assert_eq!(domain_goal.one_of.len(), 1);
+        assert_eq!(domain_goal.one_of[0].nodes.len(), 1);
+        assert_eq!(domain_goal.one_of[0].nodes[0].key.key.as_slice(), &[42]);
+        assert_eq!(
+            domain_goal.one_of[0].nodes[0]
+                .key
+                .name
+                .first()
+                .map(|s| s.to_string()),
+            Some("dock_spot".to_string())
+        );
+
+        let domain_dest = DomainDestination {
+            constraints: domain_goal.one_of[0].clone(),
+            session: domain_goal.session,
+            detour_for_goal: None,
+        };
+        let ros_dest = domain_dest.to_ros();
+        assert_eq!(ros_dest.constraints.nodes.len(), 1);
+        assert_eq!(ros_dest.constraints.nodes[0].key.key.as_slice(), &[42]);
+        assert_eq!(
+            ros_dest.constraints.nodes[0]
+                .key
+                .name
+                .first()
+                .map(|s| s.to_string()),
+            Some("dock_spot".to_string())
+        );
     }
 }

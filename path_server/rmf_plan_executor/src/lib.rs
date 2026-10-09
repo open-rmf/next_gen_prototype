@@ -357,6 +357,18 @@ impl PlanExecutor {
         let mut released_wp_idx = curr_wp_idx;
         while released_wp_idx < plan.waypoints.len() {
             let wp = &plan.waypoints[released_wp_idx];
+            if released_wp_idx > curr_wp_idx
+                && (!wp.arrival_constraints.nodes.is_empty()
+                    || wp
+                        .arrival_constraints
+                        .regions
+                        .iter()
+                        .any(|r| !r.orientations.is_empty())
+                    || !wp.arrival_action.is_empty()
+                    || !wp.departure_action.is_empty())
+            {
+                break;
+            }
             let mut blocked = false;
             for blocker in &wp.departure_blockers {
                 if let Some(blocker_sem) = semantic_waypoints.get(&blocker.name) {
@@ -532,10 +544,37 @@ impl PlanExecutor {
             .get_alloc_for_agent(agent_idx)
             .unwrap_or_default();
 
-        let target_x = plan.waypoints[released_wp_idx].position[0];
-        let target_y = plan.waypoints[released_wp_idx].position[1];
+        let target_wp = &plan.waypoints[released_wp_idx];
+        let target_x = target_wp.position[0];
+        let target_y = target_wp.position[1];
         let target_yaw = target_yaw(plan, released_wp_idx);
-        let target_progress = plan.waypoints[released_wp_idx].progress;
+        let target_progress = target_wp.progress;
+        let explicit_orientation = target_wp
+            .arrival_constraints
+            .nodes
+            .iter()
+            .find_map(|n| n.orientations.first().cloned())
+            .or_else(|| {
+                target_wp
+                    .arrival_constraints
+                    .regions
+                    .iter()
+                    .find_map(|r| r.orientations.first().cloned())
+            });
+        let target_orientation = explicit_orientation.clone().unwrap_or(TargetOrientation {
+            // Avoid turning in place at hold points.
+            orientation_radians: target_yaw,
+            spread_radians: 0.0,
+            tolerance_radians: 0.0,
+        });
+        let mut target_nodes = target_wp.arrival_constraints.nodes.clone();
+        if let Some(ref ori) = explicit_orientation {
+            for node in &mut target_nodes {
+                if node.orientations.is_empty() {
+                    node.orientations.push(ori.clone());
+                }
+            }
+        }
 
         let costmap = Self::to_costmap_msg(
             &positions,
@@ -562,14 +601,9 @@ impl PlanExecutor {
                         points: vec![target_x, target_y],
                         hint: rmf_prototype_msgs::msg::Region::HINT_POINT,
                     },
-                    orientations: vec![TargetOrientation {
-                        // Avoid turning in place at hold points.
-                        orientation_radians: target_yaw,
-                        spread_radians: 0.0,
-                        tolerance_radians: 0.0,
-                    }],
+                    orientations: vec![target_orientation],
                 }],
-                nodes: vec![],
+                nodes: target_nodes,
             },
             costmap,
             target_waypoint: vec![released_wp_idx as u64].try_into().unwrap(),
@@ -913,5 +947,220 @@ mod tests {
         // Now robot_1 should be released up to waypoint 2
         let out1_released = plan_executor.handle_odometry("robot_1", odom1);
         assert_eq!(out1_released.plan_release.unwrap().waypoint_id, 2);
+    }
+
+    #[test]
+    fn test_safe_zone_forwards_target_nodes() {
+        use ros_env::rmf_prototype_msgs::msg::{GraphElementKey, TargetNode, TargetOrientation};
+
+        let mut plan_executor = PlanExecutor::new();
+        plan_executor.handle_robot_added("robot_1", 0.5);
+
+        let mut plan = plan_with_positions(&[[0.0, 0.0], [2.0, 0.0]]);
+        let mut key = GraphElementKey::default();
+        key.key = vec![42i64].try_into().unwrap();
+        key.name = vec!["station_alpha".to_string().into()].try_into().unwrap();
+        plan.waypoints[1]
+            .arrival_constraints
+            .nodes
+            .push(TargetNode {
+                key,
+                orientations: vec![TargetOrientation {
+                    orientation_radians: std::f32::consts::FRAC_PI_2,
+                    ..Default::default()
+                }],
+            });
+
+        assert!(plan_executor.handle_plan("robot_1", plan));
+
+        let mut odom = Odometry::default();
+        odom.pose.pose.position.x = 0.0;
+        odom.pose.pose.position.y = 0.0;
+        let out = plan_executor.handle_odometry("robot_1", odom);
+
+        let sz = out.safe_zone.expect("SafeZone should be emitted");
+        assert_eq!(sz.incremental_target.nodes.len(), 1);
+        assert_eq!(sz.incremental_target.nodes[0].key.key.as_slice(), &[42]);
+        assert_eq!(
+            sz.incremental_target.nodes[0]
+                .key
+                .name
+                .first()
+                .map(|s| s.to_string()),
+            Some("station_alpha".to_string())
+        );
+        assert!(
+            (sz.incremental_target.regions[0].orientations[0].orientation_radians
+                - std::f32::consts::FRAC_PI_2)
+                .abs()
+                < 1e-5
+        );
+    }
+
+    #[test]
+    fn test_intermediate_target_nodes_are_not_skipped() {
+        use ros_env::rmf_prototype_msgs::msg::{GraphElementKey, TargetNode};
+
+        let mut plan_executor = PlanExecutor::new();
+        plan_executor.handle_robot_added("robot_1", 0.5);
+
+        let mut plan = plan_with_positions(&[[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]]);
+
+        let mut door_key = GraphElementKey::default();
+        door_key.key = vec![10i64].try_into().unwrap();
+        door_key.name = vec!["door_entry".to_string().into()].try_into().unwrap();
+        plan.waypoints[1]
+            .arrival_constraints
+            .nodes
+            .push(TargetNode {
+                key: door_key,
+                orientations: vec![],
+            });
+
+        let mut dock_key = GraphElementKey::default();
+        dock_key.key = vec![42i64].try_into().unwrap();
+        dock_key.name = vec!["dock_station".to_string().into()].try_into().unwrap();
+        plan.waypoints[2]
+            .arrival_constraints
+            .nodes
+            .push(TargetNode {
+                key: dock_key,
+                orientations: vec![],
+            });
+
+        assert!(plan_executor.handle_plan("robot_1", plan));
+
+        // 1. At start (0, 0), execution must gate at intermediate node wp[1] ("door_entry")
+        let mut odom_start = Odometry::default();
+        odom_start.pose.pose.position.x = 0.0;
+        odom_start.pose.pose.position.y = 0.0;
+        let out1 = plan_executor.handle_odometry("robot_1", odom_start);
+
+        assert_eq!(out1.plan_release.unwrap().waypoint_id, 1);
+        let sz1 = out1.safe_zone.expect("SafeZone should be emitted at start");
+        assert_eq!(sz1.target_waypoint.as_slice(), &[1]);
+        assert_eq!(sz1.incremental_target.nodes.len(), 1);
+        assert_eq!(sz1.incremental_target.nodes[0].key.key.as_slice(), &[10]);
+        assert_eq!(
+            sz1.incremental_target.nodes[0]
+                .key
+                .name
+                .first()
+                .map(|s| s.to_string()),
+            Some("door_entry".to_string())
+        );
+
+        // 2. Once robot reaches wp[1] (2, 0), execution releases to wp[2] ("dock_station")
+        let mut odom_door = Odometry::default();
+        odom_door.pose.pose.position.x = 2.0;
+        odom_door.pose.pose.position.y = 0.0;
+        let out2 = plan_executor.handle_odometry("robot_1", odom_door);
+
+        assert_eq!(out2.plan_release.unwrap().waypoint_id, 2);
+        let sz2 = out2
+            .safe_zone
+            .expect("SafeZone should be emitted at door_entry");
+        assert_eq!(sz2.target_waypoint.as_slice(), &[2]);
+        assert_eq!(sz2.incremental_target.nodes.len(), 1);
+        assert_eq!(sz2.incremental_target.nodes[0].key.key.as_slice(), &[42]);
+        assert_eq!(
+            sz2.incremental_target.nodes[0]
+                .key
+                .name
+                .first()
+                .map(|s| s.to_string()),
+            Some("dock_station".to_string())
+        );
+    }
+
+    #[test]
+    fn test_intermediate_node_orientation_constraints_are_gated_and_forwarded() {
+        use ros_env::rmf_prototype_msgs::msg::{
+            GraphElementKey, TargetNode, TargetOrientation, TargetRegion,
+        };
+
+        let mut plan_executor = PlanExecutor::new();
+        plan_executor.handle_robot_added("robot_1", 0.5);
+
+        let mut plan = plan_with_positions(&[[0.0, 0.0], [2.0, 0.0], [4.0, 0.0], [6.0, 0.0]]);
+
+        // Intermediate wp[1] has a TargetNode with an orientation constraint (-pi/2)
+        let mut staging_key = GraphElementKey::default();
+        staging_key.key = vec![13i64].try_into().unwrap();
+        staging_key.name = vec!["staging_node".to_string().into()].try_into().unwrap();
+        plan.waypoints[1]
+            .arrival_constraints
+            .nodes
+            .push(TargetNode {
+                key: staging_key,
+                orientations: vec![TargetOrientation {
+                    orientation_radians: -std::f32::consts::FRAC_PI_2,
+                    spread_radians: 0.0,
+                    tolerance_radians: 0.05,
+                }],
+            });
+
+        // Intermediate wp[2] has a region orientation constraint (pi) without a TargetNode
+        let mut reg = TargetRegion::default();
+        reg.orientations.push(TargetOrientation {
+            orientation_radians: std::f32::consts::PI,
+            spread_radians: 0.0,
+            tolerance_radians: 0.1,
+        });
+        plan.waypoints[2].arrival_constraints.regions.push(reg);
+
+        assert!(plan_executor.handle_plan("robot_1", plan));
+
+        // 1. At start (0, 0), execution gates at wp[1] and forwards its orientation (-pi/2)
+        let mut odom0 = Odometry::default();
+        odom0.pose.pose.position.x = 0.0;
+        odom0.pose.pose.position.y = 0.0;
+        let out1 = plan_executor.handle_odometry("robot_1", odom0);
+        assert_eq!(out1.plan_release.unwrap().waypoint_id, 1);
+        let sz1 = out1.safe_zone.expect("SafeZone should be emitted at start");
+        assert_eq!(sz1.target_waypoint.as_slice(), &[1]);
+        assert!(
+            (sz1.incremental_target.regions[0].orientations[0].orientation_radians
+                - (-std::f32::consts::FRAC_PI_2))
+                .abs()
+                < 1e-5
+        );
+        assert!(
+            (sz1.incremental_target.regions[0].orientations[0].tolerance_radians - 0.05).abs()
+                < 1e-5
+        );
+        assert_eq!(sz1.incremental_target.nodes.len(), 1);
+        assert!(
+            (sz1.incremental_target.nodes[0].orientations[0].orientation_radians
+                - (-std::f32::consts::FRAC_PI_2))
+                .abs()
+                < 1e-5
+        );
+
+        // 2. At wp[1] (2, 0), execution gates at wp[2] and forwards its region orientation (pi)
+        let mut odom1 = Odometry::default();
+        odom1.pose.pose.position.x = 2.0;
+        odom1.pose.pose.position.y = 0.0;
+        let out2 = plan_executor.handle_odometry("robot_1", odom1);
+        assert_eq!(out2.plan_release.unwrap().waypoint_id, 2);
+        let sz2 = out2.safe_zone.expect("SafeZone should be emitted at wp[1]");
+        assert_eq!(sz2.target_waypoint.as_slice(), &[2]);
+        assert!(
+            (sz2.incremental_target.regions[0].orientations[0].orientation_radians
+                - std::f32::consts::PI)
+                .abs()
+                < 1e-5
+        );
+        assert!(
+            (sz2.incremental_target.regions[0].orientations[0].tolerance_radians - 0.1).abs()
+                < 1e-5
+        );
+
+        // 3. At wp[2] (4, 0), execution releases to final wp[3]
+        let mut odom2 = Odometry::default();
+        odom2.pose.pose.position.x = 4.0;
+        odom2.pose.pose.position.y = 0.0;
+        let out3 = plan_executor.handle_odometry("robot_1", odom2);
+        assert_eq!(out3.plan_release.unwrap().waypoint_id, 3);
     }
 }

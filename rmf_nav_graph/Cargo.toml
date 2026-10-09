@@ -1,0 +1,10 @@
+[package]
+name = "rmf_nav_graph"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+ros-env = "0.2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rmf_site_format = { git = "https://github.com/open-rmf/rmf_site", rev = "2f661c2e917bf0093496e1945d50cf25a3c872da", default-features = false }

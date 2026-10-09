@@ -31,8 +31,15 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import (
     Destination,
+    DestinationConstraints,
+    DestinationGoal,
+    GraphElementKey,
     Plan,
+    Region,
     SafeZone,
+    TargetNode,
+    TargetOrientation,
+    TargetRegion,
 )
 
 
@@ -256,6 +263,120 @@ class TestTargetOrientationForwarding(unittest.TestCase):
             self.assertAlmostEqual(inner_pose.pose.position.y, target_y, places=4)
             inner_yaw = yaw_from_quaternion(inner_pose.pose.orientation)
             self.assertAlmostEqual(inner_yaw, target_yaw, places=4)
+
+            # Now verify TargetNode / GraphElementKey propagation through
+            # Destination -> Plan -> SafeZone
+            goal_pub = self.node.create_publisher(
+                DestinationGoal,
+                '/robot0/destination/goal',
+                qos_profile=transient_qos,
+            )
+            node_session = [7] * 16
+            node_yaw = math.pi / 2.0
+            dest_goal = DestinationGoal()
+            dest_goal.session.uuid = node_session
+            constraint = DestinationConstraints()
+            target_region = TargetRegion()
+            target_region.region.hint = Region.HINT_POINT
+            target_region.region.points = [3.0, 0.0]
+            constraint.regions.append(target_region)
+
+            target_node = TargetNode()
+            target_node.key = GraphElementKey()
+            target_node.key.key = [42]
+            target_node.key.name = ['station_alpha']
+            node_ori = TargetOrientation()
+            node_ori.orientation_radians = node_yaw
+            target_node.orientations.append(node_ori)
+            constraint.nodes.append(target_node)
+            dest_goal.one_of.append(constraint)
+
+            goal_pub.publish(dest_goal)
+
+            deadline = time.time() + 15.0
+            while time.time() < deadline:
+                odom_pub.publish(odom_msg)
+                has_dest = any(
+                    list(d.session.uuid) == node_session
+                    for d in received_destinations
+                )
+                has_plan = any(
+                    list(p.plan_id.destination_session.uuid) == node_session
+                    for p in received_plans
+                )
+                has_sz = any(
+                    list(s.id.plan_id.destination_session.uuid) == node_session
+                    for s in received_safe_zones
+                )
+                if has_dest and has_plan and has_sz:
+                    break
+                time.sleep(0.1)
+
+            node_dests = [
+                d
+                for d in received_destinations
+                if list(d.session.uuid) == node_session
+            ]
+            self.assertGreater(
+                len(node_dests),
+                0,
+                'Did not receive Destination with TargetNode session',
+            )
+            self.assertEqual(len(node_dests[-1].constraints.nodes), 1)
+            self.assertEqual(
+                list(node_dests[-1].constraints.nodes[0].key.key), [42]
+            )
+            self.assertEqual(
+                list(node_dests[-1].constraints.nodes[0].key.name),
+                ['station_alpha'],
+            )
+
+            node_plans = [
+                p
+                for p in received_plans
+                if list(p.plan_id.destination_session.uuid) == node_session
+            ]
+            self.assertGreater(
+                len(node_plans),
+                0,
+                'Did not receive Plan with TargetNode session',
+            )
+            plan_last_wp = node_plans[-1].waypoints[-1]
+            self.assertEqual(len(plan_last_wp.arrival_constraints.nodes), 1)
+            self.assertEqual(
+                list(plan_last_wp.arrival_constraints.nodes[0].key.key), [42]
+            )
+            self.assertEqual(
+                list(plan_last_wp.arrival_constraints.nodes[0].key.name),
+                ['station_alpha'],
+            )
+
+            node_szs = [
+                s
+                for s in received_safe_zones
+                if list(s.id.plan_id.destination_session.uuid) == node_session
+            ]
+            self.assertGreater(
+                len(node_szs),
+                0,
+                'Did not receive SafeZone with TargetNode session',
+            )
+            self.assertEqual(len(node_szs[-1].incremental_target.nodes), 1)
+            self.assertEqual(
+                list(node_szs[-1].incremental_target.nodes[0].key.key), [42]
+            )
+            self.assertEqual(
+                list(node_szs[-1].incremental_target.nodes[0].key.name),
+                ['station_alpha'],
+            )
+            self.assertAlmostEqual(
+                node_szs[-1]
+                .incremental_target.regions[0]
+                .orientations[0]
+                .orientation_radians,
+                node_yaw,
+                places=4,
+            )
         finally:
             inner_server.destroy()
             outer_client.destroy()
