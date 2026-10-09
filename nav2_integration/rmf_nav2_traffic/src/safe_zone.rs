@@ -1,7 +1,4 @@
-use crate::{
-    inner_navigation_client::InnerNavigationTarget, navigation_server::CurrentNavigationRequest,
-    Nav2Agent,
-};
+use crate::{inner_navigation_client::InnerNavigationTarget, Nav2Agent};
 use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
 use ros_env::{
@@ -182,19 +179,14 @@ fn create_plan_error_publisher(
 
 fn update_incremental_target(
     mut nav_target: EventWriter<InnerNavigationTarget>,
-    mut subscriptions: Query<
-        (
-            Entity,
-            &SafeZoneSubscription,
-            &CostmapPublisher,
-            &ProgressPublisher,
-            &mut CurrentSafeZone,
-            &Nav2Agent,
-        ),
-        // Only respond to a SafeZone message if there is an active NavigationRequest
-        // for this agent
-        With<CurrentNavigationRequest>,
-    >,
+    mut subscriptions: Query<(
+        Entity,
+        &SafeZoneSubscription,
+        &CostmapPublisher,
+        &ProgressPublisher,
+        &mut CurrentSafeZone,
+        &Nav2Agent,
+    )>,
 ) {
     for (e, safe_zone_sub, costmap_pub, progress_pub, mut current_safe_zone, agent) in
         subscriptions.iter_mut()
@@ -278,7 +270,7 @@ fn next_target(safe_zone: &SafeZone) -> Option<(f32, f32, f32)> {
 
     // Assume either regions or nodes will be populated, not both.
     for target_region in constraints.regions.iter() {
-        let tolerance = target_region.tolerance;
+        let _tolerance = target_region.tolerance;
         let region = &target_region.region;
         let points = &region.points;
 
