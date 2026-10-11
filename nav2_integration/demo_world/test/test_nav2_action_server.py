@@ -77,9 +77,12 @@ class TestNav2ActionServer(unittest.TestCase):
         self.spin_thread.join(timeout=2.0)
         self.node.destroy_node()
 
-    def make_safe_zone(self, session_byte, plan_version, safe_zone_version, x, y, yaw=0.0):
+    def make_safe_zone(self, session_uuid, plan_version, safe_zone_version, x, y, yaw=0.0):
         msg = SafeZone()
-        msg.id.plan_id.destination_session.uuid = [session_byte] * 16
+        if isinstance(session_uuid, int):
+            msg.id.plan_id.destination_session.uuid = [session_uuid] * 16
+        else:
+            msg.id.plan_id.destination_session.uuid = list(session_uuid)
         msg.id.plan_id.plan_version = plan_version
         msg.id.safe_zone_version = safe_zone_version
 
@@ -102,15 +105,32 @@ class TestNav2ActionServer(unittest.TestCase):
 
     def test_outer_navigate_to_pose_completion_and_pre_feedback_cancel(self):
         dest_goals_r0 = []
+        dest_goals_r1 = []
         outer_feedback_r0 = []
+        r0_inner_targets = []
+        hold_r0_inner = threading.Event()
         inner_cancelled_r1 = threading.Event()
         inner_started_r1 = threading.Event()
+        succeed_r1_inner = threading.Event()
 
         def execute_r0_inner(goal_handle):
             target_pose = goal_handle.request.pose
+            r0_inner_targets.append(
+                (target_pose.pose.position.x, target_pose.pose.position.y)
+            )
+            if hold_r0_inner.is_set():
+                deadline = time.time() + 10.0
+                while time.time() < deadline and hold_r0_inner.is_set():
+                    if goal_handle.is_cancel_requested:
+                        goal_handle.canceled()
+                        return NavigateToPose.Result()
+                    time.sleep(0.05)
             feedback = NavigateToPose.Feedback()
             feedback.current_pose = target_pose
             for _ in range(5):
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                    return NavigateToPose.Result()
                 goal_handle.publish_feedback(feedback)
                 time.sleep(0.1)
             goal_handle.succeed()
@@ -118,6 +138,15 @@ class TestNav2ActionServer(unittest.TestCase):
 
         def execute_r1_inner(goal_handle):
             inner_started_r1.set()
+            if succeed_r1_inner.is_set():
+                target_pose = goal_handle.request.pose
+                feedback = NavigateToPose.Feedback()
+                feedback.current_pose = target_pose
+                for _ in range(5):
+                    goal_handle.publish_feedback(feedback)
+                    time.sleep(0.1)
+                goal_handle.succeed()
+                return NavigateToPose.Result()
             # Intentionally do NOT publish any feedback so robot1 has no AgentPose
             deadline = time.time() + 10.0
             while time.time() < deadline:
@@ -159,6 +188,13 @@ class TestNav2ActionServer(unittest.TestCase):
             DestinationGoal,
             'robot0/destination/goal',
             lambda msg: dest_goals_r0.append(msg),
+            qos_profile=transient_qos,
+            callback_group=self.cb_group,
+        )
+        self.node.create_subscription(
+            DestinationGoal,
+            'robot1/destination/goal',
+            lambda msg: dest_goals_r1.append(msg),
             qos_profile=transient_qos,
             callback_group=self.cb_group,
         )
@@ -225,8 +261,10 @@ class TestNav2ActionServer(unittest.TestCase):
             self.assertAlmostEqual(pts[0], 3.0, places=3)
             self.assertAlmostEqual(pts[1], 1.0, places=3)
 
-            # Publish SafeZone so inner navigation runs and feeds back pose at (3.0, 1.0)
-            sz_pub_r0.publish(self.make_safe_zone(1, 1, 1, 3.0, 1.0))
+            # Publish SafeZone matching DestinationGoal.session and initial plan_version=0
+            sz_pub_r0.publish(
+                self.make_safe_zone(dest_goals_r0[-1].session.uuid, 0, 1, 3.0, 1.0)
+            )
 
             result_future_r0 = goal_handle_r0.get_result_async()
             deadline = time.time() + 10.0
@@ -253,7 +291,14 @@ class TestNav2ActionServer(unittest.TestCase):
             goal_handle_r1 = send_future_r1.result()
             self.assertTrue(goal_handle_r1.accepted, 'robot1 outer goal was not accepted')
 
-            sz_pub_r1.publish(self.make_safe_zone(2, 1, 1, 6.0, 2.0))
+            deadline = time.time() + 5.0
+            while time.time() < deadline and not dest_goals_r1:
+                time.sleep(0.05)
+            self.assertGreater(len(dest_goals_r1), 0, 'Expected DestinationGoal on robot1')
+
+            sz_pub_r1.publish(
+                self.make_safe_zone(dest_goals_r1[-1].session.uuid, 0, 1, 6.0, 2.0)
+            )
             self.assertTrue(
                 inner_started_r1.wait(timeout=10.0),
                 'robot1 inner goal did not start',
@@ -267,6 +312,145 @@ class TestNav2ActionServer(unittest.TestCase):
             self.assertTrue(
                 inner_cancelled_r1.wait(timeout=10.0),
                 'Expected robot1 inner goal to be cancelled even without AgentPose',
+            )
+            result_future_r1 = goal_handle_r1.get_result_async()
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not result_future_r1.done():
+                time.sleep(0.05)
+            self.assertTrue(result_future_r1.done(), 'robot1 cancel result timed out')
+            self.assertEqual(result_future_r1.result().status, GoalStatus.STATUS_CANCELED)
+
+            # Part 3: Preempt an active outer NavigateToPose goal on robot0 with an
+            # external SafeZone (different destination_session UUID).
+            hold_r0_inner.set()
+            prev_dest_count_r0 = len(dest_goals_r0)
+            goal_r0_preempt = NavigateToPose.Goal()
+            goal_r0_preempt.pose = PoseStamped()
+            goal_r0_preempt.pose.header.frame_id = 'map'
+            goal_r0_preempt.pose.pose.position.x = 7.0
+            goal_r0_preempt.pose.pose.position.y = 4.0
+            goal_r0_preempt.pose.pose.orientation.w = 1.0
+
+            send_future_r0_p = outer_client_r0.send_goal_async(goal_r0_preempt)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_future_r0_p.done():
+                time.sleep(0.05)
+            goal_handle_r0_p = send_future_r0_p.result()
+            self.assertTrue(goal_handle_r0_p.accepted)
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline and len(dest_goals_r0) <= prev_dest_count_r0:
+                time.sleep(0.05)
+            self.assertGreater(len(dest_goals_r0), prev_dest_count_r0)
+
+            sz_pub_r0.publish(
+                self.make_safe_zone(dest_goals_r0[-1].session.uuid, 0, 1, 7.0, 4.0)
+            )
+            deadline = time.time() + 5.0
+            while time.time() < deadline and len(r0_inner_targets) < 2:
+                time.sleep(0.05)
+
+            # Publish an external SafeZone with a different session UUID -> cancels outer goal
+            hold_r0_inner.clear()
+            sz_pub_r0.publish(self.make_safe_zone(99, 0, 1, 9.0, 5.0))
+
+            result_future_r0_p = goal_handle_r0_p.get_result_async()
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not result_future_r0_p.done():
+                time.sleep(0.05)
+            self.assertTrue(
+                result_future_r0_p.done(),
+                'Expected preempted robot0 outer NavigateToPose goal to terminate',
+            )
+            self.assertEqual(
+                result_future_r0_p.result().status,
+                GoalStatus.STATUS_CANCELED,
+            )
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline and len(r0_inner_targets) < 3:
+                time.sleep(0.05)
+            self.assertAlmostEqual(r0_inner_targets[-1][0], 9.0, places=3)
+            self.assertAlmostEqual(r0_inner_targets[-1][1], 5.0, places=3)
+
+            # Part 4: Preempt an active outer NavigateToPose goal on robot1 by sending
+            # a second outer NavigateToPose goal on robot1.
+            inner_started_r1.clear()
+            inner_cancelled_r1.clear()
+            prev_dest_count_r1 = len(dest_goals_r1)
+
+            goal_r1_first = NavigateToPose.Goal()
+            goal_r1_first.pose = PoseStamped()
+            goal_r1_first.pose.header.frame_id = 'map'
+            goal_r1_first.pose.pose.position.x = 8.0
+            goal_r1_first.pose.pose.position.y = 3.0
+            goal_r1_first.pose.pose.orientation.w = 1.0
+
+            send_future_r1_first = outer_client_r1.send_goal_async(goal_r1_first)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_future_r1_first.done():
+                time.sleep(0.05)
+            goal_handle_r1_first = send_future_r1_first.result()
+            self.assertTrue(goal_handle_r1_first.accepted)
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline and len(dest_goals_r1) <= prev_dest_count_r1:
+                time.sleep(0.05)
+
+            sz_pub_r1.publish(
+                self.make_safe_zone(dest_goals_r1[-1].session.uuid, 0, 1, 8.0, 3.0)
+            )
+            self.assertTrue(inner_started_r1.wait(timeout=10.0))
+
+            # Send a second outer NavigateToPose goal to robot1 while first is still active
+            succeed_r1_inner.set()
+            prev_dest_count_r1 = len(dest_goals_r1)
+            goal_r1_second = NavigateToPose.Goal()
+            goal_r1_second.pose = PoseStamped()
+            goal_r1_second.pose.header.frame_id = 'map'
+            goal_r1_second.pose.pose.position.x = 2.0
+            goal_r1_second.pose.pose.position.y = 4.0
+            goal_r1_second.pose.pose.orientation.w = 1.0
+
+            send_future_r1_second = outer_client_r1.send_goal_async(goal_r1_second)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_future_r1_second.done():
+                time.sleep(0.05)
+            goal_handle_r1_second = send_future_r1_second.result()
+            self.assertTrue(goal_handle_r1_second.accepted)
+
+            result_future_r1_first = goal_handle_r1_first.get_result_async()
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not result_future_r1_first.done():
+                time.sleep(0.05)
+            self.assertTrue(
+                result_future_r1_first.done(),
+                'Expected first robot1 outer NavigateToPose goal to be cancelled when superseded',
+            )
+            self.assertEqual(
+                result_future_r1_first.result().status,
+                GoalStatus.STATUS_CANCELED,
+            )
+            self.assertTrue(
+                inner_cancelled_r1.wait(timeout=10.0),
+                'Expected first robot1 inner goal to be cancelled when superseded',
+            )
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline and len(dest_goals_r1) <= prev_dest_count_r1:
+                time.sleep(0.05)
+            sz_pub_r1.publish(
+                self.make_safe_zone(dest_goals_r1[-1].session.uuid, 0, 1, 2.0, 4.0)
+            )
+
+            result_future_r1_second = goal_handle_r1_second.get_result_async()
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not result_future_r1_second.done():
+                time.sleep(0.05)
+            self.assertTrue(result_future_r1_second.done())
+            self.assertEqual(
+                result_future_r1_second.result().status,
+                GoalStatus.STATUS_SUCCEEDED,
             )
         finally:
             inner_server_r0.destroy()

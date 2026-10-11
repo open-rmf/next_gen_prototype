@@ -407,6 +407,9 @@ fn await_external_cancellation(
         let Some(existing_goal) = inner_client.goal_mut().as_mut() else {
             continue;
         };
+        if existing_goal.is_superseded() {
+            continue;
+        }
         existing_goal.mark_superseded();
         let client = existing_goal.client().clone();
         orders.for_each(|order| {

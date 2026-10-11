@@ -1,4 +1,8 @@
-use crate::{inner_navigation_client::InnerNavigationTarget, Nav2Agent};
+use crate::{
+    inner_navigation_client::{CancellingInnerNavigation, InnerNavigationTarget},
+    navigation_server::CurrentNavigationRequest,
+    Nav2Agent,
+};
 use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
 use ros_env::{
@@ -177,8 +181,10 @@ fn create_plan_error_publisher(
     });
 }
 
-fn update_incremental_target(
+pub(crate) fn update_incremental_target(
+    mut commands: Commands,
     mut nav_target: EventWriter<InnerNavigationTarget>,
+    mut current_nav_requests: Query<&mut CurrentNavigationRequest>,
     mut subscriptions: Query<(
         Entity,
         &SafeZoneSubscription,
@@ -198,18 +204,39 @@ fn update_incremental_target(
         //    continue;
         //}
 
-        // Call updateCosts() before setting new inner nav target
-        let Ok(_) = costmap_pub.publisher.publish(safe_zone.costmap.clone()) else {
-            error!("Failed to publish costmap for agent [{}]", agent.name);
-            continue;
-        };
-
         // Validate safe zone msg
         if !is_valid(&safe_zone) {
             continue;
         }
 
         let Some((target_x, target_y, target_yaw)) = next_target(&safe_zone) else {
+            continue;
+        };
+
+        if let Ok(mut current_nav_req) = current_nav_requests.get_mut(e) {
+            let incoming_plan_id = &safe_zone.id.plan_id;
+            if current_nav_req.plan_id() == incoming_plan_id {
+                current_nav_req.set_superseded_plan_id(None);
+            } else if current_nav_req.superseded_plan_id() == Some(incoming_plan_id) {
+                continue;
+            } else {
+                info!(
+                    "[{:?}] Cancelling active NavigationRequest {:?} due to SafeZone plan_id {:?}",
+                    agent.name,
+                    current_nav_req.plan_id(),
+                    incoming_plan_id
+                );
+                current_nav_req.cancel();
+                commands
+                    .entity(e)
+                    .remove::<CurrentNavigationRequest>()
+                    .remove::<CancellingInnerNavigation>();
+            }
+        }
+
+        // Call updateCosts() before setting new inner nav target
+        let Ok(_) = costmap_pub.publisher.publish(safe_zone.costmap.clone()) else {
+            error!("Failed to publish costmap for agent [{}]", agent.name);
             continue;
         };
 
