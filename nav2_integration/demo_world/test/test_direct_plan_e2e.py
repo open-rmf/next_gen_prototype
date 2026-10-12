@@ -34,6 +34,7 @@ from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
     DestinationGoal,
+    Plan,
     Region,
     TargetRegion,
 )
@@ -82,6 +83,7 @@ class MockNav2AgentHarness:
         self.lock = threading.Lock()
         self.received_targets = []
         self.odoms = []
+        self.plan_sessions = []
 
         transient_qos = QoSProfile(
             depth=10,
@@ -104,6 +106,14 @@ class MockNav2AgentHarness:
             callback_group=cb_group,
         )
 
+        self.node.create_subscription(
+            Plan,
+            f'{self.name}/plan',
+            self._plan_cb,
+            qos_profile=transient_qos,
+            callback_group=cb_group,
+        )
+
         self.action_server = ActionServer(
             self.node,
             NavigateToPose,
@@ -116,6 +126,16 @@ class MockNav2AgentHarness:
 
     def _odom_cb(self, msg):
         self.odoms.append((msg.pose.pose.position.x, msg.pose.pose.position.y))
+
+    def _plan_cb(self, msg):
+        with self.lock:
+            self.plan_sessions.append(list(msg.plan_id.destination_session.uuid))
+
+    def has_plan_for_session(self, session_uuid):
+        if session_uuid is None:
+            return False
+        with self.lock:
+            return session_uuid in self.plan_sessions
 
     def publish_amcl_pose(self):
         with self.lock:
@@ -255,9 +275,15 @@ class TestDirectPlanE2E(unittest.TestCase):
 
         try:
             # Wait until nav2_traffic converts inner/amcl_pose into /odom for both robots
+            # and rmf_path_server subscribes to both destination topics.
             deadline = time.time() + 10.0
             while time.time() < deadline:
-                if r0.odoms and r1.odoms:
+                if (
+                    r0.odoms
+                    and r1.odoms
+                    and r0_dest_pub.get_subscription_count() >= 1
+                    and r1_dest_pub.get_subscription_count() >= 1
+                ):
                     break
                 time.sleep(0.1)
 
@@ -268,10 +294,27 @@ class TestDirectPlanE2E(unittest.TestCase):
             dest_r0 = self.create_destination(1, 3.0, 0.0)
             dest_r1 = self.create_destination(2, 3.0, 3.0)
 
-            for _ in range(5):
-                r0_dest_pub.publish(dest_r0)
-                r1_dest_pub.publish(dest_r1)
-                time.sleep(0.1)
+            r0_dest_pub.publish(dest_r0)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not r0.has_plan_for_session(
+                list(dest_r0.session.uuid)
+            ):
+                time.sleep(0.05)
+            self.assertTrue(
+                r0.has_plan_for_session(list(dest_r0.session.uuid)),
+                'Expected rmf_path_server to publish initial plan for robot0',
+            )
+
+            r1_dest_pub.publish(dest_r1)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not r1.has_plan_for_session(
+                list(dest_r1.session.uuid)
+            ):
+                time.sleep(0.05)
+            self.assertTrue(
+                r1.has_plan_for_session(list(dest_r1.session.uuid)),
+                'Expected rmf_path_server to publish initial plan for robot1',
+            )
 
             r0_reached = False
             r1_reached = False
@@ -312,25 +355,28 @@ class TestDirectPlanE2E(unittest.TestCase):
             # Initial poses: robot0=(0.0, 5.0), robot1=(3.0, 5.0)
             # First destination set: robot0 -> (5.0, 5.0), robot1 -> (0.0, 3.0)
             # Second destination set: robot0 -> (9.0, 3.0), robot1 -> (9.0, 6.0)
-            def forward_goal(pub, goal_msg):
+            forwarded_sessions = {'robot0': None, 'robot1': None}
+
+            def forward_goal(robot_name, pub, goal_msg):
                 if not goal_msg.one_of:
                     return
                 dest = Destination()
                 dest.constraints = goal_msg.one_of[0]
                 dest.session = goal_msg.session
+                forwarded_sessions[robot_name] = list(goal_msg.session.uuid)
                 pub.publish(dest)
 
             self.node.create_subscription(
                 DestinationGoal,
                 'robot0/destination/goal',
-                lambda msg: forward_goal(r0_dest_pub, msg),
+                lambda msg: forward_goal('robot0', r0_dest_pub, msg),
                 qos_profile=dest_qos,
                 callback_group=self.cb_group,
             )
             self.node.create_subscription(
                 DestinationGoal,
                 'robot1/destination/goal',
-                lambda msg: forward_goal(r1_dest_pub, msg),
+                lambda msg: forward_goal('robot1', r1_dest_pub, msg),
                 qos_profile=dest_qos,
                 callback_group=self.cb_group,
             )
@@ -350,8 +396,8 @@ class TestDirectPlanE2E(unittest.TestCase):
             self.assertTrue(outer_r0.wait_for_server(timeout_sec=10.0))
             self.assertTrue(outer_r1.wait_for_server(timeout_sec=10.0))
 
-            r0.set_pose_and_speed(0.0, 5.0, 4.0)
-            r1.set_pose_and_speed(3.0, 5.0, 4.0)
+            r0.set_pose_and_speed(0.0, 5.0, 0.0)
+            r1.set_pose_and_speed(3.0, 5.0, 0.0)
             deadline = time.time() + 5.0
             while time.time() < deadline:
                 if (
@@ -374,7 +420,10 @@ class TestDirectPlanE2E(unittest.TestCase):
             # Stage 1: robot0 -> (5.0, 5.0), robot1 -> (0.0, 3.0)
             fb_r0_stage1 = []
             fb_r1_stage1 = []
+            forwarded_sessions['robot0'] = None
+            forwarded_sessions['robot1'] = None
 
+            r0.set_pose_and_speed(0.0, 5.0, 4.0)
             send_r0 = outer_r0.send_goal_async(
                 make_nav_goal(5.0, 5.0),
                 feedback_callback=lambda fb: fb_r0_stage1.append(fb.feedback),
@@ -385,8 +434,17 @@ class TestDirectPlanE2E(unittest.TestCase):
             handle_r0 = send_r0.result()
             self.assertTrue(handle_r0.accepted)
 
-            time.sleep(0.25)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not r0.has_plan_for_session(
+                forwarded_sessions['robot0']
+            ):
+                time.sleep(0.05)
+            self.assertTrue(
+                r0.has_plan_for_session(forwarded_sessions['robot0']),
+                'Expected rmf_path_server to publish Stage 1 plan for robot0',
+            )
 
+            r1.set_pose_and_speed(3.0, 5.0, 4.0)
             send_r1 = outer_r1.send_goal_async(
                 make_nav_goal(0.0, 3.0),
                 feedback_callback=lambda fb: fb_r1_stage1.append(fb.feedback),
@@ -422,6 +480,8 @@ class TestDirectPlanE2E(unittest.TestCase):
             # robot0 -> (9.0, 3.0), robot1 -> (9.0, 6.0)
             fb_r0_stage2 = []
             fb_r1_stage2 = []
+            forwarded_sessions['robot0'] = None
+            forwarded_sessions['robot1'] = None
 
             send_r0_s2 = outer_r0.send_goal_async(
                 make_nav_goal(9.0, 3.0),
@@ -433,7 +493,15 @@ class TestDirectPlanE2E(unittest.TestCase):
             handle_r0_s2 = send_r0_s2.result()
             self.assertTrue(handle_r0_s2.accepted)
 
-            time.sleep(0.25)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not r0.has_plan_for_session(
+                forwarded_sessions['robot0']
+            ):
+                time.sleep(0.05)
+            self.assertTrue(
+                r0.has_plan_for_session(forwarded_sessions['robot0']),
+                'Expected rmf_path_server to publish Stage 2 plan for robot0',
+            )
 
             send_r1_s2 = outer_r1.send_goal_async(
                 make_nav_goal(9.0, 6.0),
@@ -473,8 +541,8 @@ class TestDirectPlanE2E(unittest.TestCase):
             # Part 3: Two-robot follower scenario where the follower's outer
             # ~/navigate_to_pose goal is cancelled mid-execution.
             # Position robot0 (follower) at (0.0, 0.0) and robot1 (leader) at (3.0, 0.0).
-            r0.set_pose_and_speed(0.0, 0.0, 1.0)
-            r1.set_pose_and_speed(3.0, 0.0, 2.5)
+            r0.set_pose_and_speed(0.0, 0.0, 0.0)
+            r1.set_pose_and_speed(3.0, 0.0, 0.0)
             deadline = time.time() + 5.0
             while time.time() < deadline:
                 if (
@@ -498,6 +566,10 @@ class TestDirectPlanE2E(unittest.TestCase):
             follower_goal.pose.pose.position.y = 0.0
             follower_goal.pose.pose.orientation.w = 1.0
 
+            forwarded_sessions['robot0'] = None
+            forwarded_sessions['robot1'] = None
+
+            r1.set_pose_and_speed(3.0, 0.0, 2.5)
             send_leader = outer_r1.send_goal_async(leader_goal)
             deadline = time.time() + 10.0
             while time.time() < deadline and not send_leader.done():
@@ -505,6 +577,17 @@ class TestDirectPlanE2E(unittest.TestCase):
             handle_leader = send_leader.result()
             self.assertTrue(handle_leader.accepted)
 
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not r1.has_plan_for_session(
+                forwarded_sessions['robot1']
+            ):
+                time.sleep(0.05)
+            self.assertTrue(
+                r1.has_plan_for_session(forwarded_sessions['robot1']),
+                'Expected rmf_path_server to publish leader plan for robot1',
+            )
+
+            r0.set_pose_and_speed(0.0, 0.0, 1.0)
             send_follower = outer_r0.send_goal_async(follower_goal)
             deadline = time.time() + 10.0
             while time.time() < deadline and not send_follower.done():
@@ -512,11 +595,11 @@ class TestDirectPlanE2E(unittest.TestCase):
             handle_follower = send_follower.result()
             self.assertTrue(handle_follower.accepted)
 
-            # Wait until follower robot0 has started moving along y=0.0
+            # Wait until follower robot0 has received its plan and started moving along y=0.0
             deadline = time.time() + 10.0
             while time.time() < deadline:
                 fx, _ = r0.get_pose()
-                if fx > 0.15:
+                if r0.has_plan_for_session(forwarded_sessions['robot0']) and fx > 0.15:
                     break
                 time.sleep(0.05)
             self.assertGreater(r0.get_pose()[0], 0.1, 'Follower robot0 did not start moving')
