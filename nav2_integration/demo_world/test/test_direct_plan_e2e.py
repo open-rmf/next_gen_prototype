@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 
+from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from launch import LaunchDescription
 import launch_ros.actions
@@ -25,13 +26,14 @@ from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry
 import pytest
 import rclpy
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
+    DestinationGoal,
     Region,
     TargetRegion,
 )
@@ -294,6 +296,99 @@ class TestDirectPlanE2E(unittest.TestCase):
                 0,
                 'Expected inner NavigateToPose targets for robot1',
             )
+
+            # Now test two-robot outer ~/navigate_to_pose goals sent sequentially
+            # (reproducing the nav2_integration README workflow where robot0 gets a goal
+            # first and robot1 gets a goal second, triggering a multi-robot replan).
+            def forward_goal(pub, goal_msg):
+                if not goal_msg.one_of:
+                    return
+                dest = Destination()
+                dest.constraints = goal_msg.one_of[0]
+                dest.session = goal_msg.session
+                pub.publish(dest)
+
+            self.node.create_subscription(
+                DestinationGoal,
+                'robot0/destination/goal',
+                lambda msg: forward_goal(r0_dest_pub, msg),
+                qos_profile=dest_qos,
+                callback_group=self.cb_group,
+            )
+            self.node.create_subscription(
+                DestinationGoal,
+                'robot1/destination/goal',
+                lambda msg: forward_goal(r1_dest_pub, msg),
+                qos_profile=dest_qos,
+                callback_group=self.cb_group,
+            )
+
+            outer_r0 = ActionClient(
+                self.node,
+                NavigateToPose,
+                'robot0/navigate_to_pose',
+                callback_group=self.cb_group,
+            )
+            outer_r1 = ActionClient(
+                self.node,
+                NavigateToPose,
+                'robot1/navigate_to_pose',
+                callback_group=self.cb_group,
+            )
+            self.assertTrue(outer_r0.wait_for_server(timeout_sec=10.0))
+            self.assertTrue(outer_r1.wait_for_server(timeout_sec=10.0))
+
+            goal_r0 = NavigateToPose.Goal()
+            goal_r0.pose.header.frame_id = 'map'
+            goal_r0.pose.pose.position.x = 6.0
+            goal_r0.pose.pose.position.y = 0.0
+            goal_r0.pose.pose.orientation.w = 1.0
+
+            goal_r1 = NavigateToPose.Goal()
+            goal_r1.pose.header.frame_id = 'map'
+            goal_r1.pose.pose.position.x = 6.0
+            goal_r1.pose.pose.position.y = 3.0
+            goal_r1.pose.pose.orientation.w = 1.0
+
+            send_r0 = outer_r0.send_goal_async(goal_r0)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_r0.done():
+                time.sleep(0.05)
+            handle_r0 = send_r0.result()
+            self.assertTrue(handle_r0.accepted)
+
+            # Give rmf_path_server a moment to start/complete planning for robot0
+            # before sending the second robot's goal.
+            time.sleep(0.25)
+
+            send_r1 = outer_r1.send_goal_async(goal_r1)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_r1.done():
+                time.sleep(0.05)
+            handle_r1 = send_r1.result()
+            self.assertTrue(handle_r1.accepted)
+
+            res_r0 = handle_r0.get_result_async()
+            res_r1 = handle_r1.get_result_async()
+            deadline = time.time() + 25.0
+            while time.time() < deadline and (not res_r0.done() or not res_r1.done()):
+                time.sleep(0.1)
+
+            self.assertTrue(res_r0.done(), 'robot0 outer NavigateToPose did not finish')
+            self.assertTrue(res_r1.done(), 'robot1 outer NavigateToPose did not finish')
+            self.assertEqual(
+                res_r0.result().status,
+                GoalStatus.STATUS_SUCCEEDED,
+                f'robot0 outer goal failed with status {res_r0.result().status}',
+            )
+            self.assertEqual(
+                res_r1.result().status,
+                GoalStatus.STATUS_SUCCEEDED,
+                f'robot1 outer goal failed with status {res_r1.result().status}',
+            )
+
+            outer_r0.destroy()
+            outer_r1.destroy()
         finally:
             pose_timer.cancel()
             self.node.destroy_timer(pose_timer)

@@ -350,11 +350,23 @@ class TestNav2ActionServer(unittest.TestCase):
             while time.time() < deadline and len(r0_inner_targets) < 2:
                 time.sleep(0.05)
 
+            # A replan for the same destination_session with incremented plan_version
+            # (e.g. when a second robot receives a goal) must NOT cancel the outer goal.
+            result_future_r0_p = goal_handle_r0_p.get_result_async()
+            sz_pub_r0.publish(
+                self.make_safe_zone(dest_goals_r0[-1].session.uuid, 1, 1, 7.0, 4.0)
+            )
+            time.sleep(0.3)
+            self.assertFalse(
+                result_future_r0_p.done(),
+                'Replan with incremented plan_version for same session '
+                'should not cancel outer goal',
+            )
+
             # Publish an external SafeZone with a different session UUID -> cancels outer goal
             hold_r0_inner.clear()
             sz_pub_r0.publish(self.make_safe_zone(99, 0, 1, 9.0, 5.0))
 
-            result_future_r0_p = goal_handle_r0_p.get_result_async()
             deadline = time.time() + 10.0
             while time.time() < deadline and not result_future_r0_p.done():
                 time.sleep(0.05)
@@ -368,7 +380,7 @@ class TestNav2ActionServer(unittest.TestCase):
             )
 
             deadline = time.time() + 5.0
-            while time.time() < deadline and len(r0_inner_targets) < 3:
+            while time.time() < deadline and len(r0_inner_targets) < 4:
                 time.sleep(0.05)
             self.assertAlmostEqual(r0_inner_targets[-1][0], 9.0, places=3)
             self.assertAlmostEqual(r0_inner_targets[-1][1], 5.0, places=3)
@@ -397,8 +409,9 @@ class TestNav2ActionServer(unittest.TestCase):
             while time.time() < deadline and len(dest_goals_r1) <= prev_dest_count_r1:
                 time.sleep(0.05)
 
+            first_r1_session_uuid = list(dest_goals_r1[-1].session.uuid)
             sz_pub_r1.publish(
-                self.make_safe_zone(dest_goals_r1[-1].session.uuid, 0, 1, 8.0, 3.0)
+                self.make_safe_zone(first_r1_session_uuid, 0, 1, 8.0, 3.0)
             )
             self.assertTrue(inner_started_r1.wait(timeout=10.0))
 
@@ -439,6 +452,15 @@ class TestNav2ActionServer(unittest.TestCase):
             deadline = time.time() + 5.0
             while time.time() < deadline and len(dest_goals_r1) <= prev_dest_count_r1:
                 time.sleep(0.05)
+
+            # An in-flight SafeZone for the superseded session with a bumped plan_version
+            # (e.g. triggered by another robot's replan before the new session finishes planning)
+            # must be ignored and must NOT cancel the new goal.
+            sz_pub_r1.publish(
+                self.make_safe_zone(first_r1_session_uuid, 1, 2, 8.0, 3.0)
+            )
+            time.sleep(0.2)
+
             sz_pub_r1.publish(
                 self.make_safe_zone(dest_goals_r1[-1].session.uuid, 0, 1, 2.0, 4.0)
             )

@@ -90,7 +90,7 @@ fn create_navigation_server(
         let session = nav_request.plan_id.destination_session.clone();
         let _ = tx_for_closure.send(CurrentNavigationRequest {
             request: nav_request,
-            superseded_plan_id: None,
+            superseded_sessions: Vec::new(),
             feedback_sender,
             cancel_receiver,
         });
@@ -126,6 +126,7 @@ fn request_publish_feedback_service(
 ) {
     for server in navigation_servers.iter_mut() {
         let mut latest_request: Option<CurrentNavigationRequest> = None;
+        let mut queued_superseded_sessions: Vec<RosUuid> = Vec::new();
         while let Ok(request) = server.request_receiver.try_recv() {
             if let Some(prev) = latest_request.replace(request) {
                 info!(
@@ -133,6 +134,7 @@ fn request_publish_feedback_service(
                     prev.request.agent.index(),
                     prev.plan_id()
                 );
+                queued_superseded_sessions.push(prev.session().clone());
                 prev.cancel();
             }
         }
@@ -140,6 +142,9 @@ fn request_publish_feedback_service(
         let Some(mut request) = latest_request else {
             continue;
         };
+        for session in queued_superseded_sessions {
+            request.add_superseded_session(session);
+        }
         let agent = request.request.agent;
         let mut should_cancel_inner = false;
 
@@ -150,14 +155,18 @@ fn request_publish_feedback_service(
                 existing.plan_id(),
                 request.plan_id()
             );
+            for session in existing.superseded_sessions() {
+                request.add_superseded_session(session.clone());
+            }
+            request.add_superseded_session(existing.session().clone());
             existing.cancel();
             should_cancel_inner = true;
         }
 
         if let Ok(current_sz) = current_safe_zones.get(agent) {
             if let Some(sz) = current_sz.as_ref() {
-                if &sz.id.plan_id != request.plan_id() {
-                    request.set_superseded_plan_id(Some(sz.id.plan_id.clone()));
+                if &sz.id.plan_id.destination_session != request.session() {
+                    request.add_superseded_session(sz.id.plan_id.destination_session.clone());
                     should_cancel_inner = true;
                 }
             }
@@ -377,7 +386,7 @@ impl NavigationRequest {
 #[derive(Component)]
 pub struct CurrentNavigationRequest {
     request: NavigationRequest,
-    superseded_plan_id: Option<PlanId>,
+    superseded_sessions: Vec<RosUuid>,
     feedback_sender: UnboundedSender<NavigationActionUpdate>,
     cancel_receiver: UnboundedReceiver<CancelInnerForAgent>,
 }
@@ -387,12 +396,26 @@ impl CurrentNavigationRequest {
         &self.request.plan_id
     }
 
-    pub fn superseded_plan_id(&self) -> Option<&PlanId> {
-        self.superseded_plan_id.as_ref()
+    pub fn session(&self) -> &RosUuid {
+        &self.request.plan_id.destination_session
     }
 
-    pub fn set_superseded_plan_id(&mut self, plan_id: Option<PlanId>) {
-        self.superseded_plan_id = plan_id;
+    pub fn superseded_sessions(&self) -> &[RosUuid] {
+        &self.superseded_sessions
+    }
+
+    pub fn add_superseded_session(&mut self, session: RosUuid) {
+        if &session != self.session() && !self.superseded_sessions.contains(&session) {
+            self.superseded_sessions.push(session);
+        }
+    }
+
+    pub fn is_superseded_session(&self, session: &RosUuid) -> bool {
+        self.superseded_sessions.contains(session)
+    }
+
+    pub fn clear_superseded_sessions(&mut self) {
+        self.superseded_sessions.clear();
     }
 
     pub fn send_feedback(&self, feedback: NavigateToPose_Feedback) {

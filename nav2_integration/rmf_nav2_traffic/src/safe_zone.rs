@@ -215,9 +215,10 @@ pub(crate) fn update_incremental_target(
 
         if let Ok(mut current_nav_req) = current_nav_requests.get_mut(e) {
             let incoming_plan_id = &safe_zone.id.plan_id;
-            if current_nav_req.plan_id() == incoming_plan_id {
-                current_nav_req.set_superseded_plan_id(None);
-            } else if current_nav_req.superseded_plan_id() == Some(incoming_plan_id) {
+            let incoming_session = &incoming_plan_id.destination_session;
+            if current_nav_req.session() == incoming_session {
+                current_nav_req.clear_superseded_sessions();
+            } else if current_nav_req.is_superseded_session(incoming_session) {
                 continue;
             } else {
                 info!(
