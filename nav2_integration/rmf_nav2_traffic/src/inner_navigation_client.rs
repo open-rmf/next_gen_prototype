@@ -1,4 +1,6 @@
-use crate::{safe_zone::PlanErrorPublisher, Nav2Agent};
+use crate::{
+    navigation_server::CancelledNavigationSessions, safe_zone::PlanErrorPublisher, Nav2Agent,
+};
 use bevy::prelude::*;
 use bevy_ros2::{RclrsExecutorCommands, RclrsNode, RosActionClient};
 use crossflow::{prelude::*, service::Service};
@@ -407,6 +409,9 @@ fn await_external_cancellation(
         let Some(existing_goal) = inner_client.goal_mut().as_mut() else {
             continue;
         };
+        if existing_goal.is_superseded() {
+            continue;
+        }
         existing_goal.mark_superseded();
         let client = existing_goal.client().clone();
         orders.for_each(|order| {
@@ -434,7 +439,20 @@ enum CheckExistingGoalResult {
 fn check_existing_goal(
     Blocking { request, .. }: Blocking<InnerNavigationRequest>,
     mut inner_nav_clients: Query<&mut InnerNavigationClient>,
+    cancelled_sessions: Query<&CancelledNavigationSessions>,
 ) -> Result<CheckExistingGoalResult, InnerNavigationError> {
+    if cancelled_sessions
+        .get(request.agent)
+        .is_ok_and(|cancelled| {
+            cancelled.contains(&request.safe_zone_id.plan_id.destination_session)
+        })
+    {
+        return Err(InnerNavigationError {
+            handle: None,
+            kind: InnerNavigationErrorKind::DuplicateOrOutdatedRequestError,
+        });
+    }
+
     // TODO(@xiyuoh) Create a replan mechanism instead of cancelling goal on every
     // new request
     let mut replan_and_cancel = false;
@@ -610,12 +628,24 @@ fn update_goal_client(
         request: handle, ..
     }: Blocking<CurrentInnerNavigationGoal>,
     mut inner_nav_clients: Query<&mut InnerNavigationClient>,
+    cancelled_sessions: Query<&CancelledNavigationSessions>,
+    mut cancel_inner_for_agent: EventWriter<CancelInnerForAgent>,
 ) -> CurrentInnerNavigationGoal {
     if let Ok(mut inner_nav_client) = inner_nav_clients.get_mut(handle.request.agent) {
         *inner_nav_client.goal_mut() = Some(ActiveInnerGoal::new(
             handle.goal_client.clone(),
             handle.request.safe_zone_id.clone(),
         ));
+        if cancelled_sessions
+            .get(handle.request.agent)
+            .is_ok_and(|cancelled| {
+                cancelled.contains(&handle.request.safe_zone_id.plan_id.destination_session)
+            })
+        {
+            cancel_inner_for_agent.write(CancelInnerForAgent {
+                agent: handle.request.agent,
+            });
+        }
     } else {
         warn!(
             "[{:?}] InnerNavigationClient not found!",

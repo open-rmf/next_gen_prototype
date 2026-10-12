@@ -1,5 +1,6 @@
 use crate::{
-    inner_navigation_client::InnerNavigationTarget, navigation_server::CurrentNavigationRequest,
+    inner_navigation_client::{CancellingInnerNavigation, InnerNavigationTarget},
+    navigation_server::{CancelledNavigationSessions, CurrentNavigationRequest},
     Nav2Agent,
 };
 use bevy::prelude::*;
@@ -180,21 +181,19 @@ fn create_plan_error_publisher(
     });
 }
 
-fn update_incremental_target(
+pub(crate) fn update_incremental_target(
+    mut commands: Commands,
     mut nav_target: EventWriter<InnerNavigationTarget>,
-    mut subscriptions: Query<
-        (
-            Entity,
-            &SafeZoneSubscription,
-            &CostmapPublisher,
-            &ProgressPublisher,
-            &mut CurrentSafeZone,
-            &Nav2Agent,
-        ),
-        // Only respond to a SafeZone message if there is an active NavigationRequest
-        // for this agent
-        With<CurrentNavigationRequest>,
-    >,
+    mut current_nav_requests: Query<&mut CurrentNavigationRequest>,
+    mut cancelled_sessions: Query<&mut CancelledNavigationSessions>,
+    mut subscriptions: Query<(
+        Entity,
+        &SafeZoneSubscription,
+        &CostmapPublisher,
+        &ProgressPublisher,
+        &mut CurrentSafeZone,
+        &Nav2Agent,
+    )>,
 ) {
     for (e, safe_zone_sub, costmap_pub, progress_pub, mut current_safe_zone, agent) in
         subscriptions.iter_mut()
@@ -206,18 +205,58 @@ fn update_incremental_target(
         //    continue;
         //}
 
-        // Call updateCosts() before setting new inner nav target
-        let Ok(_) = costmap_pub.publisher.publish(safe_zone.costmap.clone()) else {
-            error!("Failed to publish costmap for agent [{}]", agent.name);
-            continue;
-        };
-
         // Validate safe zone msg
         if !is_valid(&safe_zone) {
             continue;
         }
 
         let Some((target_x, target_y, target_yaw)) = next_target(&safe_zone) else {
+            continue;
+        };
+
+        let incoming_plan_id = &safe_zone.id.plan_id;
+        let incoming_session = &incoming_plan_id.destination_session;
+
+        if cancelled_sessions
+            .get(e)
+            .is_ok_and(|cancelled| cancelled.contains(incoming_session))
+        {
+            debug!(
+                "[{:?}] Ignoring SafeZone for cancelled destination_session {:?}",
+                agent.name, incoming_plan_id
+            );
+            continue;
+        }
+
+        if let Ok(mut current_nav_req) = current_nav_requests.get_mut(e) {
+            if current_nav_req.session() == incoming_session {
+                current_nav_req.clear_superseded_sessions();
+            } else if current_nav_req.is_superseded_session(incoming_session) {
+                continue;
+            } else {
+                info!(
+                    "[{:?}] Cancelling active NavigationRequest {:?} due to SafeZone plan_id {:?}",
+                    agent.name,
+                    current_nav_req.plan_id(),
+                    incoming_plan_id
+                );
+                if let Ok(mut cancelled) = cancelled_sessions.get_mut(e) {
+                    for session in current_nav_req.superseded_sessions() {
+                        cancelled.insert(session.clone());
+                    }
+                    cancelled.insert(current_nav_req.session().clone());
+                }
+                current_nav_req.cancel();
+                commands
+                    .entity(e)
+                    .remove::<CurrentNavigationRequest>()
+                    .remove::<CancellingInnerNavigation>();
+            }
+        }
+
+        // Call updateCosts() before setting new inner nav target
+        let Ok(_) = costmap_pub.publisher.publish(safe_zone.costmap.clone()) else {
+            error!("Failed to publish costmap for agent [{}]", agent.name);
             continue;
         };
 
@@ -278,7 +317,7 @@ fn next_target(safe_zone: &SafeZone) -> Option<(f32, f32, f32)> {
 
     // Assume either regions or nodes will be populated, not both.
     for target_region in constraints.regions.iter() {
-        let tolerance = target_region.tolerance;
+        let _tolerance = target_region.tolerance;
         let region = &target_region.region;
         let points = &region.points;
 
