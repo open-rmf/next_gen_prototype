@@ -771,3 +771,248 @@ class TestNav2ActionServer(unittest.TestCase):
             inner_server_r1.destroy()
             outer_client_r0.destroy()
             outer_client_r1.destroy()
+
+    def test_readme_two_stage_happy_path(self):
+        dest_goals_r0 = []
+        dest_goals_r1 = []
+        r0_lock = threading.Lock()
+        r1_lock = threading.Lock()
+        # Initial poses from nav2_integration/README.md:
+        # robot0=(0.0, 5.0), robot1=(3.0, 5.0)
+        r0_pos = [0.0, 5.0]
+        r1_pos = [3.0, 5.0]
+
+        def make_execute_cb(pos, lock):
+            def execute_cb(goal_handle):
+                tx = float(goal_handle.request.pose.pose.position.x)
+                ty = float(goal_handle.request.pose.pose.position.y)
+                dt = 0.05
+                speed = 8.0
+                while rclpy.ok():
+                    if goal_handle.is_cancel_requested:
+                        goal_handle.canceled()
+                        return NavigateToPose.Result()
+                    with lock:
+                        dx = tx - pos[0]
+                        dy = ty - pos[1]
+                        dist = (dx * dx + dy * dy) ** 0.5
+                        if dist <= speed * dt:
+                            pos[0] = tx
+                            pos[1] = ty
+                            reached = True
+                        else:
+                            pos[0] += (dx / dist) * speed * dt
+                            pos[1] += (dy / dist) * speed * dt
+                            reached = False
+                        cx, cy = pos[0], pos[1]
+
+                    feedback = NavigateToPose.Feedback()
+                    feedback.current_pose = PoseStamped()
+                    feedback.current_pose.header.frame_id = 'map'
+                    feedback.current_pose.pose.position.x = cx
+                    feedback.current_pose.pose.position.y = cy
+                    feedback.current_pose.pose.orientation.w = 1.0
+                    goal_handle.publish_feedback(feedback)
+
+                    if reached:
+                        goal_handle.succeed()
+                        return NavigateToPose.Result()
+                    time.sleep(dt)
+                goal_handle.abort()
+                return NavigateToPose.Result()
+            return execute_cb
+
+        inner_server_r0 = ActionServer(
+            self.node,
+            NavigateToPose,
+            'robot0/inner/navigate_to_pose',
+            execute_callback=make_execute_cb(r0_pos, r0_lock),
+            goal_callback=lambda _: GoalResponse.ACCEPT,
+            cancel_callback=lambda _: CancelResponse.ACCEPT,
+            callback_group=self.cb_group,
+        )
+        inner_server_r1 = ActionServer(
+            self.node,
+            NavigateToPose,
+            'robot1/inner/navigate_to_pose',
+            execute_callback=make_execute_cb(r1_pos, r1_lock),
+            goal_callback=lambda _: GoalResponse.ACCEPT,
+            cancel_callback=lambda _: CancelResponse.ACCEPT,
+            callback_group=self.cb_group,
+        )
+
+        transient_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
+        self.node.create_subscription(
+            DestinationGoal,
+            'robot0/destination/goal',
+            lambda msg: dest_goals_r0.append(msg),
+            qos_profile=transient_qos,
+            callback_group=self.cb_group,
+        )
+        self.node.create_subscription(
+            DestinationGoal,
+            'robot1/destination/goal',
+            lambda msg: dest_goals_r1.append(msg),
+            qos_profile=transient_qos,
+            callback_group=self.cb_group,
+        )
+
+        sz_pub_r0 = self.node.create_publisher(
+            SafeZone,
+            'robot0/plan/safe_zone',
+            qos_profile=transient_qos,
+        )
+        sz_pub_r1 = self.node.create_publisher(
+            SafeZone,
+            'robot1/plan/safe_zone',
+            qos_profile=transient_qos,
+        )
+
+        outer_client_r0 = ActionClient(
+            self.node,
+            NavigateToPose,
+            'robot0/navigate_to_pose',
+            callback_group=self.cb_group,
+        )
+        outer_client_r1 = ActionClient(
+            self.node,
+            NavigateToPose,
+            'robot1/navigate_to_pose',
+            callback_group=self.cb_group,
+        )
+
+        def make_goal(x, y):
+            goal = NavigateToPose.Goal()
+            goal.pose.header.frame_id = 'map'
+            goal.pose.pose.position.x = float(x)
+            goal.pose.pose.position.y = float(y)
+            goal.pose.pose.orientation.w = 1.0
+            return goal
+
+        try:
+            self.assertTrue(outer_client_r0.wait_for_server(timeout_sec=10.0))
+            self.assertTrue(outer_client_r1.wait_for_server(timeout_sec=10.0))
+
+            time.sleep(0.2)
+            prev_r0_goals = len(dest_goals_r0)
+            prev_r1_goals = len(dest_goals_r1)
+
+            # Stage 1 (from README):
+            # robot0 -> (5.0, 5.0), robot1 -> (0.0, 3.0)
+            fb_r0_stage1 = []
+            fb_r1_stage1 = []
+
+            send_r0_s1 = outer_client_r0.send_goal_async(
+                make_goal(5.0, 5.0),
+                feedback_callback=lambda fb: fb_r0_stage1.append(fb.feedback),
+            )
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_r0_s1.done():
+                time.sleep(0.05)
+            handle_r0_s1 = send_r0_s1.result()
+            self.assertTrue(handle_r0_s1.accepted)
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline and len(dest_goals_r0) <= prev_r0_goals:
+                time.sleep(0.05)
+            r0_session_s1 = list(dest_goals_r0[-1].session.uuid)
+
+            send_r1_s1 = outer_client_r1.send_goal_async(
+                make_goal(0.0, 3.0),
+                feedback_callback=lambda fb: fb_r1_stage1.append(fb.feedback),
+            )
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_r1_s1.done():
+                time.sleep(0.05)
+            handle_r1_s1 = send_r1_s1.result()
+            self.assertTrue(handle_r1_s1.accepted)
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline and len(dest_goals_r1) <= prev_r1_goals:
+                time.sleep(0.05)
+            r1_session_s1 = list(dest_goals_r1[-1].session.uuid)
+
+            # Publish initial SafeZone for robot0 (plan_version=0) followed by multi-robot
+            # replanned SafeZones (plan_version=1) when robot1's destination is planned.
+            sz_pub_r0.publish(self.make_safe_zone(r0_session_s1, 0, 1, 2.0, 5.0))
+            time.sleep(0.1)
+            sz_pub_r0.publish(self.make_safe_zone(r0_session_s1, 1, 1, 5.0, 5.0))
+            sz_pub_r1.publish(self.make_safe_zone(r1_session_s1, 1, 1, 0.0, 3.0))
+
+            res_r0_s1 = handle_r0_s1.get_result_async()
+            res_r1_s1 = handle_r1_s1.get_result_async()
+            deadline = time.time() + 15.0
+            while time.time() < deadline and (not res_r0_s1.done() or not res_r1_s1.done()):
+                time.sleep(0.05)
+
+            self.assertTrue(res_r0_s1.done(), 'Stage 1 robot0 goal did not complete')
+            self.assertTrue(res_r1_s1.done(), 'Stage 1 robot1 goal did not complete')
+            self.assertEqual(res_r0_s1.result().status, GoalStatus.STATUS_SUCCEEDED)
+            self.assertEqual(res_r1_s1.result().status, GoalStatus.STATUS_SUCCEEDED)
+            self.assertGreater(len(fb_r0_stage1), 0, 'Expected Stage 1 feedback for robot0')
+            self.assertGreater(len(fb_r1_stage1), 0, 'Expected Stage 1 feedback for robot1')
+
+            # Stage 2 ("Alternate navigation goals" from README):
+            # robot0 -> (9.0, 3.0), robot1 -> (9.0, 6.0)
+            prev_r0_goals = len(dest_goals_r0)
+            prev_r1_goals = len(dest_goals_r1)
+            fb_r0_stage2 = []
+            fb_r1_stage2 = []
+
+            send_r0_s2 = outer_client_r0.send_goal_async(
+                make_goal(9.0, 3.0),
+                feedback_callback=lambda fb: fb_r0_stage2.append(fb.feedback),
+            )
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_r0_s2.done():
+                time.sleep(0.05)
+            handle_r0_s2 = send_r0_s2.result()
+            self.assertTrue(handle_r0_s2.accepted)
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline and len(dest_goals_r0) <= prev_r0_goals:
+                time.sleep(0.05)
+            r0_session_s2 = list(dest_goals_r0[-1].session.uuid)
+
+            send_r1_s2 = outer_client_r1.send_goal_async(
+                make_goal(9.0, 6.0),
+                feedback_callback=lambda fb: fb_r1_stage2.append(fb.feedback),
+            )
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_r1_s2.done():
+                time.sleep(0.05)
+            handle_r1_s2 = send_r1_s2.result()
+            self.assertTrue(handle_r1_s2.accepted)
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline and len(dest_goals_r1) <= prev_r1_goals:
+                time.sleep(0.05)
+            r1_session_s2 = list(dest_goals_r1[-1].session.uuid)
+
+            sz_pub_r0.publish(self.make_safe_zone(r0_session_s2, 2, 1, 9.0, 3.0))
+            sz_pub_r1.publish(self.make_safe_zone(r1_session_s2, 3, 1, 9.0, 6.0))
+            sz_pub_r0.publish(self.make_safe_zone(r0_session_s2, 3, 2, 9.0, 3.0))
+
+            res_r0_s2 = handle_r0_s2.get_result_async()
+            res_r1_s2 = handle_r1_s2.get_result_async()
+            deadline = time.time() + 15.0
+            while time.time() < deadline and (not res_r0_s2.done() or not res_r1_s2.done()):
+                time.sleep(0.05)
+
+            self.assertTrue(res_r0_s2.done(), 'Stage 2 robot0 goal did not complete')
+            self.assertTrue(res_r1_s2.done(), 'Stage 2 robot1 goal did not complete')
+            self.assertEqual(res_r0_s2.result().status, GoalStatus.STATUS_SUCCEEDED)
+            self.assertEqual(res_r1_s2.result().status, GoalStatus.STATUS_SUCCEEDED)
+            self.assertGreater(len(fb_r0_stage2), 0, 'Expected Stage 2 feedback for robot0')
+            self.assertGreater(len(fb_r1_stage2), 0, 'Expected Stage 2 feedback for robot1')
+        finally:
+            inner_server_r0.destroy()
+            inner_server_r1.destroy()
+            outer_client_r0.destroy()
+            outer_client_r1.destroy()

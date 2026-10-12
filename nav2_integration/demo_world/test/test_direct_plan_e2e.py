@@ -308,9 +308,10 @@ class TestDirectPlanE2E(unittest.TestCase):
                 'Expected inner NavigateToPose targets for robot1',
             )
 
-            # Now test two-robot outer ~/navigate_to_pose goals sent sequentially
-            # (reproducing the nav2_integration README workflow where robot0 gets a goal
-            # first and robot1 gets a goal second, triggering a multi-robot replan).
+            # Part 2: Exact two-stage happy-path scenario from nav2_integration/README.md.
+            # Initial poses: robot0=(0.0, 5.0), robot1=(3.0, 5.0)
+            # First destination set: robot0 -> (5.0, 5.0), robot1 -> (0.0, 3.0)
+            # Second destination set: robot0 -> (9.0, 3.0), robot1 -> (9.0, 6.0)
             def forward_goal(pub, goal_msg):
                 if not goal_msg.one_of:
                     return
@@ -349,30 +350,47 @@ class TestDirectPlanE2E(unittest.TestCase):
             self.assertTrue(outer_r0.wait_for_server(timeout_sec=10.0))
             self.assertTrue(outer_r1.wait_for_server(timeout_sec=10.0))
 
-            goal_r0 = NavigateToPose.Goal()
-            goal_r0.pose.header.frame_id = 'map'
-            goal_r0.pose.pose.position.x = 6.0
-            goal_r0.pose.pose.position.y = 0.0
-            goal_r0.pose.pose.orientation.w = 1.0
+            r0.set_pose_and_speed(0.0, 5.0, 4.0)
+            r1.set_pose_and_speed(3.0, 5.0, 4.0)
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if (
+                    r0.odoms
+                    and r1.odoms
+                    and math.hypot(r0.odoms[-1][0] - 0.0, r0.odoms[-1][1] - 5.0) < 0.1
+                    and math.hypot(r1.odoms[-1][0] - 3.0, r1.odoms[-1][1] - 5.0) < 0.1
+                ):
+                    break
+                time.sleep(0.05)
 
-            goal_r1 = NavigateToPose.Goal()
-            goal_r1.pose.header.frame_id = 'map'
-            goal_r1.pose.pose.position.x = 6.0
-            goal_r1.pose.pose.position.y = 3.0
-            goal_r1.pose.pose.orientation.w = 1.0
+            def make_nav_goal(x, y):
+                goal = NavigateToPose.Goal()
+                goal.pose.header.frame_id = 'map'
+                goal.pose.pose.position.x = float(x)
+                goal.pose.pose.position.y = float(y)
+                goal.pose.pose.orientation.w = 1.0
+                return goal
 
-            send_r0 = outer_r0.send_goal_async(goal_r0)
+            # Stage 1: robot0 -> (5.0, 5.0), robot1 -> (0.0, 3.0)
+            fb_r0_stage1 = []
+            fb_r1_stage1 = []
+
+            send_r0 = outer_r0.send_goal_async(
+                make_nav_goal(5.0, 5.0),
+                feedback_callback=lambda fb: fb_r0_stage1.append(fb.feedback),
+            )
             deadline = time.time() + 10.0
             while time.time() < deadline and not send_r0.done():
                 time.sleep(0.05)
             handle_r0 = send_r0.result()
             self.assertTrue(handle_r0.accepted)
 
-            # Give rmf_path_server a moment to start/complete planning for robot0
-            # before sending the second robot's goal.
             time.sleep(0.25)
 
-            send_r1 = outer_r1.send_goal_async(goal_r1)
+            send_r1 = outer_r1.send_goal_async(
+                make_nav_goal(0.0, 3.0),
+                feedback_callback=lambda fb: fb_r1_stage1.append(fb.feedback),
+            )
             deadline = time.time() + 10.0
             while time.time() < deadline and not send_r1.done():
                 time.sleep(0.05)
@@ -381,22 +399,76 @@ class TestDirectPlanE2E(unittest.TestCase):
 
             res_r0 = handle_r0.get_result_async()
             res_r1 = handle_r1.get_result_async()
-            deadline = time.time() + 25.0
+            deadline = time.time() + 30.0
             while time.time() < deadline and (not res_r0.done() or not res_r1.done()):
                 time.sleep(0.1)
 
-            self.assertTrue(res_r0.done(), 'robot0 outer NavigateToPose did not finish')
-            self.assertTrue(res_r1.done(), 'robot1 outer NavigateToPose did not finish')
+            self.assertTrue(res_r0.done(), 'Stage 1 robot0 outer NavigateToPose did not finish')
+            self.assertTrue(res_r1.done(), 'Stage 1 robot1 outer NavigateToPose did not finish')
             self.assertEqual(
                 res_r0.result().status,
                 GoalStatus.STATUS_SUCCEEDED,
-                f'robot0 outer goal failed with status {res_r0.result().status}',
+                f'Stage 1 robot0 outer goal failed with status {res_r0.result().status}',
             )
             self.assertEqual(
                 res_r1.result().status,
                 GoalStatus.STATUS_SUCCEEDED,
-                f'robot1 outer goal failed with status {res_r1.result().status}',
+                f'Stage 1 robot1 outer goal failed with status {res_r1.result().status}',
             )
+            self.assertGreater(len(fb_r0_stage1), 0, 'Expected Stage 1 feedback for robot0')
+            self.assertGreater(len(fb_r1_stage1), 0, 'Expected Stage 1 feedback for robot1')
+
+            # Stage 2 ("Alternate navigation goals" in README):
+            # robot0 -> (9.0, 3.0), robot1 -> (9.0, 6.0)
+            fb_r0_stage2 = []
+            fb_r1_stage2 = []
+
+            send_r0_s2 = outer_r0.send_goal_async(
+                make_nav_goal(9.0, 3.0),
+                feedback_callback=lambda fb: fb_r0_stage2.append(fb.feedback),
+            )
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_r0_s2.done():
+                time.sleep(0.05)
+            handle_r0_s2 = send_r0_s2.result()
+            self.assertTrue(handle_r0_s2.accepted)
+
+            time.sleep(0.25)
+
+            send_r1_s2 = outer_r1.send_goal_async(
+                make_nav_goal(9.0, 6.0),
+                feedback_callback=lambda fb: fb_r1_stage2.append(fb.feedback),
+            )
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_r1_s2.done():
+                time.sleep(0.05)
+            handle_r1_s2 = send_r1_s2.result()
+            self.assertTrue(handle_r1_s2.accepted)
+
+            res_r0_s2 = handle_r0_s2.get_result_async()
+            res_r1_s2 = handle_r1_s2.get_result_async()
+            deadline = time.time() + 30.0
+            while time.time() < deadline and (not res_r0_s2.done() or not res_r1_s2.done()):
+                time.sleep(0.1)
+
+            self.assertTrue(
+                res_r0_s2.done(), 'Stage 2 robot0 outer NavigateToPose did not finish'
+            )
+            self.assertTrue(
+                res_r1_s2.done(), 'Stage 2 robot1 outer NavigateToPose did not finish'
+            )
+            self.assertEqual(
+                res_r0_s2.result().status,
+                GoalStatus.STATUS_SUCCEEDED,
+                f'Stage 2 robot0 outer goal failed with status {res_r0_s2.result().status}',
+            )
+            self.assertEqual(
+                res_r1_s2.result().status,
+                GoalStatus.STATUS_SUCCEEDED,
+                f'Stage 2 robot1 outer goal failed with status {res_r1_s2.result().status}',
+            )
+            self.assertGreater(len(fb_r0_stage2), 0, 'Expected Stage 2 feedback for robot0')
+            self.assertGreater(len(fb_r1_stage2), 0, 'Expected Stage 2 feedback for robot1')
 
             # Part 3: Two-robot follower scenario where the follower's outer
             # ~/navigate_to_pose goal is cancelled mid-execution.
