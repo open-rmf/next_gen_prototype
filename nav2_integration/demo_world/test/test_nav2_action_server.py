@@ -479,3 +479,295 @@ class TestNav2ActionServer(unittest.TestCase):
             inner_server_r1.destroy()
             outer_client_r0.destroy()
             outer_client_r1.destroy()
+
+    def test_cancel_follower_in_two_robot_scenario(self):
+        dest_goals_r0 = []
+        dest_goals_r1 = []
+        r0_inner_targets = []
+        r1_inner_targets = []
+        r0_inner_started = threading.Event()
+        r0_inner_cancelled = threading.Event()
+        r0_lock = threading.Lock()
+        r1_lock = threading.Lock()
+        r0_pos = [0.0, 0.0]
+        r1_pos = [3.0, 0.0]
+
+        def execute_r0_inner(goal_handle):
+            tx = float(goal_handle.request.pose.pose.position.x)
+            ty = float(goal_handle.request.pose.pose.position.y)
+            r0_inner_targets.append((tx, ty))
+            r0_inner_started.set()
+            dt = 0.05
+            speed = 1.0
+            while rclpy.ok():
+                if goal_handle.is_cancel_requested:
+                    r0_inner_cancelled.set()
+                    goal_handle.canceled()
+                    return NavigateToPose.Result()
+                with r0_lock:
+                    dx = tx - r0_pos[0]
+                    dy = ty - r0_pos[1]
+                    dist = (dx * dx + dy * dy) ** 0.5
+                    if dist <= speed * dt:
+                        r0_pos[0] = tx
+                        r0_pos[1] = ty
+                        reached = True
+                    else:
+                        r0_pos[0] += (dx / dist) * speed * dt
+                        r0_pos[1] += (dy / dist) * speed * dt
+                        reached = False
+                    cx, cy = r0_pos[0], r0_pos[1]
+
+                feedback = NavigateToPose.Feedback()
+                feedback.current_pose = PoseStamped()
+                feedback.current_pose.header.frame_id = 'map'
+                feedback.current_pose.pose.position.x = cx
+                feedback.current_pose.pose.position.y = cy
+                feedback.current_pose.pose.orientation.w = 1.0
+                goal_handle.publish_feedback(feedback)
+
+                if reached:
+                    goal_handle.succeed()
+                    return NavigateToPose.Result()
+                time.sleep(dt)
+            goal_handle.abort()
+            return NavigateToPose.Result()
+
+        def execute_r1_inner(goal_handle):
+            tx = float(goal_handle.request.pose.pose.position.x)
+            ty = float(goal_handle.request.pose.pose.position.y)
+            r1_inner_targets.append((tx, ty))
+            dt = 0.05
+            speed = 5.0
+            while rclpy.ok():
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                    return NavigateToPose.Result()
+                with r1_lock:
+                    dx = tx - r1_pos[0]
+                    dy = ty - r1_pos[1]
+                    dist = (dx * dx + dy * dy) ** 0.5
+                    if dist <= speed * dt:
+                        r1_pos[0] = tx
+                        r1_pos[1] = ty
+                        reached = True
+                    else:
+                        r1_pos[0] += (dx / dist) * speed * dt
+                        r1_pos[1] += (dy / dist) * speed * dt
+                        reached = False
+                    cx, cy = r1_pos[0], r1_pos[1]
+
+                feedback = NavigateToPose.Feedback()
+                feedback.current_pose = PoseStamped()
+                feedback.current_pose.header.frame_id = 'map'
+                feedback.current_pose.pose.position.x = cx
+                feedback.current_pose.pose.position.y = cy
+                feedback.current_pose.pose.orientation.w = 1.0
+                goal_handle.publish_feedback(feedback)
+
+                if reached:
+                    goal_handle.succeed()
+                    return NavigateToPose.Result()
+                time.sleep(dt)
+            goal_handle.abort()
+            return NavigateToPose.Result()
+
+        inner_server_r0 = ActionServer(
+            self.node,
+            NavigateToPose,
+            'robot0/inner/navigate_to_pose',
+            execute_callback=execute_r0_inner,
+            goal_callback=lambda _: GoalResponse.ACCEPT,
+            cancel_callback=lambda _: CancelResponse.ACCEPT,
+            callback_group=self.cb_group,
+        )
+        inner_server_r1 = ActionServer(
+            self.node,
+            NavigateToPose,
+            'robot1/inner/navigate_to_pose',
+            execute_callback=execute_r1_inner,
+            goal_callback=lambda _: GoalResponse.ACCEPT,
+            cancel_callback=lambda _: CancelResponse.ACCEPT,
+            callback_group=self.cb_group,
+        )
+
+        transient_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
+        self.node.create_subscription(
+            DestinationGoal,
+            'robot0/destination/goal',
+            lambda msg: dest_goals_r0.append(msg),
+            qos_profile=transient_qos,
+            callback_group=self.cb_group,
+        )
+        self.node.create_subscription(
+            DestinationGoal,
+            'robot1/destination/goal',
+            lambda msg: dest_goals_r1.append(msg),
+            qos_profile=transient_qos,
+            callback_group=self.cb_group,
+        )
+
+        sz_pub_r0 = self.node.create_publisher(
+            SafeZone,
+            'robot0/plan/safe_zone',
+            qos_profile=transient_qos,
+        )
+        sz_pub_r1 = self.node.create_publisher(
+            SafeZone,
+            'robot1/plan/safe_zone',
+            qos_profile=transient_qos,
+        )
+
+        outer_client_r0 = ActionClient(
+            self.node,
+            NavigateToPose,
+            'robot0/navigate_to_pose',
+            callback_group=self.cb_group,
+        )
+        outer_client_r1 = ActionClient(
+            self.node,
+            NavigateToPose,
+            'robot1/navigate_to_pose',
+            callback_group=self.cb_group,
+        )
+
+        try:
+            self.assertTrue(outer_client_r0.wait_for_server(timeout_sec=10.0))
+            self.assertTrue(outer_client_r1.wait_for_server(timeout_sec=10.0))
+
+            # Clear any transient-local DestinationGoal messages from prior tests
+            time.sleep(0.2)
+            prev_r0_goals = len(dest_goals_r0)
+            prev_r1_goals = len(dest_goals_r1)
+
+            # Two-robot follower scenario:
+            # robot1 (leader) starts at (3.0, 0.0) and goes to (10.0, 0.0)
+            # robot0 (follower) starts at (0.0, 0.0) and goes to (9.0, 0.0)
+            goal_r1 = NavigateToPose.Goal()
+            goal_r1.pose.header.frame_id = 'map'
+            goal_r1.pose.pose.position.x = 10.0
+            goal_r1.pose.pose.position.y = 0.0
+            goal_r1.pose.pose.orientation.w = 1.0
+
+            goal_r0 = NavigateToPose.Goal()
+            goal_r0.pose.header.frame_id = 'map'
+            goal_r0.pose.pose.position.x = 9.0
+            goal_r0.pose.pose.position.y = 0.0
+            goal_r0.pose.pose.orientation.w = 1.0
+
+            send_future_r1 = outer_client_r1.send_goal_async(goal_r1)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_future_r1.done():
+                time.sleep(0.05)
+            goal_handle_r1 = send_future_r1.result()
+            self.assertTrue(goal_handle_r1.accepted)
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline and len(dest_goals_r1) <= prev_r1_goals:
+                time.sleep(0.05)
+            r1_session = list(dest_goals_r1[-1].session.uuid)
+
+            send_future_r0 = outer_client_r0.send_goal_async(goal_r0)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_future_r0.done():
+                time.sleep(0.05)
+            goal_handle_r0 = send_future_r0.result()
+            self.assertTrue(goal_handle_r0.accepted)
+
+            deadline = time.time() + 5.0
+            while time.time() < deadline and len(dest_goals_r0) <= prev_r0_goals:
+                time.sleep(0.05)
+            r0_session = list(dest_goals_r0[-1].session.uuid)
+
+            # Leader (robot1) gets SafeZone to (10.0, 0.0);
+            # Follower (robot0) is initially gated behind robot1 at (2.0, 0.0).
+            sz_pub_r1.publish(self.make_safe_zone(r1_session, 1, 1, 10.0, 0.0))
+            sz_pub_r0.publish(self.make_safe_zone(r0_session, 1, 1, 2.0, 0.0))
+
+            self.assertTrue(
+                r0_inner_started.wait(timeout=10.0),
+                'Follower robot0 inner goal did not start',
+            )
+            # Wait for follower robot0 to begin moving toward (2.0, 0.0)
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                with r0_lock:
+                    if r0_pos[0] > 0.15:
+                        break
+                time.sleep(0.05)
+
+            # Cancel the follower robot0's outer task
+            cancel_future_r0 = goal_handle_r0.cancel_goal_async()
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not cancel_future_r0.done():
+                time.sleep(0.05)
+            self.assertTrue(cancel_future_r0.done(), 'Follower cancel_goal_async timed out')
+
+            result_future_r0 = goal_handle_r0.get_result_async()
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not result_future_r0.done():
+                time.sleep(0.05)
+            self.assertTrue(result_future_r0.done(), 'Follower outer goal result timed out')
+            self.assertEqual(
+                result_future_r0.result().status,
+                GoalStatus.STATUS_CANCELED,
+                'Follower outer action goal status should be CANCELED',
+            )
+
+            self.assertTrue(
+                r0_inner_cancelled.wait(timeout=10.0),
+                'Expected follower inner navigation goal to be cancelled',
+            )
+            with r0_lock:
+                stopped_x, stopped_y = r0_pos[0], r0_pos[1]
+            stopped_target_count = len(r0_inner_targets)
+
+            # As the leader advances, rmf_plan_executor unblocks subsequent SafeZones
+            # for the follower's cancelled session. These must be ignored so the
+            # follower remains stationary.
+            sz_pub_r0.publish(self.make_safe_zone(r0_session, 1, 2, 5.0, 0.0))
+            time.sleep(0.2)
+            sz_pub_r0.publish(self.make_safe_zone(r0_session, 1, 3, 9.0, 0.0))
+            time.sleep(0.3)
+
+            with r0_lock:
+                final_x, final_y = r0_pos[0], r0_pos[1]
+            self.assertAlmostEqual(
+                final_x,
+                stopped_x,
+                places=4,
+                msg='Follower robot0 should remain stationary after cancellation',
+            )
+            self.assertAlmostEqual(
+                final_y,
+                stopped_y,
+                places=4,
+                msg='Follower robot0 should remain stationary after cancellation',
+            )
+            self.assertEqual(
+                len(r0_inner_targets),
+                stopped_target_count,
+                'Follower robot0 must not receive new inner goals for its cancelled session',
+            )
+
+            # Meanwhile leader robot1 should complete its goal normally
+            result_future_r1 = goal_handle_r1.get_result_async()
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not result_future_r1.done():
+                time.sleep(0.05)
+            self.assertTrue(result_future_r1.done(), 'Leader outer goal did not complete')
+            self.assertEqual(
+                result_future_r1.result().status,
+                GoalStatus.STATUS_SUCCEEDED,
+            )
+        finally:
+            inner_server_r0.destroy()
+            inner_server_r1.destroy()
+            outer_client_r0.destroy()
+            outer_client_r1.destroy()

@@ -41,6 +41,23 @@ pub struct NavigateToPoseServer {
     pub request_sender: Sender<CurrentNavigationRequest>,
 }
 
+#[derive(Component, Clone, Debug, Default)]
+pub struct CancelledNavigationSessions {
+    sessions: Vec<RosUuid>,
+}
+
+impl CancelledNavigationSessions {
+    pub fn insert(&mut self, session: RosUuid) {
+        if !self.sessions.contains(&session) {
+            self.sessions.push(session);
+        }
+    }
+
+    pub fn contains(&self, session: &RosUuid) -> bool {
+        self.sessions.contains(session)
+    }
+}
+
 #[derive(Default)]
 pub struct NavigationServerPlugin {}
 
@@ -49,7 +66,10 @@ impl Plugin for NavigationServerPlugin {
         // TODO(@xiyuoh) have a systematic approach to setting schedules for systems
         app.add_systems(
             PreUpdate,
-            request_publish_feedback_service.after(update_incremental_target),
+            (
+                handle_navigation_cancellations.before(update_incremental_target),
+                request_publish_feedback_service.after(update_incremental_target),
+            ),
         )
         .add_systems(PostUpdate, cleanup_navigation)
         .add_event::<NavigationCompleted>()
@@ -109,11 +129,42 @@ fn create_navigation_server(
         )
     });
 
-    commands.entity(agent_entity).insert(NavigateToPoseServer {
-        action_server: Arc::new(action_server),
-        request_receiver: rx,
-        request_sender: tx,
-    });
+    commands.entity(agent_entity).insert((
+        NavigateToPoseServer {
+            action_server: Arc::new(action_server),
+            request_receiver: rx,
+            request_sender: tx,
+        },
+        CancelledNavigationSessions::default(),
+    ));
+}
+
+fn handle_navigation_cancellations(
+    mut commands: Commands,
+    mut current_nav_requests: Query<(Entity, &mut CurrentNavigationRequest)>,
+    mut cancelled_sessions: Query<&mut CancelledNavigationSessions>,
+    mut cancel_inner_for_agent: EventWriter<CancelInnerForAgent>,
+) {
+    for (agent, mut current_nav_request) in current_nav_requests.iter_mut() {
+        if let Ok(cancel) = current_nav_request.cancel_receiver.try_recv() {
+            info!(
+                "[{:?}] Client cancelled NavigationRequest {:?}, cancelling inner navigation",
+                agent.index(),
+                current_nav_request.plan_id()
+            );
+            if let Ok(mut cancelled) = cancelled_sessions.get_mut(agent) {
+                for session in current_nav_request.superseded_sessions() {
+                    cancelled.insert(session.clone());
+                }
+                cancelled.insert(current_nav_request.session().clone());
+            }
+            cancel_inner_for_agent.write(cancel);
+            commands
+                .entity(agent)
+                .remove::<CurrentNavigationRequest>()
+                .remove::<CancellingInnerNavigation>();
+        }
+    }
 }
 
 fn request_publish_feedback_service(
@@ -121,6 +172,7 @@ fn request_publish_feedback_service(
     mut navigation_servers: Query<&NavigateToPoseServer>,
     current_nav_requests: Query<&CurrentNavigationRequest>,
     current_safe_zones: Query<&CurrentSafeZone>,
+    mut cancelled_sessions: Query<&mut CancelledNavigationSessions>,
     mut cancel_inner_for_agent: EventWriter<CancelInnerForAgent>,
     navigation_services: Res<NavigationServices>,
 ) {
@@ -170,6 +222,24 @@ fn request_publish_feedback_service(
                     should_cancel_inner = true;
                 }
             }
+        }
+
+        if let Ok(mut cancelled) = cancelled_sessions.get_mut(agent) {
+            for session in request.superseded_sessions() {
+                cancelled.insert(session.clone());
+            }
+        }
+
+        if let Ok(cancel) = request.cancel_receiver.try_recv() {
+            if let Ok(mut cancelled) = cancelled_sessions.get_mut(agent) {
+                cancelled.insert(request.session().clone());
+            }
+            cancel_inner_for_agent.write(cancel);
+            commands
+                .entity(agent)
+                .remove::<CurrentNavigationRequest>()
+                .remove::<CancellingInnerNavigation>();
+            continue;
         }
 
         if should_cancel_inner {
@@ -262,7 +332,10 @@ async fn nav_to_pose_action(
 
     let executing = match handle.accept().begin() {
         BeginAcceptedGoal::Execute(executing) => executing,
-        BeginAcceptedGoal::Cancel(cancelling) => return cancelling.cancelled_with(result),
+        BeginAcceptedGoal::Cancel(cancelling) => {
+            let _ = send_cancel();
+            return cancelling.cancelled_with(result);
+        }
     };
 
     let cancelling = loop {
@@ -503,6 +576,7 @@ fn monitor_inner_navigation_clients(
         Option<&AgentPose>,
         &mut CurrentNavigationRequest,
     )>,
+    mut cancelled_sessions: Query<&mut CancelledNavigationSessions>,
     mut cancel_inner_for_agent: EventWriter<CancelInnerForAgent>,
     mut nav_completed: EventWriter<NavigationCompleted>,
 ) {
@@ -550,6 +624,12 @@ fn monitor_inner_navigation_clients(
                 "[{:?}] Client cancelled NavigationRequest, cancelling inner navigation",
                 request.agent.index()
             );
+            if let Ok(mut cancelled) = cancelled_sessions.get_mut(request.agent) {
+                for session in current_nav_request.superseded_sessions() {
+                    cancelled.insert(session.clone());
+                }
+                cancelled.insert(current_nav_request.session().clone());
+            }
             cancel_inner_for_agent.write(cancel);
             commands
                 .entity(request.agent)

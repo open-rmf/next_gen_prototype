@@ -172,6 +172,17 @@ class MockNav2AgentHarness:
         goal_handle.abort()
         return NavigateToPose.Result()
 
+    def set_pose_and_speed(self, x, y, speed):
+        with self.lock:
+            self.x = float(x)
+            self.y = float(y)
+            self.speed = float(speed)
+        self.publish_amcl_pose()
+
+    def get_pose(self):
+        with self.lock:
+            return self.x, self.y
+
     def destroy(self):
         self.action_server.destroy()
 
@@ -385,6 +396,118 @@ class TestDirectPlanE2E(unittest.TestCase):
                 res_r1.result().status,
                 GoalStatus.STATUS_SUCCEEDED,
                 f'robot1 outer goal failed with status {res_r1.result().status}',
+            )
+
+            # Part 3: Two-robot follower scenario where the follower's outer
+            # ~/navigate_to_pose goal is cancelled mid-execution.
+            # Position robot0 (follower) at (0.0, 0.0) and robot1 (leader) at (3.0, 0.0).
+            r0.set_pose_and_speed(0.0, 0.0, 1.0)
+            r1.set_pose_and_speed(3.0, 0.0, 2.5)
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if (
+                    r0.odoms
+                    and r1.odoms
+                    and math.hypot(r0.odoms[-1][0] - 0.0, r0.odoms[-1][1] - 0.0) < 0.1
+                    and math.hypot(r1.odoms[-1][0] - 3.0, r1.odoms[-1][1] - 0.0) < 0.1
+                ):
+                    break
+                time.sleep(0.05)
+
+            leader_goal = NavigateToPose.Goal()
+            leader_goal.pose.header.frame_id = 'map'
+            leader_goal.pose.pose.position.x = 10.0
+            leader_goal.pose.pose.position.y = 0.0
+            leader_goal.pose.pose.orientation.w = 1.0
+
+            follower_goal = NavigateToPose.Goal()
+            follower_goal.pose.header.frame_id = 'map'
+            follower_goal.pose.pose.position.x = 9.0
+            follower_goal.pose.pose.position.y = 0.0
+            follower_goal.pose.pose.orientation.w = 1.0
+
+            send_leader = outer_r1.send_goal_async(leader_goal)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_leader.done():
+                time.sleep(0.05)
+            handle_leader = send_leader.result()
+            self.assertTrue(handle_leader.accepted)
+
+            send_follower = outer_r0.send_goal_async(follower_goal)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not send_follower.done():
+                time.sleep(0.05)
+            handle_follower = send_follower.result()
+            self.assertTrue(handle_follower.accepted)
+
+            # Wait until follower robot0 has started moving along y=0.0
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                fx, _ = r0.get_pose()
+                if fx > 0.15:
+                    break
+                time.sleep(0.05)
+            self.assertGreater(r0.get_pose()[0], 0.1, 'Follower robot0 did not start moving')
+
+            # Cancel the follower robot0's outer task
+            cancel_follower = handle_follower.cancel_goal_async()
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not cancel_follower.done():
+                time.sleep(0.05)
+            self.assertTrue(cancel_follower.done(), 'Follower cancel_goal_async timed out')
+
+            res_follower = handle_follower.get_result_async()
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not res_follower.done():
+                time.sleep(0.05)
+            self.assertTrue(res_follower.done(), 'Follower outer goal did not terminate')
+            self.assertEqual(
+                res_follower.result().status,
+                GoalStatus.STATUS_CANCELED,
+                'Follower outer goal should terminate with STATUS_CANCELED',
+            )
+
+            # Allow inner cancellation to settle and record the follower's stopped pose
+            time.sleep(0.3)
+            stopped_x, stopped_y = r0.get_pose()
+            stopped_targets = len(r0.received_targets)
+
+            # Wait for the leader robot1 to finish reaching (10.0, 0.0)
+            res_leader = handle_leader.get_result_async()
+            deadline = time.time() + 25.0
+            while time.time() < deadline and not res_leader.done():
+                time.sleep(0.1)
+            self.assertTrue(res_leader.done(), 'Leader outer goal did not finish')
+            self.assertEqual(
+                res_leader.result().status,
+                GoalStatus.STATUS_SUCCEEDED,
+            )
+
+            # Give rmf_plan_executor a brief window after leader completion and verify
+            # the cancelled follower remained completely stationary.
+            time.sleep(0.3)
+            final_x, final_y = r0.get_pose()
+            self.assertAlmostEqual(
+                final_x,
+                stopped_x,
+                places=3,
+                msg='Follower robot0 should remain stationary after task cancellation',
+            )
+            self.assertAlmostEqual(
+                final_y,
+                stopped_y,
+                places=3,
+                msg='Follower robot0 should remain stationary after task cancellation',
+            )
+            self.assertEqual(
+                len(r0.received_targets),
+                stopped_targets,
+                'Follower robot0 must not receive new inner targets after cancellation',
+            )
+            self.assertLess(
+                final_x,
+                5.0,
+                'Cancelled follower robot0 should have stopped well before its (9.0, 0.0) goal',
             )
 
             outer_r0.destroy()

@@ -1,6 +1,6 @@
 use crate::{
     inner_navigation_client::{CancellingInnerNavigation, InnerNavigationTarget},
-    navigation_server::CurrentNavigationRequest,
+    navigation_server::{CancelledNavigationSessions, CurrentNavigationRequest},
     Nav2Agent,
 };
 use bevy::prelude::*;
@@ -185,6 +185,7 @@ pub(crate) fn update_incremental_target(
     mut commands: Commands,
     mut nav_target: EventWriter<InnerNavigationTarget>,
     mut current_nav_requests: Query<&mut CurrentNavigationRequest>,
+    mut cancelled_sessions: Query<&mut CancelledNavigationSessions>,
     mut subscriptions: Query<(
         Entity,
         &SafeZoneSubscription,
@@ -213,9 +214,21 @@ pub(crate) fn update_incremental_target(
             continue;
         };
 
+        let incoming_plan_id = &safe_zone.id.plan_id;
+        let incoming_session = &incoming_plan_id.destination_session;
+
+        if cancelled_sessions
+            .get(e)
+            .is_ok_and(|cancelled| cancelled.contains(incoming_session))
+        {
+            debug!(
+                "[{:?}] Ignoring SafeZone for cancelled destination_session {:?}",
+                agent.name, incoming_plan_id
+            );
+            continue;
+        }
+
         if let Ok(mut current_nav_req) = current_nav_requests.get_mut(e) {
-            let incoming_plan_id = &safe_zone.id.plan_id;
-            let incoming_session = &incoming_plan_id.destination_session;
             if current_nav_req.session() == incoming_session {
                 current_nav_req.clear_superseded_sessions();
             } else if current_nav_req.is_superseded_session(incoming_session) {
@@ -227,6 +240,12 @@ pub(crate) fn update_incremental_target(
                     current_nav_req.plan_id(),
                     incoming_plan_id
                 );
+                if let Ok(mut cancelled) = cancelled_sessions.get_mut(e) {
+                    for session in current_nav_req.superseded_sessions() {
+                        cancelled.insert(session.clone());
+                    }
+                    cancelled.insert(current_nav_req.session().clone());
+                }
                 current_nav_req.cancel();
                 commands
                     .entity(e)
