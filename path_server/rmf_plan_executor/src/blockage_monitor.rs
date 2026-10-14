@@ -93,14 +93,12 @@ pub(crate) fn route_intersects_map(map: &OccupancyGrid, route: &[(f32, f32)], ra
     for segment in route.windows(2) {
         let start = to_map(segment[0]);
         let end = to_map(segment[1]);
-        let min_x =
-            (((start.0.min(end.0) - search_margin) / resolution).floor() as isize).max(0);
-        let max_x = (((start.0.max(end.0) + search_margin) / resolution).ceil() as isize)
-            .min(width - 1);
-        let min_y =
-            (((start.1.min(end.1) - search_margin) / resolution).floor() as isize).max(0);
-        let max_y = (((start.1.max(end.1) + search_margin) / resolution).ceil() as isize)
-            .min(height - 1);
+        let min_x = (((start.0.min(end.0) - search_margin) / resolution).floor() as isize).max(0);
+        let max_x =
+            (((start.0.max(end.0) + search_margin) / resolution).ceil() as isize).min(width - 1);
+        let min_y = (((start.1.min(end.1) - search_margin) / resolution).floor() as isize).max(0);
+        let max_y =
+            (((start.1.max(end.1) + search_margin) / resolution).ceil() as isize).min(height - 1);
 
         for y in min_y..=max_y {
             for x in min_x..=max_x {

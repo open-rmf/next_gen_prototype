@@ -1,5 +1,21 @@
 # Progress.msg
 
+uint8 MODE_IDLE = 0
+uint8 MODE_NAVIGATING = 1
+uint8 MODE_ACTION = 2
+uint8 MODE_WAITING = 3
+uint8 MODE_ERROR = 4
+
+# Current estimated pose of the robot in the map/world frame.
+geometry_msgs/PoseStamped pose
+
+# Current operational mode of the robot (one of the MODE_* constants above).
+uint8 mode
+
+# Active safe zone identifier, if the robot is currently operating within an
+# allocated SafeZone.
+SafeZoneId[<=1] safe_zone_id
+
 # The continuous progress value of the robot along its current plan. This allows
 # us to continuously identify when traffic dependencies are satisfied without
 # being sensitive to the spacing of waypoints.
