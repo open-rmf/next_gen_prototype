@@ -1,10 +1,14 @@
+use crate::{
+    navigation_server::CurrentNavigationRequest,
+    safe_zone::{build_robot_status, CurrentSafeZone, LatestProgress, RobotStatusPublisher},
+};
 use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
 use mapf::negotiation::scenario::Agent;
 use ros_env::{
-    geometry_msgs::msg::{PoseWithCovarianceStamped, TwistWithCovariance},
+    geometry_msgs::msg::{PoseStamped, PoseWithCovarianceStamped, TwistWithCovariance},
     nav_msgs::msg::Odometry,
-    rmf_prototype_msgs::msg::{Participant, ParticipantList, SafeZoneId},
+    rmf_prototype_msgs::msg::{Participant, ParticipantList, RobotStatus, SafeZoneId},
 };
 use std::sync::Arc;
 
@@ -120,9 +124,23 @@ fn update_amcl_pose(
         &mut AmclPose,
         &AmclPoseSubscription,
         &OdomPublisher,
+        Option<&RobotStatusPublisher>,
+        Option<&LatestProgress>,
+        Option<&CurrentSafeZone>,
+        Option<&CurrentNavigationRequest>,
     )>,
 ) {
-    for (mut agent, mut amcl_pose, amcl_pose_sub, odom_pub) in agents.iter_mut() {
+    for (
+        mut agent,
+        mut amcl_pose,
+        amcl_pose_sub,
+        odom_pub,
+        status_pub,
+        latest_progress,
+        current_safe_zone,
+        current_nav_req,
+    ) in agents.iter_mut()
+    {
         if let Some(amcl_pose_msg) = amcl_pose_sub.subscriber.data_callback() {
             amcl_pose.0 = amcl_pose_msg.clone();
             agent.localized = true;
@@ -137,6 +155,22 @@ fn update_amcl_pose(
         odom.pose = amcl_pose.0.pose.clone();
         odom.twist = TwistWithCovariance::default();
         let _ = odom_pub.publisher.publish(odom);
+
+        if let Some(status_pub) = status_pub {
+            let pose = PoseStamped {
+                header: amcl_pose.0.header.clone(),
+                pose: amcl_pose.0.pose.pose.clone(),
+            };
+            let mode = if current_nav_req.is_some() {
+                RobotStatus::MODE_NAVIGATING
+            } else {
+                RobotStatus::MODE_IDLE
+            };
+            let prog = latest_progress.and_then(|lp| lp.0.as_ref());
+            let sz_id = current_safe_zone.and_then(|csz| csz.0.as_ref().map(|sz| &sz.id));
+            let status_msg = build_robot_status(pose, mode, prog, sz_id);
+            let _ = status_pub.publisher.publish(status_msg);
+        }
     }
 }
 

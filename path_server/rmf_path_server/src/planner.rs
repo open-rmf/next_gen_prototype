@@ -14,8 +14,8 @@
 
 use hetpibt::external_tracks_pibt::PiBTWithExternalTracks;
 use mapf_post::na::Isometry2;
-use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
-use ros_env::rmf_prototype_msgs::msg::Destination;
+use ros_env::nav_msgs::msg::OccupancyGrid;
+use ros_env::rmf_prototype_msgs::msg::{Destination, RobotStatus};
 use std::collections::HashMap;
 
 use std::sync::atomic::AtomicBool;
@@ -34,7 +34,7 @@ pub struct Map {
 pub trait MapfPlanner: Send + Sync + 'static {
     fn plan(
         &self,
-        starts: &HashMap<String, Odometry>,
+        starts: &HashMap<String, RobotStatus>,
         goals: &HashMap<String, Destination>,
         footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
@@ -49,7 +49,7 @@ pub struct MockPlanner;
 impl MapfPlanner for MockPlanner {
     fn plan(
         &self,
-        _starts: &HashMap<String, Odometry>,
+        _starts: &HashMap<String, RobotStatus>,
         _goals: &HashMap<String, Destination>,
         _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
@@ -148,7 +148,7 @@ fn planning_grid(
 impl MapfPlanner for PibtPlanner {
     fn plan(
         &self,
-        starts: &HashMap<String, Odometry>,
+        starts: &HashMap<String, RobotStatus>,
         goals: &HashMap<String, Destination>,
         _footprints: &HashMap<String, Arc<dyn mapf_post::shape::Shape>>,
         robot_ids: &[String],
@@ -171,9 +171,9 @@ impl MapfPlanner for PibtPlanner {
             let mut max_y = f32::MIN;
 
             for id in robot_ids {
-                if let Some(odom) = starts.get(id) {
-                    let x = odom.pose.pose.position.x as f32;
-                    let y = odom.pose.pose.position.y as f32;
+                if let Some(status) = starts.get(id) {
+                    let x = status.pose.pose.position.x as f32;
+                    let y = status.pose.pose.position.y as f32;
                     if x < min_x {
                         min_x = x;
                     }
@@ -235,11 +235,8 @@ impl MapfPlanner for PibtPlanner {
         let mut grid_ends = Vec::new();
 
         for id in robot_ids {
-            let odom = starts.get(id).ok_or_else(|| {
-                Box::<dyn std::error::Error>::from(format!(
-                    "Missing start odometry for agent {}",
-                    id
-                ))
+            let status = starts.get(id).ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(format!("Missing start status for agent {}", id))
             })?;
             let dest = goals.get(id).ok_or_else(|| {
                 Box::<dyn std::error::Error>::from(format!(
@@ -248,8 +245,10 @@ impl MapfPlanner for PibtPlanner {
                 ))
             })?;
 
-            let sx = ((odom.pose.pose.position.x as f32 - offset_x) / resolution).round() as usize;
-            let sy = ((odom.pose.pose.position.y as f32 - offset_y) / resolution).round() as usize;
+            let sx =
+                ((status.pose.pose.position.x as f32 - offset_x) / resolution).round() as usize;
+            let sy =
+                ((status.pose.pose.position.y as f32 - offset_y) / resolution).round() as usize;
 
             let gx_f32;
             let gy_f32;
@@ -390,10 +389,10 @@ mod tests {
     fn final_waypoint_clamped_to_exact_goal_coordinates() {
         let planner = PibtPlanner::default();
         let mut starts = HashMap::new();
-        let mut odom = Odometry::default();
-        odom.pose.pose.position.x = 0.0;
-        odom.pose.pose.position.y = 0.0;
-        starts.insert("robot_1".to_string(), odom);
+        let mut status = RobotStatus::default();
+        status.pose.pose.position.x = 0.0;
+        status.pose.pose.position.y = 0.0;
+        starts.insert("robot_1".to_string(), status);
 
         let mut goals = HashMap::new();
         let mut dest = Destination::default();
