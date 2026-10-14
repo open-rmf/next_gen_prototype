@@ -27,10 +27,11 @@ use ros_env::builtin_interfaces;
 use ros_env::geometry_msgs::msg::Pose;
 use ros_env::nav2_msgs;
 use ros_env::nav2_msgs::msg::Costmap;
-use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
+use ros_env::nav_msgs::msg::OccupancyGrid;
 use ros_env::rmf_prototype_msgs;
 use ros_env::rmf_prototype_msgs::msg::{
-    DestinationConstraints, Plan, PlanError, PlanRelease, SafeZone, SafeZoneId, TargetOrientation,
+    DestinationConstraints, Plan, PlanError, PlanRelease, Progress, SafeZone, SafeZoneId,
+    TargetOrientation,
 };
 use ros_env::std_msgs;
 use std::{
@@ -41,7 +42,7 @@ use std::{
 
 pub struct RobotState {
     pub radius: f32,
-    pub latest_odom: Option<Odometry>,
+    pub latest_progress: Option<Progress>,
     pub plan: Option<Plan>,
     pub waypoint_follower: Option<WaypointFollower>,
     pub safe_zone_version: u64,
@@ -223,7 +224,7 @@ impl PlanExecutor {
                 robot_id.to_string(),
                 RobotState {
                     radius,
-                    latest_odom: None,
+                    latest_progress: None,
                     plan: None,
                     waypoint_follower: None,
                     safe_zone_version: 0,
@@ -268,17 +269,17 @@ impl PlanExecutor {
                     mapf_post::Trajectory { poses: traj_poses },
                 );
 
-                if let Some(odom) = &robot_state.latest_odom {
-                    let current_x = odom.pose.pose.position.x as f32;
-                    let current_y = odom.pose.pose.position.y as f32;
+                if let Some(progress) = &robot_state.latest_progress {
+                    let current_x = progress.pose.pose.position.x as f32;
+                    let current_y = progress.pose.pose.position.y as f32;
                     let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
                     follower.update_position_estimate(&position, 0.5);
                 }
 
                 robot_state.waypoint_follower = Some(follower);
-            } else if let Some(odom) = &robot_state.latest_odom {
-                let current_x = odom.pose.pose.position.x as f32;
-                let current_y = odom.pose.pose.position.y as f32;
+            } else if let Some(progress) = &robot_state.latest_progress {
+                let current_x = progress.pose.pose.position.x as f32;
+                let current_y = progress.pose.pose.position.y as f32;
                 let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
                 let mut follower = WaypointFollower::from_trajectory(
                     agent_idx,
@@ -338,7 +339,7 @@ impl PlanExecutor {
         errors
     }
 
-    pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) -> ExecutionStepOutput {
+    pub fn handle_progress(&mut self, robot_id: &str, msg: Progress) -> ExecutionStepOutput {
         let current_x = msg.pose.pose.position.x as f32;
         let current_y = msg.pose.pose.position.y as f32;
 
@@ -347,7 +348,7 @@ impl PlanExecutor {
                 return ExecutionStepOutput::default();
             };
 
-            state.latest_odom = Some(msg.clone());
+            state.latest_progress = Some(msg.clone());
 
             if let Some(fw) = &mut state.waypoint_follower {
                 let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
@@ -428,9 +429,9 @@ impl PlanExecutor {
                 if r_name == robot_id {
                     continue;
                 }
-                if let Some(odom) = &r_state.latest_odom {
-                    let dx = wp_pos[0] - odom.pose.pose.position.x as f32;
-                    let dy = wp_pos[1] - odom.pose.pose.position.y as f32;
+                if let Some(progress) = &r_state.latest_progress {
+                    let dx = wp_pos[0] - progress.pose.pose.position.x as f32;
+                    let dy = wp_pos[1] - progress.pose.pose.position.y as f32;
                     if dx.hypot(dy) < 0.8 {
                         released_wp_idx = released_wp_idx.saturating_sub(1);
                         break;
@@ -455,11 +456,11 @@ impl PlanExecutor {
         let mut max_y = f32::MIN;
 
         for r_state in self.active_robots.values() {
-            if let Some(r_odom) = &r_state.latest_odom {
-                min_x = min_x.min(r_odom.pose.pose.position.x as f32);
-                min_y = min_y.min(r_odom.pose.pose.position.y as f32);
-                max_x = max_x.max(r_odom.pose.pose.position.x as f32);
-                max_y = max_y.max(r_odom.pose.pose.position.y as f32);
+            if let Some(r_progress) = &r_state.latest_progress {
+                min_x = min_x.min(r_progress.pose.pose.position.x as f32);
+                min_y = min_y.min(r_progress.pose.pose.position.y as f32);
+                max_x = max_x.max(r_progress.pose.pose.position.x as f32);
+                max_y = max_y.max(r_progress.pose.pose.position.y as f32);
             }
             if let Some(r_plan) = &r_state.plan {
                 for wp in &r_plan.waypoints {
@@ -524,11 +525,11 @@ impl PlanExecutor {
                         )
                     })
                     .collect()
-            } else if let Some(r_odom) = &r_state.latest_odom {
+            } else if let Some(r_progress) = &r_state.latest_progress {
                 vec![Isometry2::new(
                     Vector2::new(
-                        r_odom.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
-                        r_odom.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
+                        r_progress.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
+                        r_progress.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
                     ),
                     0.0,
                 )]
@@ -549,10 +550,10 @@ impl PlanExecutor {
                         trajectory_index: 0,
                     });
 
-            let real_position = if let Some(r_odom) = &r_state.latest_odom {
+            let real_position = if let Some(r_progress) = &r_state.latest_progress {
                 (
-                    r_odom.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
-                    r_odom.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
+                    r_progress.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
+                    r_progress.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
                 )
             } else {
                 (0.0, 0.0)
@@ -597,7 +598,7 @@ impl PlanExecutor {
             self.grid_height,
             self.grid_resolution,
             self.grid_origin.clone(),
-            msg.header.stamp.clone(),
+            msg.pose.header.stamp.clone(),
         );
 
         let plan_id = plan.plan_id.clone();
@@ -640,9 +641,9 @@ impl PlanExecutor {
     fn update_route_blockage(&mut self, robot_id: &str) -> Option<PlanError> {
         let map = self.latest_map.as_ref()?;
         let state = self.active_robots.get_mut(robot_id)?;
-        let (Some(plan), Some(odom), Some(follower)) = (
+        let (Some(plan), Some(progress), Some(follower)) = (
             state.plan.as_ref(),
-            state.latest_odom.as_ref(),
+            state.latest_progress.as_ref(),
             state.waypoint_follower.as_mut(),
         ) else {
             return None;
@@ -651,8 +652,8 @@ impl PlanExecutor {
         let remaining = follower.remaining_trajectory();
         let mut route = Vec::with_capacity(remaining.len() + 1);
         route.push((
-            odom.pose.pose.position.x as f32,
-            odom.pose.pose.position.y as f32,
+            progress.pose.pose.position.x as f32,
+            progress.pose.pose.position.y as f32,
         ));
         route.extend(remaining);
 
@@ -720,8 +721,8 @@ mod tests {
     use mapf_post::{Trajectory, WaypointFollower};
     use ros_env::{
         geometry_msgs::msg::Pose,
-        nav_msgs::msg::{OccupancyGrid, Odometry},
-        rmf_prototype_msgs::msg::{Plan, TrafficDependency, Waypoint},
+        nav_msgs::msg::OccupancyGrid,
+        rmf_prototype_msgs::msg::{Plan, Progress, TrafficDependency, Waypoint},
     };
 
     fn plan_with_positions(positions: &[[f32; 2]]) -> Plan {
@@ -899,18 +900,18 @@ mod tests {
         assert!(plan_executor.handle_robot_added("robot_1", 0.5));
         assert!(plan_executor.handle_robot_added("robot_2", 0.5));
 
-        // Send odometry for both robots
-        let mut odom1 = Odometry::default();
-        odom1.pose.pose.position.x = 0.0;
-        odom1.pose.pose.position.y = 0.0;
-        let out1 = plan_executor.handle_odometry("robot_1", odom1.clone());
+        // Send progress for both robots
+        let mut progress1 = Progress::default();
+        progress1.pose.pose.position.x = 0.0;
+        progress1.pose.pose.position.y = 0.0;
+        let out1 = plan_executor.handle_progress("robot_1", progress1.clone());
         assert!(out1.plan_release.is_none());
         assert!(out1.safe_zone.is_none());
 
-        let mut odom2 = Odometry::default();
-        odom2.pose.pose.position.x = 5.0;
-        odom2.pose.pose.position.y = 5.0;
-        let out2 = plan_executor.handle_odometry("robot_2", odom2.clone());
+        let mut progress2 = Progress::default();
+        progress2.pose.pose.position.x = 5.0;
+        progress2.pose.pose.position.y = 5.0;
+        let out2 = plan_executor.handle_progress("robot_2", progress2.clone());
         assert!(out2.plan_release.is_none());
         assert!(out2.safe_zone.is_none());
 
@@ -924,14 +925,14 @@ mod tests {
 
         assert!(plan_executor.handle_plan("robot_1", plan1));
 
-        // robot_1 odometry arrives: it should execute without error even though robot_2 has no plan!
-        let out1 = plan_executor.handle_odometry("robot_1", odom1);
+        // robot_1 progress arrives: it should execute without error even though robot_2 has no plan!
+        let out1 = plan_executor.handle_progress("robot_1", progress1);
         assert!(out1.plan_release.is_some());
         assert_eq!(out1.plan_release.unwrap().waypoint_id, 1);
         assert!(out1.safe_zone.is_some());
 
-        // robot_2 has no plan, so its odometry produces no release or safe zone
-        let out2 = plan_executor.handle_odometry("robot_2", odom2);
+        // robot_2 has no plan, so its progress produces no release or safe zone
+        let out2 = plan_executor.handle_progress("robot_2", progress2);
         assert!(out2.plan_release.is_none());
         assert!(out2.safe_zone.is_none());
     }
@@ -963,26 +964,26 @@ mod tests {
         plan_executor.handle_plan("robot_1", plan1);
         plan_executor.handle_plan("robot_2", plan2);
 
-        let mut odom2 = Odometry::default();
-        odom2.pose.pose.position.x = 0.0;
-        odom2.pose.pose.position.y = 5.0;
-        plan_executor.handle_odometry("robot_2", odom2);
+        let mut progress2 = Progress::default();
+        progress2.pose.pose.position.x = 0.0;
+        progress2.pose.pose.position.y = 5.0;
+        plan_executor.handle_progress("robot_2", progress2);
 
-        let mut odom1 = Odometry::default();
-        odom1.pose.pose.position.x = 0.0;
-        odom1.pose.pose.position.y = 0.0;
-        let out1 = plan_executor.handle_odometry("robot_1", odom1.clone());
+        let mut progress1 = Progress::default();
+        progress1.pose.pose.position.x = 0.0;
+        progress1.pose.pose.position.y = 0.0;
+        let out1 = plan_executor.handle_progress("robot_1", progress1.clone());
         // Held at waypoint 1 because robot_2 is still at waypoint 0
         assert_eq!(out1.plan_release.unwrap().waypoint_id, 1);
 
         // Advance robot_2 to waypoint 1 (2.0, 5.0)
-        let mut odom2_reached = Odometry::default();
-        odom2_reached.pose.pose.position.x = 2.0;
-        odom2_reached.pose.pose.position.y = 5.0;
-        plan_executor.handle_odometry("robot_2", odom2_reached);
+        let mut progress2_reached = Progress::default();
+        progress2_reached.pose.pose.position.x = 2.0;
+        progress2_reached.pose.pose.position.y = 5.0;
+        plan_executor.handle_progress("robot_2", progress2_reached);
 
         // Now robot_1 should be released up to waypoint 2
-        let out1_released = plan_executor.handle_odometry("robot_1", odom1);
+        let out1_released = plan_executor.handle_progress("robot_1", progress1);
         assert_eq!(out1_released.plan_release.unwrap().waypoint_id, 2);
     }
 
@@ -1021,10 +1022,10 @@ mod tests {
 
         assert!(plan_executor.handle_plan("robot_1", plan));
 
-        let mut odom1 = Odometry::default();
-        odom1.pose.pose.position.x = 0.0;
-        odom1.pose.pose.position.y = 0.0;
-        let out = plan_executor.handle_odometry("robot_1", odom1);
+        let mut progress1 = Progress::default();
+        progress1.pose.pose.position.x = 0.0;
+        progress1.pose.pose.position.y = 0.0;
+        let out = plan_executor.handle_progress("robot_1", progress1);
         let sz = out.safe_zone.expect("SafeZone should be emitted");
         assert_eq!(sz.incremental_target.regions.len(), 1);
         assert!((sz.incremental_target.regions[0].tolerance - 0.42).abs() < 1e-5);
@@ -1082,10 +1083,10 @@ mod tests {
         assert!(plan_executor.handle_plan("robot_1", plan));
 
         // 1. At start (0, 0), execution gates at wp[1] and forwards its node + orientation (-pi/2)
-        let mut odom1 = Odometry::default();
-        odom1.pose.pose.position.x = 0.0;
-        odom1.pose.pose.position.y = 0.0;
-        let out1 = plan_executor.handle_odometry("robot_1", odom1);
+        let mut progress1 = Progress::default();
+        progress1.pose.pose.position.x = 0.0;
+        progress1.pose.pose.position.y = 0.0;
+        let out1 = plan_executor.handle_progress("robot_1", progress1);
         assert_eq!(out1.plan_release.unwrap().waypoint_id, 1);
         let sz1 = out1.safe_zone.expect("SafeZone should be emitted at start");
         assert_eq!(sz1.target_waypoint.as_slice(), &[1]);
@@ -1103,10 +1104,10 @@ mod tests {
         assert_eq!(sz1.incremental_target.nodes[0].key.key.as_slice(), &[13]);
 
         // 2. At wp[1] (2, 0), execution gates at wp[2] and forwards its region orientation (pi) and tolerance (0.35)
-        let mut odom2 = Odometry::default();
-        odom2.pose.pose.position.x = 2.0;
-        odom2.pose.pose.position.y = 0.0;
-        let out2 = plan_executor.handle_odometry("robot_1", odom2);
+        let mut progress2 = Progress::default();
+        progress2.pose.pose.position.x = 2.0;
+        progress2.pose.pose.position.y = 0.0;
+        let out2 = plan_executor.handle_progress("robot_1", progress2);
         assert_eq!(out2.plan_release.unwrap().waypoint_id, 2);
         let sz2 = out2.safe_zone.expect("SafeZone should be emitted at wp[1]");
         assert_eq!(sz2.target_waypoint.as_slice(), &[2]);
@@ -1123,10 +1124,10 @@ mod tests {
         );
 
         // 3. At wp[2] (4, 0), execution releases to final wp[3]
-        let mut odom3 = Odometry::default();
-        odom3.pose.pose.position.x = 4.0;
-        odom3.pose.pose.position.y = 0.0;
-        let out3 = plan_executor.handle_odometry("robot_1", odom3);
+        let mut progress3 = Progress::default();
+        progress3.pose.pose.position.x = 4.0;
+        progress3.pose.pose.position.y = 0.0;
+        let out3 = plan_executor.handle_progress("robot_1", progress3);
         assert_eq!(out3.plan_release.unwrap().waypoint_id, 3);
     }
 
@@ -1171,10 +1172,10 @@ mod tests {
 
         assert!(plan_executor.handle_plan("robot_1", plan));
 
-        let mut odom = Odometry::default();
-        odom.pose.pose.position.x = 0.0;
-        odom.pose.pose.position.y = 0.0;
-        let out = plan_executor.handle_odometry("robot_1", odom);
+        let mut progress = Progress::default();
+        progress.pose.pose.position.x = 0.0;
+        progress.pose.pose.position.y = 0.0;
+        let out = plan_executor.handle_progress("robot_1", progress);
         let sz = out.safe_zone.expect("SafeZone should be emitted");
 
         // The resolved target orientation on the SafeZone region should come from Node 2 (pi / 3)
