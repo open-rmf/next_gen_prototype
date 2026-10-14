@@ -31,5 +31,26 @@ def generate_map():
     print('Generated demo_grid.png')
 
 
+def generate_corridor_map():
+    # 14x9 pixels with origin [-5.0, -4.0, 0.0] and resolution 1.0
+    # Central 3x8 corridor: wx in [-2..5] (ix in [3..10]), wy in [-1..1] (iy in [3..5])
+    # Protruding 1x1 docks at wx in {-1, 1, 3} (ix in {4, 6, 8}) on wy in {-2, 2}
+    width, height = 14, 9
+    img = Image.new('L', (width, height), 0)
+    draw = ImageDraw.Draw(img)
+
+    # Carve 3x8 central corridor (free = 255)
+    draw.rectangle([3, 3, 10, 5], fill=255)
+
+    # Carve protruding dock alcoves (north: iy=2 in top-down / iy=6 in bottom-up; south: symmetric)
+    for ix in (4, 6, 8):
+        img.putpixel((ix, 2), 255)
+        img.putpixel((ix, 6), 255)
+
+    img.save('corridor_grid.png')
+    print('Generated corridor_grid.png')
+
+
 if __name__ == '__main__':
     generate_map()
+    generate_corridor_map()

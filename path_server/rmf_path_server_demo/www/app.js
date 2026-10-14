@@ -18,7 +18,10 @@
 let isConnected = false;
 let config = {
   default_radius: 0.49,
-  use_destination_server: false
+  use_destination_server: false,
+  site_file: '',
+  docks: [],
+  lanes: []
 };
 let robots = [];
 let reservationConfig = null;
@@ -26,6 +29,7 @@ let selectedRobotName = null;
 let interactionMode = 'normal'; // 'normal', 'add-robot', 'set-goal'
 let systemMode = 'setup'; // 'setup', 'live'
 let pendingGoalReset = false;
+let pendingPassTrigger = false;
 let eventSource = null;
 let mouseX = 0;
 let mouseY = 0;
@@ -113,13 +117,33 @@ function initSSE() {
               r.status = 'Moving';
             }
           }
+
+          if (pendingPassTrigger && msg.name === 'robot_1' && msg.y >= 1.15 && msg.y <= 1.85) {
+            pendingPassTrigger = false;
+            const r2 = robots.find(bot => bot.name === 'robot_2');
+            if (r2) {
+              r2.goal_x = 1;
+              r2.goal_y = 1;
+              r2.goals = [{ x: 1, y: 1 }];
+              r2.status = 'Planning';
+              sendGoalRequest(r2);
+              showInstruction(
+                `robot_1 mid-docking at (-1.0, ${msg.y.toFixed(2)}) — triggered passing goal (1, 1) for robot_2!`
+              );
+            }
+          }
           updateRobotListUI();
         }
       } else if (msg.type === 'plan') {
         const r = robots.find(robot => robot.name === msg.name);
         if (r) {
           r.waypoints = msg.waypoints;
-          console.log(`Received plan for ${msg.name} with ${msg.waypoints.length} waypoints.`);
+          r.plan_version = msg.plan_version !== undefined ? msg.plan_version : 0;
+          r.plan_count = (r.plan_count || 0) + 1;
+          console.log(
+            `Received plan v${r.plan_version} for ${msg.name} with ${msg.waypoints.length} waypoints.`
+          );
+          updateRobotListUI();
         }
       } else if (msg.type === 'progress') {
         const r = robots.find(robot => robot.name === msg.name);
@@ -203,18 +227,28 @@ function reservationConfigBounds() {
 function fitViewToConfig() {
   let bounds = reservationConfigBounds();
   
-  if (!bounds && mapData) {
+  if (mapData) {
     const width = mapData.info.width;
     const height = mapData.info.height;
     const res = mapData.info.resolution;
     const originX = mapData.info.origin.position.x;
     const originY = mapData.info.origin.position.y;
-    bounds = {
-      minX: originX,
-      minY: originY,
-      maxX: originX + width * res,
-      maxY: originY + height * res
+    const mapBounds = {
+      minX: originX - res / 2,
+      minY: originY - res / 2,
+      maxX: originX + (width - 0.5) * res,
+      maxY: originY + (height - 0.5) * res
     };
+    if (bounds) {
+      bounds = {
+        minX: Math.min(bounds.minX, mapBounds.minX),
+        minY: Math.min(bounds.minY, mapBounds.minY),
+        maxX: Math.max(bounds.maxX, mapBounds.maxX),
+        maxY: Math.max(bounds.maxY, mapBounds.maxY)
+      };
+    } else {
+      bounds = mapBounds;
+    }
   }
 
   if (!bounds) {
@@ -252,14 +286,21 @@ function showInstruction(text) {
 
 // Spawns a robot Simulator Node by calling HTTP REST /spawn
 function sendSpawnRequest(robot) {
-  const url = `/spawn?name=${robot.name}&x=${robot.start_x}&y=${robot.start_y}`;
-  fetch(url)
+  let url = `/spawn?name=${robot.name}&x=${robot.start_x}&y=${robot.start_y}`;
+  if (robot.min_action_scale !== undefined) {
+    url += `&min_action_scale=${robot.min_action_scale}`;
+  }
+  if (robot.max_action_scale !== undefined) {
+    url += `&max_action_scale=${robot.max_action_scale}`;
+  }
+  return fetch(url)
     .then(res => res.json())
     .then(data => {
       console.log('Spawn response:', data);
       if (data.radius !== undefined) {
         robot.radius = parseFloat(data.radius);
       }
+      return data;
     })
     .catch(err => console.error('Spawn request failed:', err));
 }
@@ -274,9 +315,12 @@ function sendGoalRequest(robot) {
   } else {
     url = `/destination?name=${robot.name}&x=${robot.goal_x}&y=${robot.goal_y}`;
   }
-  fetch(url)
+  return fetch(url)
     .then(res => res.json())
-    .then(data => console.log('Goal set response:', data))
+    .then(data => {
+      console.log('Goal set response:', data);
+      return data;
+    })
     .catch(err => console.error('Goal request failed:', err));
 }
 
@@ -335,6 +379,7 @@ function updateRobotListUI() {
         <div class="robot-item-coords">
           <span><span class="coord-label">Pos:</span> (${r.current_x.toFixed(1)}, ${r.current_y.toFixed(1)})</span>
           <span><span class="coord-label">Goal:</span> ${goalStr}</span>
+          <span><span class="coord-label">Plan:</span> ${r.plan_version !== undefined ? `v${r.plan_version}` : '--'}${(r.plan_count || 0) > 1 ? ` (${r.plan_count}x)` : ''}</span>
         </div>
         ${errorRow}
       </div>
@@ -555,6 +600,98 @@ document.getElementById('btn-send')?.addEventListener('click', () => {
     .catch(err => console.error('Failed to start scenario:', err));
 });
 
+function resetScenarioUI() {
+  robots = [];
+  selectedRobotName = null;
+  interactionMode = 'normal';
+  systemMode = 'setup';
+  pendingGoalReset = false;
+  pendingPassTrigger = false;
+  showInstruction(null);
+  document.getElementById('mode-badge').textContent = 'Setup Mode';
+  document.getElementById('mode-badge').classList.remove('live');
+  document.getElementById('btn-add-robot').disabled = false;
+  document.getElementById('btn-add-robot').classList.remove('active');
+  document.getElementById('btn-send').disabled = true;
+  updateRobotListUI();
+}
+
+document.getElementById('btn-reset')?.addEventListener('click', () => {
+  fetch('/reset')
+    .then(res => res.json())
+    .then(() => {
+      resetScenarioUI();
+    })
+    .catch(err => console.error('Failed to reset scenario:', err));
+});
+
+document.getElementById('btn-preset-dock-pass')?.addEventListener('click', async () => {
+  if (!isConnected) {
+    alert('Not connected to backend server yet.');
+    return;
+  }
+
+  await fetch('/reset').catch(() => {});
+  resetScenarioUI();
+
+  // robot_1 starts at dock_north_1 staging (-1, 1) and docks into (-1, 2) with delayed docking (2.5x - 3.0x)
+  const r1 = {
+    idNum: 1,
+    name: 'robot_1',
+    color: robotColors[0],
+    start_x: -1,
+    start_y: 1,
+    current_x: -1,
+    current_y: 1,
+    goal_x: -1,
+    goal_y: 2,
+    goals: [{ x: -1, y: 2 }],
+    status: 'Planning',
+    waypoints: [],
+    progress: 0.0,
+    radius: 0.49,
+    min_action_scale: 2.5,
+    max_action_scale: 3.0
+  };
+
+  // robot_2 starts right next to robot_1 at (-2, 1), initially holding at (-2, 1)
+  // Once robot_1 is mid-docking into (-1, 2), robot_2 is sent to pass to (1, 1)
+  const r2 = {
+    idNum: 2,
+    name: 'robot_2',
+    color: robotColors[1],
+    start_x: -2,
+    start_y: 1,
+    current_x: -2,
+    current_y: 1,
+    goal_x: -2,
+    goal_y: 1,
+    goals: [{ x: -2, y: 1 }],
+    status: 'Planning',
+    waypoints: [],
+    progress: 0.0,
+    radius: 0.49
+  };
+
+  robots.push(r1, r2);
+  pendingPassTrigger = true;
+  systemMode = 'live';
+  document.getElementById('mode-badge').textContent = 'Live Mode';
+  document.getElementById('mode-badge').classList.add('live');
+  document.getElementById('btn-add-robot').disabled = true;
+  document.getElementById('btn-send').disabled = true;
+  showInstruction(
+    'Preset running: robot_1 docking into dock_north_1 (-1, 2) with delay; robot_2 will request to pass to (1, 1) mid-docking.'
+  );
+  updateRobotListUI();
+
+  await sendSpawnRequest(r1);
+  await sendSpawnRequest(r2);
+  await sendGoalRequest(r1);
+  await sendGoalRequest(r2);
+  await fetch('/send_scenario');
+});
+
 
 // Helper to draw dependency arrow with optional dash animation
 function drawDependencyArrow(ctx, fromX, fromY, toX, toY, isBlocking) {
@@ -712,6 +849,79 @@ function drawReservationConfig() {
   });
 }
 
+function drawDocks() {
+  if (!config) return;
+
+  if (Array.isArray(config.lanes) && config.lanes.length > 0) {
+    ctx.save();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = 'rgba(56, 189, 248, 0.22)';
+    ctx.lineWidth = 1.5;
+    config.lanes.forEach(lane => {
+      if (lane.is_dock) return;
+      const p1 = toPixel(lane.x1, lane.y1);
+      const p2 = toPixel(lane.x2, lane.y2);
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
+
+  if (!Array.isArray(config.docks) || config.docks.length === 0) return;
+
+  config.docks.forEach(dock => {
+    const dockPix = toPixel(dock.x, dock.y);
+    const entryPix = toPixel(dock.entry_x, dock.entry_y);
+
+    ctx.save();
+    ctx.shadowBlur = 0;
+
+    // Draw dashed dock lane between entry staging point and dock anchor
+    ctx.strokeStyle = 'rgba(0, 240, 255, 0.55)';
+    ctx.lineWidth = 2.0;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(entryPix.x, entryPix.y);
+    ctx.lineTo(dockPix.x, dockPix.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Draw dock badge
+    const boxSize = Math.max(16, Math.min(26, scale * 0.45));
+    ctx.fillStyle = 'rgba(0, 240, 255, 0.14)';
+    ctx.strokeStyle = 'rgba(0, 240, 255, 0.8)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.roundRect(
+      dockPix.x - boxSize / 2,
+      dockPix.y - boxSize / 2,
+      boxSize,
+      boxSize,
+      4
+    );
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#00f0ff';
+    ctx.font = 'bold 11px Outfit';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('D', dockPix.x, dockPix.y);
+
+    ctx.fillStyle = 'rgba(0, 240, 255, 0.88)';
+    ctx.font = '600 10px Outfit';
+    ctx.textAlign = 'center';
+    const isNorth = dock.y >= dock.entry_y;
+    ctx.textBaseline = isNorth ? 'bottom' : 'top';
+    const offsetY = isNorth ? -(boxSize / 2 + 4) : (boxSize / 2 + 4);
+    ctx.fillText(dock.name, dockPix.x, dockPix.y + offsetY);
+
+    ctx.restore();
+  });
+}
+
 function drawMap() {
   if (!mapData) return;
 
@@ -742,9 +952,11 @@ function drawMap() {
         color = `rgba(255, 255, 255, ${val / 100 * 0.15})`;
       }
 
+      // PibtPlanner maps grid index (x, y) to world coordinate
+      // (originX + x * res, originY + y * res), so each cell is centered there.
       const cellWorldX = originX + x * res;
       const cellWorldY = originY + y * res;
-      const topLeftPix = toPixel(cellWorldX, cellWorldY + res);
+      const topLeftPix = toPixel(cellWorldX - res / 2, cellWorldY + res / 2);
       const cellPixelSize = res * scale;
 
       ctx.fillStyle = color;
@@ -836,8 +1048,9 @@ function drawGrid() {
     ctx.fillText(String(Math.round(gy * 1000) / 1000), labelX, centerY - gy * scale);
   }
 
-  // Draw the reservation config behind plans and robots.
+  // Draw the reservation config and site docks behind plans and robots.
   drawReservationConfig();
+  drawDocks();
 
   // 4. Draw plans, actual routes, and dependencies
   robots.forEach(r => {
