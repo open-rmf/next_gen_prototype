@@ -15,13 +15,13 @@
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use rmf_plan_executor::{PlanExecutorConfig, PlanExecutorRosNode};
 use ros_env::geometry_msgs::msg::Pose;
-use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
-use ros_env::rmf_prototype_msgs::msg::{ParticipantList, Plan};
+use ros_env::nav_msgs::msg::OccupancyGrid;
+use ros_env::rmf_prototype_msgs::msg::{ParticipantList, Plan, RobotStatus};
 use std::collections::HashMap;
 use std::env;
 
 struct RobotConnections {
-    _odom_subscription: rclrs::WorkerSubscription<Odometry, PlanExecutorRosNode>,
+    _status_subscription: rclrs::WorkerSubscription<RobotStatus, PlanExecutorRosNode>,
     _plan_subscription: rclrs::WorkerSubscription<Plan, PlanExecutorRosNode>,
 }
 
@@ -208,20 +208,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let robot_id_clone = robot_id.to_string();
                 let robot_id_clone2 = robot_id.to_string();
-                let odom_topic = robot_id.to_string() + "/odom";
+                let status_topic = robot_id.to_string() + "/status";
                 let plan_topic = robot_id.to_string() + "/plan";
 
-                let odom_sub = match server.executor_worker.create_subscription::<Odometry, _>(
-                    odom_topic.as_str().reliable(),
-                    move |executor: &mut PlanExecutorRosNode, msg: Odometry| {
-                        executor.handle_odometry(&robot_id_clone, msg);
-                    },
-                ) {
+                let status_sub = match server
+                    .executor_worker
+                    .create_subscription::<RobotStatus, _>(
+                        status_topic.as_str().transient_local().reliable(),
+                        move |executor: &mut PlanExecutorRosNode, msg: RobotStatus| {
+                            executor.handle_status(&robot_id_clone, msg);
+                        },
+                    ) {
                     Ok(sub) => sub,
                     Err(err) => {
                         rclrs::log_error!(
                             server.node.logger(),
-                            "Failed to create odom subscription on executor_worker for {}: {:?}",
+                            "Failed to create status subscription on executor_worker for {}: {:?}",
                             robot_id,
                             err
                         );
@@ -250,7 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 server.active_robots.insert(
                     robot_id.to_string(),
                     RobotConnections {
-                        _odom_subscription: odom_sub,
+                        _status_subscription: status_sub,
                         _plan_subscription: plan_sub,
                     },
                 );

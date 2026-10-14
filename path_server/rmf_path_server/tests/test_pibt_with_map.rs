@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use rmf_path_server::planner::{Map, MapfPlanner, PibtPlanner};
-use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
-use ros_env::rmf_prototype_msgs::msg::Destination;
+use ros_env::nav_msgs::msg::OccupancyGrid;
+use ros_env::rmf_prototype_msgs::msg::{Destination, RobotStatus};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -37,10 +37,10 @@ fn test_pibt_planner_with_obstacle() {
     };
 
     let mut starts = HashMap::new();
-    let mut odom = Odometry::default();
-    odom.pose.pose.position.x = 0.0;
-    odom.pose.pose.position.y = 5.0;
-    starts.insert("robot1".to_string(), odom);
+    let mut status = RobotStatus::default();
+    status.pose.pose.position.x = 0.0;
+    status.pose.pose.position.y = 5.0;
+    starts.insert("robot1".to_string(), status);
 
     let mut goals = HashMap::new();
     let mut dest = Destination::default();

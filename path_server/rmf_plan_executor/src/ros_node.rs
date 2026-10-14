@@ -14,8 +14,8 @@
 
 use crate::{PlanExecutor, PlanExecutorConfig};
 use rclrs::{IntoPrimitiveOptions, Node, ToLogParams};
-use ros_env::nav_msgs::msg::{OccupancyGrid, Odometry};
-use ros_env::rmf_prototype_msgs::msg::{Plan, PlanError, PlanRelease, SafeZone};
+use ros_env::nav_msgs::msg::OccupancyGrid;
+use ros_env::rmf_prototype_msgs::msg::{Plan, PlanError, PlanRelease, RobotStatus, SafeZone};
 use std::collections::HashMap;
 
 pub struct PlanExecutorRosNode {
@@ -115,8 +115,8 @@ impl PlanExecutorRosNode {
         }
     }
 
-    pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) {
-        let output = self.executor.handle_odometry(robot_id, msg);
+    pub fn handle_status(&mut self, robot_id: &str, msg: RobotStatus) {
+        let output = self.executor.handle_status(robot_id, msg);
 
         if let Some(error) = output.plan_error {
             self.publish_plan_error(robot_id, error);
@@ -210,8 +210,7 @@ impl PlanExecutorRosNode {
 mod tests {
     use super::PlanExecutorRosNode;
     use rclrs::{Context, CreateBasicExecutor};
-    use ros_env::nav_msgs::msg::Odometry;
-    use ros_env::rmf_prototype_msgs::msg::{Plan, Waypoint};
+    use ros_env::rmf_prototype_msgs::msg::{Plan, RobotStatus, Waypoint};
 
     #[test]
     fn ros_node_manages_publishers_on_add_and_remove() {
@@ -225,15 +224,15 @@ mod tests {
         ros_node.handle_robot_added("robot_1", 0.5);
         ros_node.handle_robot_added("robot_2", 0.5);
 
-        let mut odom1 = Odometry::default();
-        odom1.pose.pose.position.x = 0.0;
-        odom1.pose.pose.position.y = 0.0;
-        ros_node.handle_odometry("robot_1", odom1.clone());
+        let mut status1 = RobotStatus::default();
+        status1.pose.pose.position.x = 0.0;
+        status1.pose.pose.position.y = 0.0;
+        ros_node.handle_status("robot_1", status1.clone());
 
-        let mut odom2 = Odometry::default();
-        odom2.pose.pose.position.x = 5.0;
-        odom2.pose.pose.position.y = 5.0;
-        ros_node.handle_odometry("robot_2", odom2);
+        let mut status2 = RobotStatus::default();
+        status2.pose.pose.position.x = 5.0;
+        status2.pose.pose.position.y = 5.0;
+        ros_node.handle_status("robot_2", status2);
 
         let mut plan1 = Plan::default();
         let mut wp0 = Waypoint::default();
@@ -243,7 +242,7 @@ mod tests {
         plan1.waypoints = vec![wp0, wp1];
 
         ros_node.handle_plan("robot_1", plan1);
-        ros_node.handle_odometry("robot_1", odom1);
+        ros_node.handle_status("robot_1", status1);
 
         assert!(ros_node.plan_release_publishers.contains_key("robot_1"));
         assert!(ros_node.safezone_publishers.contains_key("robot_1"));
