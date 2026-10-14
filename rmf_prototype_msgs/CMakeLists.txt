@@ -14,6 +14,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
 find_package(unique_identifier_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
@@ -35,6 +36,7 @@ set(msg_files
   "msg/PlanRelease.msg"
   "msg/Progress.msg"
   "msg/Region.msg"
+  "msg/RobotStatus.msg"
   "msg/SafeZone.msg"
   "msg/SafeZoneId.msg"
   "msg/SessionRefresh.msg"
@@ -48,7 +50,7 @@ set(msg_files
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
-  DEPENDENCIES builtin_interfaces nav2_msgs unique_identifier_msgs
+  DEPENDENCIES builtin_interfaces geometry_msgs nav2_msgs unique_identifier_msgs
   ADD_LINTER_TESTS
 )
 

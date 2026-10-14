@@ -18,7 +18,6 @@ import unittest
 import launch
 import launch_ros
 import launch_testing
-from nav_msgs.msg import Odometry
 import pytest
 import rclpy
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -29,6 +28,7 @@ from rmf_prototype_msgs.msg import (
     ParticipantList,
     Plan,
     Region,
+    RobotStatus,
     TargetRegion,
 )
 
@@ -78,10 +78,12 @@ class TestPathServer(unittest.TestCase):
         msg.constraints = constraint
         return msg
 
-    def create_odom(self, x, y):
-        msg = Odometry()
+    def create_status(self, x, y):
+        msg = RobotStatus()
         msg.pose.pose.position.x = float(x)
         msg.pose.pose.position.y = float(y)
+        msg.pose.pose.orientation.w = 1.0
+        msg.mode = RobotStatus.MODE_IDLE
         return msg
 
     def test_plan_generation_and_publication(self):
@@ -108,9 +110,9 @@ class TestPathServer(unittest.TestCase):
             qos_profile=reliable_transient_qos
         )
 
-        odom_pub = self.node.create_publisher(
-            Odometry,
-            f'{robot_name}/odom',
+        status_pub = self.node.create_publisher(
+            RobotStatus,
+            f'{robot_name}/status',
             qos_profile=reliable_transient_qos
         )
 
@@ -138,16 +140,16 @@ class TestPathServer(unittest.TestCase):
 
         time.sleep(0.5)
 
-        # 2. Publish destination and odom
+        # 2. Publish destination and status
         dest = self.create_destination(1, 10.0, 10.0, 1.0)
-        odom = self.create_odom(0.0, 0.0)
+        status = self.create_status(0.0, 0.0)
 
         start_time = time.time()
         timeout = 15.0
         while time.time() - start_time < timeout:
             discovery_pub.publish(parts)
             dest_pub.publish(dest)
-            odom_pub.publish(odom)
+            status_pub.publish(status)
             rclpy.spin_once(self.node, timeout_sec=0.1)
             if received_plans:
                 break
