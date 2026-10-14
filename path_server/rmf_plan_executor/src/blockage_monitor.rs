@@ -79,8 +79,10 @@ pub(crate) fn route_intersects_map(map: &OccupancyGrid, route: &[(f32, f32)], ra
     let sin_yaw = yaw.sin();
     let origin_x = map.info.origin.position.x as f32;
     let origin_y = map.info.origin.position.y as f32;
-    let clearance = radius.max(0.0) + resolution * std::f32::consts::FRAC_1_SQRT_2;
-    let clearance_squared = clearance * clearance;
+    let half_cell = 0.5 * resolution;
+    let radius = radius.max(0.0);
+    let radius_squared = radius * radius;
+    let search_margin = radius + half_cell;
 
     let to_map = |(x, y): (f32, f32)| {
         let dx = x - origin_x;
@@ -91,12 +93,14 @@ pub(crate) fn route_intersects_map(map: &OccupancyGrid, route: &[(f32, f32)], ra
     for segment in route.windows(2) {
         let start = to_map(segment[0]);
         let end = to_map(segment[1]);
-        let min_x = (((start.0.min(end.0) - clearance) / resolution).floor() as isize).max(0);
-        let max_x =
-            (((start.0.max(end.0) + clearance) / resolution).floor() as isize).min(width - 1);
-        let min_y = (((start.1.min(end.1) - clearance) / resolution).floor() as isize).max(0);
-        let max_y =
-            (((start.1.max(end.1) + clearance) / resolution).floor() as isize).min(height - 1);
+        let min_x =
+            (((start.0.min(end.0) - search_margin) / resolution).floor() as isize).max(0);
+        let max_x = (((start.0.max(end.0) + search_margin) / resolution).ceil() as isize)
+            .min(width - 1);
+        let min_y =
+            (((start.1.min(end.1) - search_margin) / resolution).floor() as isize).max(0);
+        let max_y = (((start.1.max(end.1) + search_margin) / resolution).ceil() as isize)
+            .min(height - 1);
 
         for y in min_y..=max_y {
             for x in min_x..=max_x {
@@ -105,8 +109,12 @@ pub(crate) fn route_intersects_map(map: &OccupancyGrid, route: &[(f32, f32)], ra
                     continue;
                 }
 
-                let center = ((x as f32 + 0.5) * resolution, (y as f32 + 0.5) * resolution);
-                if distance_squared_to_segment(center, start, end) <= clearance_squared {
+                let cx = x as f32 * resolution;
+                let cy = y as f32 * resolution;
+                let box_min = (cx - half_cell, cy - half_cell);
+                let box_max = (cx + half_cell, cy + half_cell);
+                if segment_distance_squared_to_aabb(start, end, box_min, box_max) <= radius_squared
+                {
                     return true;
                 }
             }
@@ -114,6 +122,77 @@ pub(crate) fn route_intersects_map(map: &OccupancyGrid, route: &[(f32, f32)], ra
     }
 
     false
+}
+
+fn point_distance_squared_to_aabb(
+    point: (f32, f32),
+    box_min: (f32, f32),
+    box_max: (f32, f32),
+) -> f32 {
+    let dx = (box_min.0 - point.0).max(0.0).max(point.0 - box_max.0);
+    let dy = (box_min.1 - point.1).max(0.0).max(point.1 - box_max.1);
+    dx * dx + dy * dy
+}
+
+fn segment_intersects_aabb(
+    start: (f32, f32),
+    end: (f32, f32),
+    box_min: (f32, f32),
+    box_max: (f32, f32),
+) -> bool {
+    let mut t_min = 0.0_f32;
+    let mut t_max = 1.0_f32;
+    let dx = end.0 - start.0;
+    let dy = end.1 - start.1;
+
+    for (p, d, min_b, max_b) in [
+        (start.0, dx, box_min.0, box_max.0),
+        (start.1, dy, box_min.1, box_max.1),
+    ] {
+        if d.abs() <= f32::EPSILON {
+            if p < min_b || p > max_b {
+                return false;
+            }
+        } else {
+            let inv_d = 1.0 / d;
+            let mut t1 = (min_b - p) * inv_d;
+            let mut t2 = (max_b - p) * inv_d;
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            t_min = t_min.max(t1);
+            t_max = t_max.min(t2);
+            if t_min > t_max {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn segment_distance_squared_to_aabb(
+    start: (f32, f32),
+    end: (f32, f32),
+    box_min: (f32, f32),
+    box_max: (f32, f32),
+) -> f32 {
+    if segment_intersects_aabb(start, end, box_min, box_max) {
+        return 0.0;
+    }
+
+    let mut min_dist_sq = point_distance_squared_to_aabb(start, box_min, box_max)
+        .min(point_distance_squared_to_aabb(end, box_min, box_max));
+
+    for corner in [
+        (box_min.0, box_min.1),
+        (box_min.0, box_max.1),
+        (box_max.0, box_min.1),
+        (box_max.0, box_max.1),
+    ] {
+        min_dist_sq = min_dist_sq.min(distance_squared_to_segment(corner, start, end));
+    }
+
+    min_dist_sq
 }
 
 fn distance_squared_to_segment(point: (f32, f32), start: (f32, f32), end: (f32, f32)) -> f32 {
@@ -145,6 +224,29 @@ mod tests {
 
         assert!(route_intersects_map(&map, &[(1.5, 5.5), (8.5, 5.5)], 0.25));
         assert!(!route_intersects_map(&map, &[(1.5, 8.5), (8.5, 8.5)], 0.25));
+    }
+
+    #[test]
+    fn route_adjacent_to_occupied_walls_is_not_blocked() {
+        let mut map = OccupancyGrid::default();
+        map.info.resolution = 1.0;
+        map.info.width = 14;
+        map.info.height = 9;
+        map.info.origin.position.x = -5.0;
+        map.info.origin.position.y = -4.0;
+        map.info.origin.orientation.w = 1.0;
+        // Mark all cells occupied except 3x8 corridor (x in 3..=10, y in 3..=5) and dock at (4, 6)
+        map.data = vec![100; 14 * 9];
+        for y in 3..=5 {
+            for x in 3..=10 {
+                map.data[y * 14 + x] = 0;
+            }
+        }
+        map.data[6 * 14 + 4] = 0;
+
+        // Route from corridor (-2.0, 0.0) -> (-1.0, 0.0) -> (-1.0, 1.0) -> dock (-1.0, 2.0) with radius 0.49
+        let route = [(-2.0, 0.0), (-1.0, 0.0), (-1.0, 1.0), (-1.0, 2.0)];
+        assert!(!route_intersects_map(&map, &route, 0.49));
     }
 
     #[test]

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import tempfile
 import time
 import unittest
 
@@ -22,6 +24,7 @@ from nav_msgs.msg import Odometry
 import pytest
 import rclpy
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rmf_mock_robot_sim.mock_robot_sim_node import MockRobotSimNode
 from rmf_prototype_msgs.msg import ParticipantList, Plan, PlanId, PlanRelease, Progress, Waypoint
 
 
@@ -281,3 +284,121 @@ class TestMockRobotSim(unittest.TestCase):
             f'Test finished. Received {len(received_odoms)} odom and '
             f'{len(received_progress)} progress messages.'
         )
+
+    def test_site_file_and_random_action_duration(self):
+        site_dict = {
+            'levels': {
+                'L1': {
+                    'anchors': {
+                        '1': [0.0, 1.0],
+                        '2': [0.0, 2.0],
+                    }
+                }
+            },
+            'navigation': {
+                'guided': {
+                    'lanes': {
+                        '10': {
+                            'left': 1,
+                            'right': 2,
+                            'forward': {
+                                'dock': {
+                                    'dock_name': 'dock_north_1',
+                                    'duration': 4.0,
+                                }
+                            },
+                            'reverse': 'Same',
+                        }
+                    },
+                    'locations': {
+                        '20': {
+                            'anchor': 2,
+                            'name': 'dock_north_1',
+                            'tags': ['Dock'],
+                        }
+                    },
+                }
+            },
+        }
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.site.json') as tmp_file:
+            json.dump(site_dict, tmp_file)
+            tmp_file.flush()
+
+            sim = MockRobotSimNode()
+            try:
+                sim.action_time_min_scale = 0.5
+                sim.action_time_max_scale = 2.0
+                sim.load_site_file(tmp_file.name)
+
+                self.assertEqual(len(sim.site_anchors), 2)
+                self.assertEqual(len(sim.site_action_lanes), 2)
+                self.assertGreaterEqual(len(sim.site_dock_positions), 1)
+
+                wp0 = Waypoint()
+                wp0.position = [0.0, 1.0]
+                wp0.progress = 0.0
+
+                wp1 = Waypoint()
+                wp1.position = [0.0, 2.0]
+                wp1.progress = 1.0
+
+                wp2 = Waypoint()
+                wp2.position = [0.0, 1.0]
+                wp2.progress = 2.0
+
+                plan_msg = Plan()
+                plan_msg.plan_id.destination_session.uuid = [9] * 16
+                plan_msg.plan_id.plan_version = 1
+                plan_msg.waypoints = [wp0, wp1, wp2]
+
+                # Sample multiple times across the dock/undock transitions
+                sampled_dock_durations = []
+                sampled_undock_durations = []
+                for _ in range(15):
+                    sim.x, sim.y = 0.0, 1.0
+                    sim.handle_plan(plan_msg)
+                    sim._configure_transition(1)
+                    self.assertEqual(sim.active_transition_action, 'dock_north_1')
+                    self.assertIsNotNone(sim.active_transition_duration)
+                    self.assertTrue(2.0 <= sim.active_transition_duration <= 8.0)
+                    sampled_dock_durations.append(sim.active_transition_duration)
+
+                    sim._configure_transition(2)
+                    self.assertEqual(
+                        sim.active_transition_action, 'undock:dock_north_1'
+                    )
+                    self.assertIsNotNone(sim.active_transition_duration)
+                    self.assertTrue(2.0 <= sim.active_transition_duration <= 8.0)
+                    sampled_undock_durations.append(sim.active_transition_duration)
+
+                # Confirm durations actually vary randomly across runs
+                self.assertGreater(
+                    len({round(d, 4) for d in sampled_dock_durations}),
+                    3,
+                    'Expected dock transition durations to vary randomly',
+                )
+                self.assertGreater(
+                    len({round(d, 4) for d in sampled_undock_durations}),
+                    3,
+                    'Expected undock transition durations to vary randomly',
+                )
+
+                # Verify explicit Waypoint.arrival_action also triggers random duration
+                wp_action = Waypoint()
+                wp_action.position = [5.0, 5.0]
+                wp_action.progress = 3.0
+                wp_action.arrival_action = 'custom_dock_action'
+                plan_msg.waypoints = [wp0, wp_action]
+                sim.handle_plan(plan_msg)
+                sim._configure_transition(1)
+                self.assertEqual(
+                    sim.active_transition_action, 'custom_dock_action'
+                )
+                self.assertTrue(
+                    sim.default_action_duration * 0.5
+                    <= sim.active_transition_duration
+                    <= sim.default_action_duration * 2.0
+                )
+            finally:
+                sim.destroy_node()
