@@ -1,5 +1,7 @@
 use crate::{
-    inner_navigation_client::{CancellingInnerNavigation, InnerNavigationTarget},
+    inner_navigation_client::{
+        CancellingInnerNavigation, InnerNavigationClient, InnerNavigationTarget,
+    },
     navigation_server::{CancelledNavigationSessions, CurrentNavigationRequest},
     Nav2Agent,
 };
@@ -192,11 +194,19 @@ pub(crate) fn update_incremental_target(
         &CostmapPublisher,
         &ProgressPublisher,
         &mut CurrentSafeZone,
+        &mut InnerNavigationClient,
         &Nav2Agent,
     )>,
 ) {
-    for (e, safe_zone_sub, costmap_pub, progress_pub, mut current_safe_zone, agent) in
-        subscriptions.iter_mut()
+    for (
+        e,
+        safe_zone_sub,
+        costmap_pub,
+        progress_pub,
+        mut current_safe_zone,
+        mut inner_client,
+        agent,
+    ) in subscriptions.iter_mut()
     {
         let Some(safe_zone) = safe_zone_sub.subscriber.data_callback() else {
             continue;
@@ -260,19 +270,38 @@ pub(crate) fn update_incremental_target(
             continue;
         };
 
+        // Reset completion status when a new or updated target is received
+        let should_update = current_safe_zone.should_update_target(&safe_zone);
+        if should_update {
+            inner_client.target_reached = false;
+        }
+
         // Publish progress
+        let target_wp = safe_zone
+            .target_waypoint
+            .first()
+            .copied()
+            .unwrap_or(safe_zone.last_waypoint);
+
+        // Keep reporting target progress once the inner Nav2 goal has succeeded
+        let (observed_progress, reached_waypoint) = if inner_client.target_reached {
+            (safe_zone.target_progress, target_wp)
+        } else {
+            (safe_zone.last_waypoint as f32, safe_zone.last_waypoint)
+        };
+
         let Ok(_) = progress_pub.publisher.publish(Progress {
-            progress: safe_zone.last_waypoint as f32,
-            reached_waypoint: safe_zone.last_waypoint,
-            target_waypoint: safe_zone.target_waypoint[0], // TODO(@xiyuoh) review
-            reached_keys: vec![],                          // TODO(@xiyuoh)
+            progress: observed_progress,
+            reached_waypoint,
+            target_waypoint: target_wp,
+            reached_keys: vec![],
             plan_id: safe_zone.id.plan_id.clone(),
         }) else {
             error!("Failed to publish progress for agent [{}]", agent.name);
             continue;
         };
 
-        if !current_safe_zone.should_update_target(&safe_zone) {
+        if !should_update {
             continue;
         }
         debug!(

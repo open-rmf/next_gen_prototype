@@ -1,5 +1,7 @@
 use crate::{
-    navigation_server::CancelledNavigationSessions, safe_zone::PlanErrorPublisher, Nav2Agent,
+    navigation_server::CancelledNavigationSessions,
+    safe_zone::{CurrentSafeZone, PlanErrorPublisher, ProgressPublisher},
+    Nav2Agent,
 };
 use bevy::prelude::*;
 use bevy_ros2::{RclrsExecutorCommands, RclrsNode, RosActionClient};
@@ -11,7 +13,7 @@ use ros_env::{
     builtin_interfaces::msg::Time as RosTime,
     geometry_msgs::msg::{Point, Pose, PoseStamped, Quaternion},
     nav2_msgs::action::{NavigateToPose, NavigateToPose_Feedback, NavigateToPose_Goal},
-    rmf_prototype_msgs::msg::SafeZoneId,
+    rmf_prototype_msgs::msg::{Progress, SafeZoneId},
     std_msgs::msg::Header,
 };
 use std::{future::Future, sync::Arc};
@@ -81,6 +83,8 @@ pub struct InnerNavigationClient {
     pub action_client: Arc<RosActionClient<NavigateToPose>>,
     // The ongoing action goal (if any)
     pub active_goal: Option<ActiveInnerGoal>,
+    // Whether the latest inner navigation goal succeeded
+    pub target_reached: bool,
 }
 
 impl InnerNavigationClient {
@@ -88,6 +92,7 @@ impl InnerNavigationClient {
         Self {
             action_client,
             active_goal: None,
+            target_reached: false,
         }
     }
 
@@ -857,14 +862,16 @@ fn cleanup_goal_client(
         request: result, ..
     }: Blocking<InnerNavigationResult>,
     mut inner_nav_clients: Query<&mut InnerNavigationClient>,
+    current_safe_zones: Query<&CurrentSafeZone>,
+    progress_publishers: Query<&ProgressPublisher>,
 ) {
-    let handle = match result {
-        Ok(res) => res.handle,
+    let (handle, succeeded) = match result {
+        Ok(res) => (res.handle, true),
         Err(err) => {
             let Some(req) = err.handle else {
                 return;
             };
-            req
+            (req, false)
         }
     };
 
@@ -877,18 +884,44 @@ fn cleanup_goal_client(
         };
         if is_current {
             inner_nav_client.reset_goal();
+            inner_nav_client.target_reached = succeeded;
         } else {
             debug!(
                 "[{:?}] Ignoring stale Nav2 goal cleanup {:?}",
                 handle.request.agent.index(),
                 handle.request.safe_zone_id,
             );
+            return;
         }
     } else {
         warn!(
             "[{:?}] InnerNavigationClient not found!",
             handle.request.agent.index()
         );
+        return;
+    }
+
+    if !succeeded {
+        return;
+    }
+
+    // Publish terminal progress once the inner Nav2 goal succeeds
+    if let (Ok(CurrentSafeZone(Some(safe_zone))), Ok(progress_pub)) = (
+        current_safe_zones.get(handle.request.agent),
+        progress_publishers.get(handle.request.agent),
+    ) {
+        let target_wp = safe_zone
+            .target_waypoint
+            .first()
+            .copied()
+            .unwrap_or(safe_zone.last_waypoint);
+        let _ = progress_pub.publisher.publish(Progress {
+            progress: safe_zone.target_progress,
+            reached_waypoint: target_wp,
+            target_waypoint: target_wp,
+            reached_keys: vec![],
+            plan_id: safe_zone.id.plan_id.clone(),
+        });
     }
 }
 
