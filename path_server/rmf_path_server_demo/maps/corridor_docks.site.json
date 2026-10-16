@@ -1,0 +1,519 @@
+{
+  "format_version": "0.0.1",
+  "properties": {
+    "name": "corridor_docks"
+  },
+  "levels": {
+    "1": {
+      "properties": {
+        "name": "L1",
+        "elevation": 0.0,
+        "global_floor_visibility": "Shown",
+        "global_drawing_visibility": "Shown"
+      },
+      "anchors": {
+        "2": [-3.5, -3.5],
+        "3": [6.5, -3.5],
+        "4": [6.5, 3.5],
+        "5": [-3.5, 3.5],
+        "10": [-2.0, 0.0],
+        "11": [-1.0, 0.0],
+        "12": [0.0, 0.0],
+        "13": [1.0, 0.0],
+        "14": [2.0, 0.0],
+        "15": [3.0, 0.0],
+        "16": [4.0, 0.0],
+        "17": [5.0, 0.0],
+        "20": [-2.0, 1.0],
+        "21": [-1.0, 1.0],
+        "22": [0.0, 1.0],
+        "23": [1.0, 1.0],
+        "24": [2.0, 1.0],
+        "25": [3.0, 1.0],
+        "26": [4.0, 1.0],
+        "27": [5.0, 1.0],
+        "30": [-1.0, 2.0],
+        "31": [1.0, 2.0],
+        "32": [3.0, 2.0],
+        "40": [-2.0, -1.0],
+        "41": [-1.0, -1.0],
+        "42": [0.0, -1.0],
+        "43": [1.0, -1.0],
+        "44": [2.0, -1.0],
+        "45": [3.0, -1.0],
+        "46": [4.0, -1.0],
+        "47": [5.0, -1.0],
+        "50": [-1.0, -2.0],
+        "51": [1.0, -2.0],
+        "52": [3.0, -2.0]
+      },
+      "floors": {
+        "6": {
+          "anchors": [2, 3, 4, 5],
+          "texture": {
+            "Alpha": 1.0
+          },
+          "visible": null
+        }
+      }
+    }
+  },
+  "navigation": {
+    "guided": {
+      "graphs": {
+        "100": {
+          "name": "default",
+          "color": [0.1, 0.5, 0.9],
+          "default_visibility": null
+        }
+      },
+      "ranking": [100],
+      "lanes": {
+        "101": {
+          "left": 21,
+          "right": 30,
+          "forward": {
+            "speed_limit": null,
+            "dock": {
+              "dock_name": "dock_north_1",
+              "duration": 3.0
+            },
+            "mutex": "dock_north_1"
+          },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "102": {
+          "left": 23,
+          "right": 31,
+          "forward": {
+            "speed_limit": null,
+            "dock": {
+              "dock_name": "dock_north_2",
+              "duration": 3.0
+            },
+            "mutex": "dock_north_2"
+          },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "103": {
+          "left": 25,
+          "right": 32,
+          "forward": {
+            "speed_limit": null,
+            "dock": {
+              "dock_name": "dock_north_3",
+              "duration": 3.0
+            },
+            "mutex": "dock_north_3"
+          },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "104": {
+          "left": 41,
+          "right": 50,
+          "forward": {
+            "speed_limit": null,
+            "dock": {
+              "dock_name": "dock_south_1",
+              "duration": 3.0
+            },
+            "mutex": "dock_south_1"
+          },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "105": {
+          "left": 43,
+          "right": 51,
+          "forward": {
+            "speed_limit": null,
+            "dock": {
+              "dock_name": "dock_south_2",
+              "duration": 3.0
+            },
+            "mutex": "dock_south_2"
+          },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "106": {
+          "left": 45,
+          "right": 52,
+          "forward": {
+            "speed_limit": null,
+            "dock": {
+              "dock_name": "dock_south_3",
+              "duration": 3.0
+            },
+            "mutex": "dock_south_3"
+          },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "110": {
+          "left": 10,
+          "right": 11,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "111": {
+          "left": 11,
+          "right": 12,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "112": {
+          "left": 12,
+          "right": 13,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "113": {
+          "left": 13,
+          "right": 14,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "114": {
+          "left": 14,
+          "right": 15,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "115": {
+          "left": 15,
+          "right": 16,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "116": {
+          "left": 16,
+          "right": 17,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "120": {
+          "left": 20,
+          "right": 21,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "121": {
+          "left": 21,
+          "right": 22,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "122": {
+          "left": 22,
+          "right": 23,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "123": {
+          "left": 23,
+          "right": 24,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "124": {
+          "left": 24,
+          "right": 25,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "125": {
+          "left": 25,
+          "right": 26,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "126": {
+          "left": 26,
+          "right": 27,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "130": {
+          "left": 40,
+          "right": 41,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "131": {
+          "left": 41,
+          "right": 42,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "132": {
+          "left": 42,
+          "right": 43,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "133": {
+          "left": 43,
+          "right": 44,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "134": {
+          "left": 44,
+          "right": 45,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "135": {
+          "left": 45,
+          "right": 46,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "136": {
+          "left": 46,
+          "right": 47,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "140": {
+          "left": 10,
+          "right": 20,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "141": {
+          "left": 11,
+          "right": 21,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "142": {
+          "left": 12,
+          "right": 22,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "143": {
+          "left": 13,
+          "right": 23,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "144": {
+          "left": 14,
+          "right": 24,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "145": {
+          "left": 15,
+          "right": 25,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "146": {
+          "left": 16,
+          "right": 26,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "147": {
+          "left": 17,
+          "right": 27,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "150": {
+          "left": 10,
+          "right": 40,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "151": {
+          "left": 11,
+          "right": 41,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "152": {
+          "left": 12,
+          "right": 42,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "153": {
+          "left": 13,
+          "right": 43,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "154": {
+          "left": 14,
+          "right": 44,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "155": {
+          "left": 15,
+          "right": 45,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "156": {
+          "left": 16,
+          "right": 46,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        },
+        "157": {
+          "left": 17,
+          "right": 47,
+          "forward": { "speed_limit": null, "dock": null, "mutex": "" },
+          "reverse": "Same",
+          "graphs": [100],
+          "marker": null
+        }
+      },
+      "locations": {
+        "200": {
+          "anchor": 10,
+          "name": "parking_west",
+          "tags": ["ParkingSpot", "Charger"],
+          "mutex": "",
+          "graphs": [100]
+        },
+        "201": {
+          "anchor": 17,
+          "name": "parking_east",
+          "tags": ["ParkingSpot", "Charger"],
+          "mutex": "",
+          "graphs": [100]
+        },
+        "210": {
+          "anchor": 30,
+          "name": "dock_north_1",
+          "tags": [],
+          "mutex": "dock_north_1",
+          "graphs": [100]
+        },
+        "211": {
+          "anchor": 31,
+          "name": "dock_north_2",
+          "tags": [],
+          "mutex": "dock_north_2",
+          "graphs": [100]
+        },
+        "212": {
+          "anchor": 32,
+          "name": "dock_north_3",
+          "tags": [],
+          "mutex": "dock_north_3",
+          "graphs": [100]
+        },
+        "213": {
+          "anchor": 50,
+          "name": "dock_south_1",
+          "tags": [],
+          "mutex": "dock_south_1",
+          "graphs": [100]
+        },
+        "214": {
+          "anchor": 51,
+          "name": "dock_south_2",
+          "tags": [],
+          "mutex": "dock_south_2",
+          "graphs": [100]
+        },
+        "215": {
+          "anchor": 52,
+          "name": "dock_south_3",
+          "tags": [],
+          "mutex": "dock_south_3",
+          "graphs": [100]
+        }
+      }
+    }
+  }
+}
