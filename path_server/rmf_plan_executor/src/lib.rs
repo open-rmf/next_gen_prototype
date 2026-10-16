@@ -13,15 +13,19 @@
 // limitations under the License.
 
 mod blockage_monitor;
+mod plan_registry;
 pub mod ros_node;
 
 pub use ros_node::PlanExecutorRosNode;
 
-use blockage_monitor::{route_intersects_map, BlockageMonitor};
+use crate::{
+    blockage_monitor::{route_intersects_map, BlockageMonitor},
+    plan_registry::PlanRegistry,
+};
 use mapf_post::{
     na::{Isometry2, Vector2},
     spatial_allocation::{CurrentPosition, Grid2D},
-    MapfResult, WaypointFollower,
+    SemanticWaypoint, Trajectory, WaypointFollower,
 };
 use ros_env::builtin_interfaces;
 use ros_env::geometry_msgs::msg::Pose;
@@ -30,8 +34,8 @@ use ros_env::nav2_msgs::msg::Costmap;
 use ros_env::nav_msgs::msg::OccupancyGrid;
 use ros_env::rmf_prototype_msgs;
 use ros_env::rmf_prototype_msgs::msg::{
-    DestinationConstraints, Plan, PlanError, PlanRelease, RobotStatus, SafeZone, SafeZoneId,
-    TargetOrientation,
+    DestinationConstraints, Plan, PlanError, PlanId, PlanRelease, RobotStatus, SafeZone,
+    SafeZoneId, TargetOrientation, TrafficDependency,
 };
 use ros_env::std_msgs;
 use std::{
@@ -116,6 +120,7 @@ pub struct PlanExecutor {
     pub grid_resolution: f32,
     pub grid_origin: Pose,
     pub latest_map: Option<OccupancyGrid>,
+    plan_registry: PlanRegistry,
 }
 
 impl Default for PlanExecutor {
@@ -215,10 +220,13 @@ impl PlanExecutor {
             grid_resolution: config.grid_resolution,
             grid_origin: config.grid_origin,
             latest_map: None,
+            plan_registry: PlanRegistry::default(),
         }
     }
 
     pub fn handle_robot_added(&mut self, robot_id: &str, radius: f32) -> bool {
+        self.plan_registry.add_robot(robot_id.to_string(), radius);
+
         if !self.active_robots.contains_key(robot_id) {
             self.active_robots.insert(
                 robot_id.to_string(),
@@ -232,70 +240,25 @@ impl PlanExecutor {
                     blockage_monitor: BlockageMonitor::default(),
                 },
             );
-            self.reindex_followers();
             return true;
         }
         false
     }
 
     pub fn handle_robot_removed(&mut self, robot_id: &str) -> bool {
-        if self.active_robots.remove(robot_id).is_some() {
-            self.reindex_followers();
-            return true;
-        }
-        false
+        self.plan_registry.remove_robot(robot_id);
+        self.active_robots.remove(robot_id).is_some()
     }
 
     fn get_agent_index(&self, robot_id: &str) -> Option<usize> {
-        let mut sorted_names: Vec<String> = self.active_robots.keys().cloned().collect();
-        sorted_names.sort();
-        sorted_names.iter().position(|k| k == robot_id)
-    }
-
-    fn reindex_followers(&mut self) {
-        let mut sorted_names: Vec<String> = self.active_robots.keys().cloned().collect();
-        sorted_names.sort();
-        for (agent_idx, name) in sorted_names.iter().enumerate() {
-            let robot_state = self.active_robots.get_mut(name).unwrap();
-            if let Some(plan) = &robot_state.plan {
-                let traj_poses: Vec<Isometry2<f32>> = plan
-                    .waypoints
-                    .iter()
-                    .map(|wp| Isometry2::new(Vector2::new(wp.position[0], wp.position[1]), 0.0))
-                    .collect();
-
-                let mut follower = WaypointFollower::from_trajectory(
-                    agent_idx,
-                    mapf_post::Trajectory { poses: traj_poses },
-                );
-
-                if let Some(status) = &robot_state.latest_status {
-                    let current_x = status.pose.pose.position.x as f32;
-                    let current_y = status.pose.pose.position.y as f32;
-                    let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
-                    follower.update_position_estimate(&position, 0.5);
-                }
-
-                robot_state.waypoint_follower = Some(follower);
-            } else if let Some(status) = &robot_state.latest_status {
-                let current_x = status.pose.pose.position.x as f32;
-                let current_y = status.pose.pose.position.y as f32;
-                let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
-                let mut follower = WaypointFollower::from_trajectory(
-                    agent_idx,
-                    mapf_post::Trajectory {
-                        poses: vec![position],
-                    },
-                );
-                follower.update_position_estimate(&position, 0.5);
-                robot_state.waypoint_follower = Some(follower);
-            } else {
-                robot_state.waypoint_follower = None;
-            }
-        }
+        self.active_robots.keys().position(|k| k == robot_id)
     }
 
     pub fn handle_plan(&mut self, robot_id: &str, msg: Plan) -> bool {
+        let Some(agent_idx) = self.get_agent_index(robot_id) else {
+            return false;
+        };
+
         let Some(state) = self.active_robots.get_mut(robot_id) else {
             return false;
         };
@@ -304,13 +267,27 @@ impl PlanExecutor {
             return false;
         }
 
+        self.plan_registry
+            .add_robot_plan(robot_id.to_string(), msg.clone());
+
+        let poses: Vec<Isometry2<f32>> = msg
+            .waypoints
+            .iter()
+            .map(|wp| Isometry2::new(Vector2::new(wp.position[0], wp.position[1]), 0.0))
+            .collect();
+        let mut follower = WaypointFollower::from_trajectory(agent_idx, Trajectory { poses });
+        if let Some(status) = &state.latest_status {
+            let current_x = status.pose.pose.position.x as f32;
+            let current_y = status.pose.pose.position.y as f32;
+            let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
+            follower.update_position_estimate(&position, 0.5);
+        }
+
         state.plan = Some(msg);
+        state.waypoint_follower = Some(follower);
         state.safe_zone_version = 0;
         state.last_incremental_target_wp = None;
         state.blockage_monitor.begin_plan();
-
-        // Reindex because we updated the plan
-        self.reindex_followers();
         true
     }
 
@@ -337,9 +314,51 @@ impl PlanExecutor {
         errors
     }
 
+    /// Decide whether a traffic dependency has been satisfied.
+    ///
+    /// We prefer the blocker's own reported `Progress` in `RobotStatus`, because
+    /// that is its own statement of how far it has got. We only fall back to
+    /// projecting its pose onto its plan when it has not reported progress against
+    /// the plan we are depending on.
+    fn blocker_is_satisfied(
+        &self,
+        blocker: &TrafficDependency,
+        semantic_waypoints: &HashMap<String, SemanticWaypoint>,
+    ) -> bool {
+        if let Some(blocker_state) = self.active_robots.get(&blocker.name) {
+            if let Some(status) = &blocker_state.latest_status {
+                if let Some(rmw_prog) = status.progress.first() {
+                    if rmw_prog.plan_id.destination_session.uuid
+                        == blocker.plan_id.destination_session.uuid
+                        && rmw_prog.plan_id.plan_version == blocker.plan_id.plan_version
+                    {
+                        return rmw_prog.progress >= blocker.required_progress;
+                    }
+                }
+            }
+            if let Some(active_plan) = &blocker_state.plan {
+                if blocker.plan_id != PlanId::default() && active_plan.plan_id != blocker.plan_id {
+                    // The blocker robot has moved on to a different plan.
+                    return true;
+                }
+            }
+        }
+
+        match semantic_waypoints.get(&blocker.name) {
+            Some(sem) => sem.trajectory_index >= blocker.required_progress.round() as usize,
+            // We know nothing about this participant, so we must assume it is in
+            // the way.
+            None => false,
+        }
+    }
+
     pub fn handle_status(&mut self, robot_id: &str, msg: RobotStatus) -> ExecutionStepOutput {
         let current_x = msg.pose.pose.position.x as f32;
         let current_y = msg.pose.pose.position.y as f32;
+        let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
+
+        self.plan_registry
+            .update_stationary_position(robot_id, position);
 
         {
             let Some(state) = self.active_robots.get_mut(robot_id) else {
@@ -348,19 +367,37 @@ impl PlanExecutor {
 
             state.latest_status = Some(msg.clone());
 
-            if let Some(fw) = &mut state.waypoint_follower {
-                let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
-                fw.update_position_estimate(&position, 0.5);
-            } else {
-                self.reindex_followers();
+            if let (Some(fw), Some(plan)) = (&mut state.waypoint_follower, &state.plan) {
+                if msg.mode == RobotStatus::MODE_ACTION {
+                    if let Some(rmw_prog) = msg.progress.first() {
+                        if rmw_prog.plan_id.destination_session.uuid
+                            == plan.plan_id.destination_session.uuid
+                            && rmw_prog.plan_id.plan_version == plan.plan_id.plan_version
+                        {
+                            let reached = rmw_prog.reached_waypoint as usize;
+                            if reached > fw.get_semantic_waypoint().trajectory_index {
+                                if let Some(wp) = plan.waypoints.get(reached) {
+                                    let wp_pos = Isometry2::new(
+                                        Vector2::new(wp.position[0], wp.position[1]),
+                                        0.0,
+                                    );
+                                    fw.update_position_estimate(&wp_pos, 0.1);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    fw.update_position_estimate(&position, 0.5);
+                }
+                let after = fw.get_semantic_waypoint().trajectory_index;
+                self.plan_registry
+                    .update_progress(robot_id, after, plan.plan_id.clone());
             }
         }
 
         let plan_error = self.update_route_blockage(robot_id);
 
-        // Only robots with an active plan need to compute and publish PlanRelease & SafeZone
-        let robot_state = &self.active_robots[robot_id];
-        if robot_state.plan.is_none() {
+        if !self.ready_to_execute(robot_id) {
             return ExecutionStepOutput {
                 plan_release: None,
                 safe_zone: None,
@@ -371,14 +408,19 @@ impl PlanExecutor {
         // Cache all semantic waypoints first because get_semantic_waypoint requires &mut self.
         // Doing this first avoids borrowing active_robots as mutable during later immutable reads.
         let mut semantic_waypoints = HashMap::new();
-        for (name, r_state) in &mut self.active_robots {
+        for (robot_index, (name, r_state)) in self.active_robots.iter_mut().enumerate() {
             if let Some(fw) = &mut r_state.waypoint_follower {
-                semantic_waypoints.insert(name.clone(), fw.get_semantic_waypoint());
+                semantic_waypoints.insert(
+                    name.clone(),
+                    SemanticWaypoint {
+                        agent: robot_index,
+                        trajectory_index: fw.get_semantic_waypoint().trajectory_index,
+                    },
+                );
             }
         }
 
         // 1. Calculate PlanRelease
-        let agent_idx = self.get_agent_index(robot_id).unwrap();
         let robot_state = &self.active_robots[robot_id];
         let plan = robot_state.plan.as_ref().unwrap();
         let curr_wp_idx = semantic_waypoints
@@ -403,14 +445,7 @@ impl PlanExecutor {
             }
             let mut blocked = false;
             for blocker in &wp.departure_blockers {
-                if let Some(blocker_sem) = semantic_waypoints.get(&blocker.name) {
-                    let blocker_progress = blocker_sem.trajectory_index;
-                    let required_progress = blocker.required_progress.round() as usize;
-                    if blocker_progress < required_progress {
-                        blocked = true;
-                        break;
-                    }
-                } else {
+                if !self.blocker_is_satisfied(blocker, &semantic_waypoints) {
                     blocked = true;
                     break;
                 }
@@ -442,7 +477,7 @@ impl PlanExecutor {
             released_wp_idx = plan.waypoints.len() - 1;
         }
 
-        let pr = PlanRelease {
+        let plan_release = PlanRelease {
             waypoint_id: released_wp_idx as u64,
             plan_id: plan.plan_id.clone(),
         };
@@ -499,55 +534,21 @@ impl PlanExecutor {
         }
         // --- End dynamic grid resizing ---
 
-        // 2. Generate SafeZone
-        let mut trajectories = Vec::new();
-        let mut footprints = Vec::new();
+        // 2. Generate SafeZone using the DFS-reconstructed multi-plan snapshot
+        let mut snapshot = self.plan_registry.get_mapf_snapshot();
+        let origin_offset = Vector2::new(
+            self.grid_origin.position.x as f32,
+            self.grid_origin.position.y as f32,
+        );
+        for traj in &mut snapshot.mapf_result.trajectories {
+            for pose in &mut traj.poses {
+                pose.translation.vector -= origin_offset;
+            }
+        }
+
         let mut current_positions = Vec::new();
-
-        let mut sorted_names: Vec<String> = self.active_robots.keys().cloned().collect();
-        sorted_names.sort();
-
-        for r_name in &sorted_names {
+        for (idx, r_name) in snapshot.included_robots.iter().enumerate() {
             let r_state = &self.active_robots[r_name];
-            let traj_poses: Vec<Isometry2<f32>> = if let Some(r_plan) = &r_state.plan {
-                r_plan
-                    .waypoints
-                    .iter()
-                    .map(|wp| {
-                        Isometry2::new(
-                            Vector2::new(
-                                wp.position[0] - self.grid_origin.position.x as f32,
-                                wp.position[1] - self.grid_origin.position.y as f32,
-                            ),
-                            0.0,
-                        )
-                    })
-                    .collect()
-            } else if let Some(r_status) = &r_state.latest_status {
-                vec![Isometry2::new(
-                    Vector2::new(
-                        r_status.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
-                        r_status.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
-                    ),
-                    0.0,
-                )]
-            } else {
-                continue;
-            };
-
-            trajectories.push(mapf_post::Trajectory { poses: traj_poses });
-            footprints.push(Arc::new(mapf_post::shape::Ball::new(r_state.radius))
-                as Arc<dyn mapf_post::shape::Shape>);
-
-            let semantic_position =
-                semantic_waypoints
-                    .get(r_name)
-                    .cloned()
-                    .unwrap_or(mapf_post::SemanticWaypoint {
-                        agent: trajectories.len() - 1,
-                        trajectory_index: 0,
-                    });
-
             let real_position = if let Some(r_status) = &r_state.latest_status {
                 (
                     r_status.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
@@ -557,23 +558,34 @@ impl PlanExecutor {
                 (0.0, 0.0)
             };
 
+            let semantic_position = semantic_waypoints
+                .get(r_name)
+                .map(|sem| {
+                    let global_idx = snapshot
+                        .get_global_waypoint_index(r_name, sem.trajectory_index)
+                        .unwrap_or(sem.trajectory_index);
+                    SemanticWaypoint {
+                        agent: idx,
+                        trajectory_index: global_idx,
+                    }
+                })
+                .unwrap_or(SemanticWaypoint {
+                    agent: idx,
+                    trajectory_index: 0,
+                });
             current_positions.push(CurrentPosition {
                 semantic_position,
                 real_position,
             });
         }
 
-        let mapf_result = MapfResult {
-            trajectories,
-            footprints,
-            discretization_timestep: 1.0,
-        };
-
         let allocation_field = self
             .grid
-            .allocate_trajectory(&mapf_result, &current_positions);
+            .allocate_trajectory(&snapshot.mapf_result, &current_positions);
+
+        let snapshot_agent_idx = snapshot.get_agent_index(robot_id).unwrap_or(0);
         let positions = allocation_field
-            .get_alloc_for_agent(agent_idx)
+            .get_alloc_for_agent(snapshot_agent_idx)
             .unwrap_or_default();
 
         let target_wp = &plan.waypoints[released_wp_idx];
@@ -637,7 +649,7 @@ impl PlanExecutor {
         };
 
         ExecutionStepOutput {
-            plan_release: Some(pr),
+            plan_release: Some(plan_release),
             safe_zone: Some(safe_zone),
             plan_error,
         }
@@ -678,6 +690,15 @@ impl PlanExecutor {
                 parameters: String::new(),
             },
             plan_id,
+        })
+    }
+
+    /// Whether we can generate a release and safe zone for `robot_id`.
+    fn ready_to_execute(&self, robot_id: &str) -> bool {
+        self.active_robots.get(robot_id).is_some_and(|state| {
+            state.latest_status.is_some()
+                && state.plan.is_some()
+                && state.waypoint_follower.is_some()
         })
     }
 
@@ -727,20 +748,29 @@ mod tests {
     use ros_env::{
         geometry_msgs::msg::Pose,
         nav_msgs::msg::OccupancyGrid,
-        rmf_prototype_msgs::msg::{Plan, RobotStatus, TrafficDependency, Waypoint},
+        rmf_prototype_msgs::msg::{Plan, PlanId, RobotStatus, TrafficDependency, Waypoint},
     };
 
     fn plan_with_positions(positions: &[[f32; 2]]) -> Plan {
         Plan {
             waypoints: positions
                 .iter()
-                .map(|position| Waypoint {
+                .enumerate()
+                .map(|(i, position)| Waypoint {
                     position: *position,
+                    progress: i as f32,
                     ..Default::default()
                 })
                 .collect(),
             ..Default::default()
         }
+    }
+
+    fn status_at(x: f64, y: f64) -> RobotStatus {
+        let mut status = RobotStatus::default();
+        status.pose.pose.position.x = x;
+        status.pose.pose.position.y = y;
+        status
     }
 
     #[test]
@@ -787,6 +817,118 @@ mod tests {
         let ori1 = target_orientation(&plan, 1);
         assert!((ori1.orientation_radians - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-6);
         assert!((ori1.tolerance_radians - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn executor_releases_and_generates_safe_zone_across_plans_with_stationary_peer() {
+        let mut executor = PlanExecutor::new();
+        executor.handle_robot_added("robot_1", 0.5);
+        executor.handle_robot_added("robot_2", 0.5);
+        executor.handle_robot_added("robot_3", 0.5);
+
+        let mut plan_1 = plan_with_positions(&[[1.0, 1.0], [2.0, 1.0], [3.0, 1.0]]);
+        plan_1.plan_id = PlanId {
+            plan_version: 1,
+            ..Default::default()
+        };
+        plan_1.plan_id.destination_session.uuid = [1; 16];
+        let plan_1_id = plan_1.plan_id.clone();
+
+        let mut plan_2 = plan_with_positions(&[[5.0, 5.0], [6.0, 5.0]]);
+        plan_2.plan_id = PlanId {
+            plan_version: 1,
+            ..Default::default()
+        };
+        plan_2.plan_id.destination_session.uuid = [2; 16];
+        plan_2.waypoints[0].departure_blockers = vec![TrafficDependency {
+            name: "robot_1".to_string(),
+            plan_id: plan_1_id.clone(),
+            required_progress: 2.0,
+        }];
+
+        executor.handle_plan("robot_1", plan_1);
+        executor.handle_plan("robot_2", plan_2);
+
+        // Localize all three robots (robot_3 has no plan and remains stationary)
+        executor.handle_status("robot_1", status_at(1.0, 1.0));
+        executor.handle_status("robot_3", status_at(10.0, 10.0));
+
+        // robot_2 is blocked at wp 0 until robot_1 reaches progress 2.0
+        let out_blocked = executor.handle_status("robot_2", status_at(5.0, 5.0));
+        assert_eq!(out_blocked.plan_release.unwrap().waypoint_id, 0);
+        assert!(out_blocked.safe_zone.is_some());
+
+        // Report robot_1 progress = 2.0 on its plan via RobotStatus
+        let mut status_r1_progressed = status_at(1.0, 1.0);
+        let mut rmw_prog = ros_env::rmf_prototype_msgs::msg::rmw::Progress::default();
+        rmw_prog.plan_id.destination_session.uuid = plan_1_id.destination_session.uuid;
+        rmw_prog.plan_id.plan_version = plan_1_id.plan_version;
+        rmw_prog.progress = 2.0;
+        rmw_prog.reached_waypoint = 2;
+        rmw_prog.target_waypoint = 2;
+        status_r1_progressed.progress = vec![rmw_prog].try_into().unwrap();
+        executor.handle_status("robot_1", status_r1_progressed);
+
+        let out_released = executor.handle_status("robot_2", status_at(5.0, 5.0));
+        assert_eq!(out_released.plan_release.unwrap().waypoint_id, 1);
+        assert!(out_released.safe_zone.is_some());
+    }
+
+    #[test]
+    fn handle_plan_does_not_reset_peer_action_follower() {
+        let mut executor = PlanExecutor::new();
+        executor.handle_robot_added("robot_1", 0.5);
+        executor.handle_robot_added("robot_2", 0.5);
+
+        let mut plan_1 = plan_with_positions(&[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]);
+        plan_1.plan_id.destination_session.uuid = [1; 16];
+        let plan_1_id = plan_1.plan_id.clone();
+
+        executor.handle_plan("robot_1", plan_1);
+        executor.handle_status("robot_2", status_at(5.0, 5.0));
+
+        // Advance robot_1 to waypoint 2 via RobotStatus (MODE_ACTION + Progress) while pose is off-path
+        let mut action_status = status_at(0.0, 0.0);
+        action_status.mode = RobotStatus::MODE_ACTION;
+        let mut rmw_prog = ros_env::rmf_prototype_msgs::msg::rmw::Progress::default();
+        rmw_prog.plan_id.destination_session.uuid = plan_1_id.destination_session.uuid;
+        rmw_prog.plan_id.plan_version = plan_1_id.plan_version;
+        rmw_prog.progress = 2.0;
+        rmw_prog.reached_waypoint = 2;
+        rmw_prog.target_waypoint = 2;
+        action_status.progress = vec![rmw_prog].try_into().unwrap();
+        executor.handle_status("robot_1", action_status.clone());
+        assert_eq!(
+            executor
+                .active_robots
+                .get_mut("robot_1")
+                .unwrap()
+                .waypoint_follower
+                .as_mut()
+                .unwrap()
+                .get_semantic_waypoint()
+                .trajectory_index,
+            2
+        );
+
+        // Now send a new plan for robot_2 while robot_1 is still in MODE_ACTION at (0.0, 0.0)
+        executor.handle_status("robot_1", action_status);
+        let plan_2 = plan_with_positions(&[[5.0, 5.0], [6.0, 5.0]]);
+        executor.handle_plan("robot_2", plan_2);
+
+        // robot_1's follower must NOT have been reset back to 0!
+        assert_eq!(
+            executor
+                .active_robots
+                .get_mut("robot_1")
+                .unwrap()
+                .waypoint_follower
+                .as_mut()
+                .unwrap()
+                .get_semantic_waypoint()
+                .trajectory_index,
+            2
+        );
     }
 
     #[test]
