@@ -17,12 +17,11 @@ import threading
 import time
 import unittest
 
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from launch import LaunchDescription
 import launch_ros.actions
 import launch_testing.actions
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import Odometry
 import pytest
 import rclpy
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
@@ -161,12 +160,16 @@ class TestTargetOrientationForwarding(unittest.TestCase):
             callback_group=self.cb_group,
         )
 
-        odom_pub = self.node.create_publisher(Odometry, '/robot0/odom', 10)
-        odom_msg = Odometry()
-        odom_msg.header.frame_id = 'map'
-        odom_msg.pose.pose.position.x = 0.0
-        odom_msg.pose.pose.position.y = 0.0
-        odom_msg.pose.pose.orientation.w = 1.0
+        amcl_pub = self.node.create_publisher(
+            PoseWithCovarianceStamped,
+            '/robot0/inner/amcl_pose',
+            qos_profile=transient_qos,
+        )
+        amcl_msg = PoseWithCovarianceStamped()
+        amcl_msg.header.frame_id = 'map'
+        amcl_msg.pose.pose.position.x = 0.0
+        amcl_msg.pose.pose.position.y = 0.0
+        amcl_msg.pose.pose.orientation.w = 1.0
 
         outer_client = ActionClient(
             self.node,
@@ -179,10 +182,10 @@ class TestTargetOrientationForwarding(unittest.TestCase):
             'Timed out waiting for /robot0/navigate_to_pose action server',
         )
 
-        # Wait for discovery and subscriptions to settle while publishing odometry
+        # Wait for discovery and subscriptions to settle while publishing pose
         start_wait = time.time()
         while time.time() - start_wait < 2.0:
-            odom_pub.publish(odom_msg)
+            amcl_pub.publish(amcl_msg)
             time.sleep(0.1)
 
         goal_msg = NavigateToPose.Goal()
@@ -202,7 +205,7 @@ class TestTargetOrientationForwarding(unittest.TestCase):
             and received_safe_zones
             and inner_goals
         ):
-            odom_pub.publish(odom_msg)
+            amcl_pub.publish(amcl_msg)
             time.sleep(0.1)
 
         try:

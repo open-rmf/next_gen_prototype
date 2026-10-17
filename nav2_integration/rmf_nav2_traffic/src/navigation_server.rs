@@ -1,10 +1,14 @@
 use crate::{
+    agent::AmclPose,
     destination::DestinationGoalPublisher,
     inner_navigation_client::{
         CancelInnerForAgent, CancellingInnerNavigation, InnerNavigationClient,
         InnerNavigationFeedback,
     },
-    safe_zone::{CurrentSafeZone, ProgressPublisher, SafeZoneSubscription},
+    safe_zone::{
+        build_robot_status, CurrentSafeZone, LatestProgress, ProgressPublisher,
+        RobotStatusPublisher, SafeZoneSubscription,
+    },
     Nav2Agent,
 };
 use bevy::prelude::*;
@@ -16,8 +20,8 @@ use ros_env::{
     geometry_msgs::msg::PoseStamped,
     nav2_msgs::action::{NavigateToPose, NavigateToPose_Feedback, NavigateToPose_Result},
     rmf_prototype_msgs::msg::{
-        DestinationConstraints, DestinationGoal, PlanId, Progress, Region, TargetOrientation,
-        TargetRegion,
+        DestinationConstraints, DestinationGoal, PlanId, Progress, Region, RobotStatus,
+        TargetOrientation, TargetRegion,
     },
     unique_identifier_msgs::msg::UUID as RosUuid,
 };
@@ -472,15 +476,28 @@ fn cleanup_navigation(
     mut commands: Commands,
     mut nav_completed: EventReader<NavigationCompleted>,
     current_nav_requests: Query<&CurrentNavigationRequest>,
-    safe_zones: Query<(&SafeZoneSubscription, &CurrentSafeZone, &ProgressPublisher)>,
+    mut safe_zones: Query<(
+        &SafeZoneSubscription,
+        &CurrentSafeZone,
+        &ProgressPublisher,
+        &RobotStatusPublisher,
+        &mut LatestProgress,
+        Option<&AmclPose>,
+    )>,
 ) {
     for event in nav_completed.read() {
         if current_nav_requests.get(event.agent).is_ok_and(|req| {
             req.request.agent == event.agent && req.request.plan_id == event.plan_id
         }) {
-            // Publish final Progress message to indicate path completion
-            if let Ok((safe_zone_sub, current_safe_zone, progress_pub)) =
-                safe_zones.get(event.agent)
+            // Publish final Progress and RobotStatus messages to indicate path completion
+            if let Ok((
+                safe_zone_sub,
+                current_safe_zone,
+                progress_pub,
+                status_pub,
+                mut latest_progress,
+                amcl_pose,
+            )) = safe_zones.get_mut(event.agent)
             {
                 if let Some(safe_zone) = safe_zone_sub
                     .subscriber
@@ -488,13 +505,29 @@ fn cleanup_navigation(
                     .or_else(|| current_safe_zone.0.clone())
                 {
                     let target_wp = safe_zone.target_waypoint.first().copied().unwrap_or(0);
-                    let _ = progress_pub.publisher.publish(Progress {
+                    let final_progress = Progress {
                         progress: safe_zone.target_progress,
                         reached_waypoint: target_wp,
                         target_waypoint: target_wp,
                         reached_keys: vec![],
                         plan_id: safe_zone.id.plan_id.clone(),
-                    });
+                    };
+                    let _ = progress_pub.publisher.publish(final_progress.clone());
+                    latest_progress.0 = Some(final_progress.clone());
+
+                    let pose = amcl_pose
+                        .map(|p| PoseStamped {
+                            header: p.0.header.clone(),
+                            pose: p.0.pose.pose.clone(),
+                        })
+                        .unwrap_or_default();
+                    let status_msg = build_robot_status(
+                        pose,
+                        RobotStatus::MODE_IDLE,
+                        Some(&final_progress),
+                        Some(&safe_zone.id),
+                    );
+                    let _ = status_pub.publisher.publish(status_msg);
                 }
             }
             commands
