@@ -28,6 +28,57 @@ pub struct Map {
     pub grid: OccupancyGrid,
 }
 
+impl Map {
+    pub fn is_usable(&self) -> bool {
+        self.grid.info.width > 0 && self.grid.info.height > 0 && self.grid.info.resolution > 0.0
+    }
+
+    fn cell(&self, point: [f32; 2]) -> Option<(usize, usize)> {
+        let resolution = self.grid.info.resolution;
+        let x = (point[0] - self.grid.info.origin.position.x as f32) / resolution;
+        let y = (point[1] - self.grid.info.origin.position.y as f32) / resolution;
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let (x, y) = (x.round() as usize, y.round() as usize);
+        if x >= self.grid.info.width as usize || y >= self.grid.info.height as usize {
+            return None;
+        }
+        Some((x, y))
+    }
+
+    pub fn mark(&mut self, path: &[[f32; 2]]) {
+        if !self.is_usable() {
+            return;
+        }
+        let Some(first) = path.first() else {
+            return;
+        };
+
+        self.occupy(*first);
+        let resolution = self.grid.info.resolution;
+        for pair in path.windows(2) {
+            let (from, to) = (pair[0], pair[1]);
+            let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+            let steps = ((dx.hypot(dy) / (resolution * 0.25)).ceil() as usize).max(1);
+            for step in 1..=steps {
+                let t = step as f32 / steps as f32;
+                self.occupy([from[0] + dx * t, from[1] + dy * t]);
+            }
+        }
+    }
+
+    fn occupy(&mut self, point: [f32; 2]) {
+        let Some((x, y)) = self.cell(point) else {
+            return;
+        };
+        let width = self.grid.info.width as usize;
+        if let Some(cell) = self.grid.data.get_mut(y * width + x) {
+            *cell = 100;
+        }
+    }
+}
+
 /// Implement this trait to use your own custom MAPF
 /// planner. The planner in this scenario will take in
 /// starts and goals and assign a trajectory to the agents.
@@ -416,5 +467,56 @@ mod tests {
         let last_pose = trajectories[0].last().unwrap();
         assert!((last_pose.translation.x - 2.35).abs() < 1e-6);
         assert!((last_pose.translation.y - 1.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn marked_path_is_routed_around_by_pibt() {
+        let mut map = Map::default();
+        map.grid.info.resolution = 1.0;
+        map.grid.info.width = 5;
+        map.grid.info.height = 3;
+        map.grid.data = vec![0; 15];
+
+        // Mark action segment from (2.0, 1.0) to (2.0, 2.0)
+        map.mark(&[[2.0, 1.0], [2.0, 2.0]]);
+
+        let mut starts = HashMap::new();
+        let mut status = RobotStatus::default();
+        status.pose.pose.position.x = 0.0;
+        status.pose.pose.position.y = 1.0;
+        starts.insert("mover".to_string(), status);
+
+        let mut goals = HashMap::new();
+        let mut dest = Destination::default();
+        dest.constraints.regions.push(TargetRegion {
+            region: Region {
+                points: vec![4.0, 1.0],
+                hint: Region::HINT_POINT,
+            },
+            ..Default::default()
+        });
+        goals.insert("mover".to_string(), dest);
+
+        let trajectories = PibtPlanner::new(50)
+            .plan(
+                &starts,
+                &goals,
+                &HashMap::new(),
+                &["mover".to_string()],
+                &map,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("planner should route around the marked path");
+
+        let path = &trajectories[0];
+        for pose in &path[..path.len() - 1] {
+            let at_mark =
+                (pose.translation.x - 2.0).abs() < 0.01 && (pose.translation.y - 1.0).abs() < 0.01;
+            assert!(!at_mark, "mover drove through marked space: {:?}", path);
+        }
+
+        let end = path.last().unwrap();
+        assert!((end.translation.x - 4.0).abs() < 0.01);
+        assert!((end.translation.y - 1.0).abs() < 0.01);
     }
 }
