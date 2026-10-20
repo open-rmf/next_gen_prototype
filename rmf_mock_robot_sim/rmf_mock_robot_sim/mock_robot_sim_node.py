@@ -238,17 +238,28 @@ class MockRobotSimNode(Node):
             )
             return
 
+        def extract_anchor_xy(pose):
+            if isinstance(pose, list) and len(pose) >= 2:
+                return (float(pose[0]), float(pose[1]))
+            if isinstance(pose, dict):
+                t2d = pose.get('Translate2D')
+                if isinstance(t2d, list) and len(t2d) >= 2:
+                    return (float(t2d[0]), float(t2d[1]))
+            return None
+
         anchors = {}
         for anchor_id, pose in site_data.get('anchors', {}).items():
-            if isinstance(pose, list) and len(pose) >= 2:
-                anchors[str(anchor_id)] = (float(pose[0]), float(pose[1]))
+            xy = extract_anchor_xy(pose)
+            if xy is not None:
+                anchors[str(anchor_id)] = xy
 
         for level_data in site_data.get('levels', {}).values():
             if not isinstance(level_data, dict):
                 continue
             for anchor_id, pose in level_data.get('anchors', {}).items():
-                if isinstance(pose, list) and len(pose) >= 2:
-                    anchors[str(anchor_id)] = (float(pose[0]), float(pose[1]))
+                xy = extract_anchor_xy(pose)
+                if xy is not None:
+                    anchors[str(anchor_id)] = xy
 
         self.site_anchors = anchors
         self.site_action_lanes = []
@@ -260,8 +271,13 @@ class MockRobotSimNode(Node):
         for lane_id, lane_data in lanes.items():
             if not isinstance(lane_data, dict):
                 continue
-            left_id = str(lane_data.get('left', ''))
-            right_id = str(lane_data.get('right', ''))
+            lane_anchors = lane_data.get('anchors')
+            if isinstance(lane_anchors, list) and len(lane_anchors) >= 2:
+                left_id = str(lane_anchors[0])
+                right_id = str(lane_anchors[1])
+            else:
+                left_id = str(lane_data.get('left', ''))
+                right_id = str(lane_data.get('right', ''))
             if left_id not in anchors or right_id not in anchors:
                 continue
             left_pos = anchors[left_id]
@@ -325,7 +341,10 @@ class MockRobotSimNode(Node):
             loc_pos = anchors[anchor_id]
             loc_name = str(loc_data.get('name', f'location_{loc_id}'))
             tags = loc_data.get('tags', [])
-            is_dock = bool(loc_data.get('is_dock', False))
+            is_dock = bool(
+                loc_data.get('is_dock', False)
+                or loc_name.lower().startswith('dock')
+            )
             dock_dur = float(
                 loc_data.get('dock_duration', self.default_action_duration)
             )
