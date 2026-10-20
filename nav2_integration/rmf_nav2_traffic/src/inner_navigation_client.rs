@@ -560,8 +560,21 @@ fn async_cancel_goal(
 fn async_request_new_goal(
     Async { request, .. }: Async<InnerNavigationRequest>,
     mut inner_nav_clients: Query<&mut InnerNavigationClient>,
+    current_safe_zones: Query<&CurrentSafeZone>,
     executor_commands: Res<RclrsExecutorCommands>,
 ) -> impl Future<Output = Result<CurrentInnerNavigationGoal, InnerNavigationError>> {
+    let is_stale = current_safe_zones
+        .get(request.agent)
+        .ok()
+        .and_then(|csz| csz.0.as_ref())
+        .is_some_and(|sz| sz.id != request.safe_zone_id);
+    if is_stale {
+        return std::future::ready(Err(InnerNavigationError {
+            handle: None,
+            kind: InnerNavigationErrorKind::DuplicateOrOutdatedRequestError,
+        }))
+        .left_future();
+    }
     let inner_nav_client_result = inner_nav_clients.get_mut(request.agent);
     if inner_nav_client_result.is_err() {
         return std::future::ready(Err(InnerNavigationError {
@@ -615,8 +628,30 @@ fn update_goal_client(
         request: handle, ..
     }: Blocking<CurrentInnerNavigationGoal>,
     mut inner_nav_clients: Query<&mut InnerNavigationClient>,
+    current_safe_zones: Query<&CurrentSafeZone>,
 ) -> CurrentInnerNavigationGoal {
+    let is_stale = current_safe_zones
+        .get(handle.request.agent)
+        .ok()
+        .and_then(|csz| csz.0.as_ref())
+        .is_some_and(|sz| sz.id != handle.request.safe_zone_id);
+    if is_stale {
+        return handle;
+    }
     if let Ok(mut inner_nav_client) = inner_nav_clients.get_mut(handle.request.agent) {
+        if let Some(existing) = inner_nav_client.goal() {
+            if existing.id().plan_id.destination_session.uuid
+                != handle.request.safe_zone_id.plan_id.destination_session.uuid
+                || existing.id().plan_id.plan_version
+                    > handle.request.safe_zone_id.plan_id.plan_version
+                || (existing.id().plan_id.plan_version
+                    == handle.request.safe_zone_id.plan_id.plan_version
+                    && existing.id().safe_zone_version
+                        > handle.request.safe_zone_id.safe_zone_version)
+            {
+                return handle;
+            }
+        }
         *inner_nav_client.goal_mut() = Some(ActiveInnerGoal::new(
             handle.goal_client.clone(),
             handle.request.safe_zone_id.clone(),
@@ -766,7 +801,13 @@ fn process_navigation_result(
                     amcl_pose,
                 )) = progress_query.get_mut(target.agent)
                 {
-                    if tracker.plan_id.as_ref() == Some(&target.safe_zone_id.plan_id) {
+                    let matches_current_sz = current_safe_zone
+                        .and_then(|csz| csz.0.as_ref())
+                        .map(|sz| sz.id == target.safe_zone_id)
+                        .unwrap_or(true);
+                    if matches_current_sz
+                        && tracker.plan_id.as_ref() == Some(&target.safe_zone_id.plan_id)
+                    {
                         let current_pose = amcl_pose.map(|p| p.xy_yaw());
                         if !tracker.is_target_pose_satisfied(current_pose) {
                             warn!(
