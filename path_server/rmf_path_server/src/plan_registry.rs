@@ -20,7 +20,8 @@ use mapf_post::{
 use ros_env::{
     builtin_interfaces,
     rmf_prototype_msgs::msg::{
-        Destination, Plan, PlanId, RobotStatus, TrafficDependency, Waypoint,
+        Destination, DestinationConstraints, Plan, PlanId, Region, RobotStatus, TargetOrientation,
+        TargetRegion, TrafficDependency, Waypoint,
     },
 };
 use std::{
@@ -38,6 +39,19 @@ struct CollatedAgent {
     /// (any steps after this are stationary end-of-plan padding).
     active_end_step: usize,
     poses: Vec<Isometry2<f32>>,
+}
+
+fn push_or_max_blocker(blockers: &mut Vec<TrafficDependency>, dep: TrafficDependency) {
+    if let Some(existing) = blockers
+        .iter_mut()
+        .find(|b| b.name == dep.name && b.plan_id == dep.plan_id)
+    {
+        if dep.required_progress > existing.required_progress {
+            existing.required_progress = dep.required_progress;
+        }
+    } else {
+        blockers.push(dep);
+    }
 }
 
 /// Manages active [`Plan`]s, computes [`PlanId`] versions, answers plan-occupancy
@@ -376,9 +390,47 @@ impl PlanRegistry {
 
             let mut waypoints = Vec::with_capacity(traj.len());
             for (i, pose) in traj.iter().enumerate() {
+                let x = pose.translation.x;
+                let y = pose.translation.y;
+                let mut heading = pose.rotation.angle();
+                let mut found_heading = false;
+                for prev in traj[..i].iter().rev() {
+                    let dx = x - prev.translation.x;
+                    let dy = y - prev.translation.y;
+                    if dx.hypot(dy) > 1e-3 {
+                        heading = dy.atan2(dx);
+                        found_heading = true;
+                        break;
+                    }
+                }
+                if !found_heading {
+                    for next in traj.iter().skip(i + 1) {
+                        let dx = next.translation.x - x;
+                        let dy = next.translation.y - y;
+                        if dx.hypot(dy) > 1e-3 {
+                            heading = dy.atan2(dx);
+                            break;
+                        }
+                    }
+                }
+
                 waypoints.push(Waypoint {
-                    position: [pose.translation.x, pose.translation.y],
-                    arrival_constraints: Default::default(),
+                    position: [x, y],
+                    arrival_constraints: DestinationConstraints {
+                        regions: vec![TargetRegion {
+                            tolerance: 0.2,
+                            region: Region {
+                                points: vec![x, y],
+                                hint: Region::HINT_POINT,
+                            },
+                            orientations: vec![TargetOrientation {
+                                orientation_radians: heading,
+                                spread_radians: 0.0,
+                                tolerance_radians: std::f32::consts::PI,
+                            }],
+                        }],
+                        nodes: Vec::new(),
+                    },
                     progress: i as f32 * timestep,
                     maps: Vec::new(),
                     departure_blockers: Vec::new(),
@@ -389,9 +441,10 @@ impl PlanRegistry {
             }
 
             for i in 0..traj.len() {
+                let global_step = new_session_offset + i;
                 if let Some(dep_ids) = traffic_dependencies.comes_before(&SemanticWaypoint {
                     agent: collated_idx,
-                    trajectory_index: new_session_offset + i,
+                    trajectory_index: global_step,
                 }) {
                     for &dep_id in dep_ids {
                         let dep_wp = &traffic_dependencies.waypoints[dep_id];
@@ -409,11 +462,14 @@ impl PlanRegistry {
                                 .unwrap_or(0);
                             if local_next_wp > 0 {
                                 let req_progress = local_next_wp as f32 * timestep;
-                                waypoints[i].departure_blockers.push(TrafficDependency {
-                                    name: dep_agent.robot_id.clone(),
-                                    plan_id: dep_agent.plan_id.clone(),
-                                    required_progress: req_progress,
-                                });
+                                push_or_max_blocker(
+                                    &mut waypoints[i].departure_blockers,
+                                    TrafficDependency {
+                                        name: dep_agent.robot_id.clone(),
+                                        plan_id: dep_agent.plan_id.clone(),
+                                        required_progress: req_progress,
+                                    },
+                                );
                             }
                         }
                     }
@@ -422,7 +478,41 @@ impl PlanRegistry {
 
             if let Some(dest) = goals.get(&agent.robot_id) {
                 if let Some(last_wp) = waypoints.last_mut() {
-                    last_wp.arrival_constraints = dest.constraints.clone();
+                    let default_heading = last_wp
+                        .arrival_constraints
+                        .regions
+                        .first()
+                        .and_then(|r| r.orientations.first().map(|o| o.orientation_radians))
+                        .unwrap_or(0.0);
+                    if !dest.constraints.regions.is_empty() || !dest.constraints.nodes.is_empty() {
+                        last_wp.arrival_constraints = dest.constraints.clone();
+                    }
+                    let mut has_orientation = false;
+                    for region in &mut last_wp.arrival_constraints.regions {
+                        for ori in &mut region.orientations {
+                            has_orientation = true;
+                            if ori.tolerance_radians <= 0.0 && ori.spread_radians <= 0.0 {
+                                ori.tolerance_radians = 0.25;
+                            }
+                        }
+                    }
+                    for node in &mut last_wp.arrival_constraints.nodes {
+                        for ori in &mut node.orientations {
+                            has_orientation = true;
+                            if ori.tolerance_radians <= 0.0 && ori.spread_radians <= 0.0 {
+                                ori.tolerance_radians = 0.25;
+                            }
+                        }
+                    }
+                    if !has_orientation {
+                        if let Some(region) = last_wp.arrival_constraints.regions.first_mut() {
+                            region.orientations.push(TargetOrientation {
+                                orientation_radians: default_heading,
+                                spread_radians: 0.0,
+                                tolerance_radians: std::f32::consts::PI,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -559,5 +649,130 @@ mod tests {
             "Expected robot2 to wait for robot1 to reach progress 2.0, got: {:?}",
             wp0_blockers
         );
+    }
+
+    #[test]
+    fn test_same_direction_follow_and_corridor_handoff_blockers() {
+        let registry = PlanRegistry::new();
+        let mut footprints: HashMap<String, Arc<dyn Shape>> = HashMap::new();
+        footprints.insert("robot_1".to_string(), Arc::new(Ball::new(0.49)));
+        footprints.insert("robot_2".to_string(), Arc::new(Ball::new(0.49)));
+
+        // 1. Same-direction follow:
+        // robot_1: [0,0] -> [1,0] -> [2,0] -> [3,0] -> [4,0]
+        // robot_2: [3,0] -> [4,0] -> [5,0] -> [6,0]
+        let mut goals = HashMap::new();
+        goals.insert("robot_1".to_string(), make_destination(1));
+        goals.insert("robot_2".to_string(), make_destination(2));
+        let robot_ids = vec!["robot_1".to_string(), "robot_2".to_string()];
+        let basic_plan_follow = vec![
+            make_poses(&[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0]]),
+            make_poses(&[[3.0, 0.0], [4.0, 0.0], [5.0, 0.0], [6.0, 0.0]]),
+        ];
+        let (plans_follow, _, _) =
+            registry.build_session_plans(&basic_plan_follow, &goals, &robot_ids, &footprints, 1.0);
+        let r1_follow = plans_follow.get("robot_1").unwrap();
+        // Departing wp 2 ([2,0] -> [3,0]) must wait for robot_2 to reach wp 1 ([4,0], progress 1.0)
+        assert!(
+            r1_follow.waypoints[2]
+                .departure_blockers
+                .iter()
+                .any(|b| b.name == "robot_2" && (b.required_progress - 1.0).abs() < 1e-5),
+            "Expected robot_1 wp 2 to block until robot_2 progress >= 1.0, got: {:?}",
+            r1_follow.waypoints[2].departure_blockers
+        );
+
+        // 2. Corridor alcove swap handoff at equal discrete timesteps:
+        let basic_plan_swap = vec![
+            make_poses(&[
+                [-1.0, 0.0],
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [2.0, 0.0],
+                [3.0, 0.0],
+                [3.0, 1.0],
+                [3.0, 0.0],
+                [4.0, 0.0],
+            ]),
+            make_poses(&[
+                [4.0, 0.0],
+                [3.0, 0.0],
+                [2.0, 0.0],
+                [3.0, 0.0],
+                [4.0, 0.0],
+                [3.0, 0.0],
+                [2.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 0.0],
+            ]),
+        ];
+        let (plans_swap, _, _) =
+            registry.build_session_plans(&basic_plan_swap, &goals, &robot_ids, &footprints, 1.0);
+        let r1_swap = plans_swap.get("robot_1").unwrap();
+        let r2_swap = plans_swap.get("robot_2").unwrap();
+        // robot_2 departing wp 4 ([4,0] -> [3,0]) must wait for robot_1 to reach alcove wp 5 ([3,1])
+        assert!(
+            r2_swap.waypoints[4]
+                .departure_blockers
+                .iter()
+                .any(|b| b.name == "robot_1" && (b.required_progress - 5.0).abs() < 1e-5),
+            "Expected robot_2 wp 4 to block until robot_1 progress >= 5.0, got: {:?}",
+            r2_swap.waypoints[4].departure_blockers
+        );
+        // robot_1 departing alcove wp 5 ([3,1] -> [3,0]) must wait for robot_2 to reach wp 6 ([2,0])
+        assert!(
+            r1_swap.waypoints[5]
+                .departure_blockers
+                .iter()
+                .any(|b| b.name == "robot_2" && (b.required_progress - 6.0).abs() < 1e-5),
+            "Expected robot_1 wp 5 to block until robot_2 progress >= 6.0, got: {:?}",
+            r1_swap.waypoints[5].departure_blockers
+        );
+    }
+
+    #[test]
+    fn test_waypoints_populate_intermediate_and_final_target_orientations() {
+        let registry = PlanRegistry::new();
+        let mut footprints: HashMap<String, Arc<dyn Shape>> = HashMap::new();
+        footprints.insert("robot_1".to_string(), Arc::new(Ball::new(0.49)));
+
+        let mut dest = make_destination(7);
+        dest.constraints = DestinationConstraints {
+            regions: vec![TargetRegion {
+                tolerance: 0.25,
+                region: Region {
+                    points: vec![2.0, 0.0],
+                    hint: Region::HINT_POINT,
+                },
+                orientations: vec![TargetOrientation {
+                    orientation_radians: std::f32::consts::FRAC_PI_2,
+                    spread_radians: 0.0,
+                    tolerance_radians: 0.0,
+                }],
+            }],
+            nodes: Vec::new(),
+        };
+
+        let mut goals = HashMap::new();
+        goals.insert("robot_1".to_string(), dest);
+        let robot_ids = vec!["robot_1".to_string()];
+        let basic_plan = vec![make_poses(&[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])];
+
+        let (plans, _, _) =
+            registry.build_session_plans(&basic_plan, &goals, &robot_ids, &footprints, 1.0);
+        let plan = plans.get("robot_1").unwrap();
+        assert_eq!(plan.waypoints.len(), 3);
+
+        // Intermediate waypoints (0 and 1) should have travel heading 0.0 and tolerance PI
+        for wp in &plan.waypoints[..2] {
+            let ori = &wp.arrival_constraints.regions[0].orientations[0];
+            assert!((ori.orientation_radians - 0.0).abs() < 1e-5);
+            assert!((ori.tolerance_radians - std::f32::consts::PI).abs() < 1e-5);
+        }
+
+        // Final waypoint (2) should preserve destination orientation PI/2 with normalized tolerance 0.25
+        let final_ori = &plan.waypoints[2].arrival_constraints.regions[0].orientations[0];
+        assert!((final_ori.orientation_radians - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        assert!((final_ori.tolerance_radians - 0.25).abs() < 1e-5);
     }
 }

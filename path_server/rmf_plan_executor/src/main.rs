@@ -88,6 +88,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|p| p.get())
         .unwrap_or(0.0);
 
+    let param_grid_subdivision = node
+        .declare_parameter("grid_subdivision")
+        .default(1i64)
+        .mandatory()
+        .map(|p| (p.get().max(1)) as u32)
+        .unwrap_or(1);
+
+    let param_blur_radius = node
+        .declare_parameter("blur_radius")
+        .default(1.0f64)
+        .mandatory()
+        .map(|p| (p.get().max(0.0)) as f32)
+        .unwrap_or(1.0);
+
     let args: Vec<String> = env::args().collect();
     let get_cli_arg = |flag: &str| -> Option<String> {
         args.iter()
@@ -127,6 +141,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(param_grid_origin_y);
 
+    let grid_subdivision = get_cli_arg("--grid-subdivision")
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|v| v.max(1))
+        .unwrap_or(param_grid_subdivision);
+
+    let blur_radius = get_cli_arg("--blur-radius")
+        .and_then(|s| s.parse::<f32>().ok())
+        .map(|v| v.max(0.0))
+        .unwrap_or(param_blur_radius);
+
     let mut origin = Pose::default();
     origin.position.x = grid_origin_x;
     origin.position.y = grid_origin_y;
@@ -137,16 +161,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         grid_height,
         grid_resolution,
         grid_origin: origin,
+        grid_subdivision,
+        blur_radius,
     };
 
     rclrs::log!(
         node.logger(),
-        "PlanExecutor initialized with grid: width={}, height={}, resolution={}, origin=({}, {})",
+        "PlanExecutor initialized with grid: width={}, height={}, resolution={}, origin=({}, {}), subdivision={}, blur_radius={}",
         config.grid_width,
         config.grid_height,
         config.grid_resolution,
         config.grid_origin.position.x,
-        config.grid_origin.position.y
+        config.grid_origin.position.y,
+        config.grid_subdivision,
+        config.blur_radius
     );
 
     // Create the executor worker
