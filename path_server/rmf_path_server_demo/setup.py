@@ -33,7 +33,10 @@ setup(
         (os.path.join('share', package_name, 'maps'),
             glob('maps/*.building.yaml')
             + glob('maps/*.site.json')
-            + glob('maps/*_grid.*')),
+            + glob('maps/*_grid.*')
+            + glob('maps/*_nav2.*')),
+        (os.path.join('share', package_name, 'worlds'), glob('worlds/*.sdf')),
+        (os.path.join('share', package_name, 'urdf'), glob('urdf/*.xacro')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -46,6 +49,14 @@ setup(
         'console_scripts': [
             'robot_spawner = rmf_path_server_demo.robot_spawner:main',
             'rmf_demo_test_client = rmf_path_server_demo.test_client:main',
+            (
+                'ground_truth_localizer = '
+                'rmf_path_server_demo.ground_truth_localizer:main'
+            ),
+            (
+                'corridor_swap_demo = '
+                'rmf_path_server_demo.corridor_swap_demo:main'
+            ),
         ],
     },
 )
