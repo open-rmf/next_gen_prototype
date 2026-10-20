@@ -225,9 +225,8 @@ impl PlanExecutor {
     }
 
     pub fn handle_robot_added(&mut self, robot_id: &str, radius: f32) -> bool {
-        self.plan_registry.add_robot(robot_id.to_string(), radius);
-
         if !self.active_robots.contains_key(robot_id) {
+            self.plan_registry.add_robot(robot_id.to_string(), radius);
             self.active_robots.insert(
                 robot_id.to_string(),
                 RobotState {
@@ -338,8 +337,16 @@ impl PlanExecutor {
             }
             if let Some(active_plan) = &blocker_state.plan {
                 if blocker.plan_id != PlanId::default() && active_plan.plan_id != blocker.plan_id {
-                    // The blocker robot has moved on to a different plan.
-                    return true;
+                    if active_plan.plan_id.destination_session.uuid
+                        != blocker.plan_id.destination_session.uuid
+                    {
+                        // The blocker robot has moved on to a different destination session.
+                        return true;
+                    }
+                    // The blocker is on a different version of the same destination
+                    // session (e.g. a replan arrived for one robot slightly before the
+                    // other). Hold until both plans and progress reports align.
+                    return false;
                 }
             }
         }
@@ -1264,5 +1271,54 @@ mod tests {
         status3.pose.pose.position.y = 0.0;
         let out3 = plan_executor.handle_status("robot_1", status3);
         assert_eq!(out3.plan_release.unwrap().waypoint_id, 3);
+    }
+
+    #[test]
+    fn test_blocker_holds_on_newer_plan_version_of_same_session() {
+        let mut plan_executor = PlanExecutor::new();
+        plan_executor.handle_robot_added("robot_1", 0.5);
+        plan_executor.handle_robot_added("robot_2", 0.5);
+
+        let mut plan_r2_v1 = plan_with_positions(&[[5.0, 0.0], [4.0, 0.0], [3.0, 0.0]]);
+        plan_r2_v1.plan_id.destination_session.uuid = [2; 16];
+        plan_r2_v1.plan_id.plan_version = 1;
+        let r2_v1_id = plan_r2_v1.plan_id.clone();
+
+        let mut plan_r1_v1 = plan_with_positions(&[[-2.0, 0.0], [1.0, 0.0], [5.0, 0.0]]);
+        plan_r1_v1.plan_id.destination_session.uuid = [1; 16];
+        plan_r1_v1.plan_id.plan_version = 1;
+        plan_r1_v1.waypoints[1].departure_blockers = vec![TrafficDependency {
+            name: "robot_2".to_string(),
+            plan_id: r2_v1_id,
+            required_progress: 2.0,
+        }];
+
+        plan_executor.handle_plan("robot_1", plan_r1_v1);
+        plan_executor.handle_plan("robot_2", plan_r2_v1);
+        plan_executor.handle_status("robot_2", status_at(5.0, 0.0));
+
+        // robot_1 is held at wp 1 while robot_2 is on plan_version = 1 at wp 0
+        let out1 = plan_executor.handle_status("robot_1", status_at(-2.0, 0.0));
+        assert_eq!(out1.plan_release.unwrap().waypoint_id, 1);
+
+        // Now robot_2 receives replan (plan_version = 2) of the SAME destination session
+        // before robot_1 receives its matching plan_version = 2.
+        let mut plan_r2_v2 = plan_with_positions(&[[5.0, 0.0], [4.0, 0.0], [3.0, 0.0]]);
+        plan_r2_v2.plan_id.destination_session.uuid = [2; 16];
+        plan_r2_v2.plan_id.plan_version = 2;
+        plan_executor.handle_plan("robot_2", plan_r2_v2);
+
+        // robot_1 must STILL be held at wp 1 (not prematurely released!)
+        let out1_still_held = plan_executor.handle_status("robot_1", status_at(-2.0, 0.0));
+        assert_eq!(out1_still_held.plan_release.unwrap().waypoint_id, 1);
+
+        // If robot_2 moves on to a DIFFERENT destination session, the old blocker is satisfied.
+        let mut plan_r2_new_session = plan_with_positions(&[[5.0, 0.0], [6.0, 0.0]]);
+        plan_r2_new_session.plan_id.destination_session.uuid = [99; 16];
+        plan_r2_new_session.plan_id.plan_version = 0;
+        plan_executor.handle_plan("robot_2", plan_r2_new_session);
+
+        let out1_released = plan_executor.handle_status("robot_1", status_at(-2.0, 0.0));
+        assert_eq!(out1_released.plan_release.unwrap().waypoint_id, 2);
     }
 }
