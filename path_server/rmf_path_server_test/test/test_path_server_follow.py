@@ -19,7 +19,7 @@ import unittest
 from launch import LaunchDescription
 import launch_ros
 import launch_testing
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 import pytest
 import rclpy
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -125,10 +125,29 @@ class TestPathServerFollow(unittest.TestCase):
         msg.constraints = constraint
         return msg
 
+    def create_single_lane_corridor_map_msg(self):
+        msg = OccupancyGrid()
+        msg.header.frame_id = 'map'
+        msg.info.resolution = 1.0
+        msg.info.width = 16
+        msg.info.height = 5
+        msg.info.origin.position.x = -2.0
+        msg.info.origin.position.y = -2.0
+        msg.info.origin.orientation.w = 1.0
+
+        # Block all cells except the single-lane corridor along y=0.0 (iy=2, ix=2..12)
+        data = [100] * (16 * 5)
+        for ix in range(2, 13):
+            data[2 * 16 + ix] = 0
+        msg.data = data
+        return msg
+
     def test_follow_scenario(self):
-        # Track robot positions
+        # Track robot positions and plans
         r1_positions = []
         r2_positions = []
+        r1_plans = []
+        r2_plans = []
         trajectory = []
 
         reliable_transient_qos = QoSProfile(
@@ -151,6 +170,7 @@ class TestPathServerFollow(unittest.TestCase):
             trajectory.append((time.time(), 'robot_2', x, y))
 
         def r1_plan_cb(msg):
+            r1_plans.append(msg)
             print(f'--- robot_1 plan (version {msg.plan_id.plan_version}) ---')
             for i, wp in enumerate(msg.waypoints):
                 blockers = [
@@ -163,6 +183,7 @@ class TestPathServerFollow(unittest.TestCase):
                 )
 
         def r2_plan_cb(msg):
+            r2_plans.append(msg)
             print(f'--- robot_2 plan (version {msg.plan_id.plan_version}) ---')
             for i, wp in enumerate(msg.waypoints):
                 blockers = [
@@ -191,7 +212,12 @@ class TestPathServerFollow(unittest.TestCase):
             qos_profile=reliable_transient_qos
         )
 
-        # Publishers for destinations
+        # Publishers for map and destinations
+        map_pub = self.node.create_publisher(
+            OccupancyGrid,
+            '/map',
+            qos_profile=reliable_transient_qos,
+        )
         r1_dest_pub = self.node.create_publisher(
             Destination,
             'robot_1/destination',
@@ -229,8 +255,16 @@ class TestPathServerFollow(unittest.TestCase):
         p2.components = []
         discovery_msg.participants.append(p2)
 
-        # Wait for discovery and subscriptions to settle
-        time.sleep(3.0)
+        map_msg = self.create_single_lane_corridor_map_msg()
+        map_pub.publish(map_msg)
+
+        # Wait for discovery and map subscriptions to settle
+        start_wait = time.time()
+        while time.time() - start_wait < 3.0:
+            map_pub.publish(map_msg)
+            discovery_pub.publish(discovery_msg)
+            rclpy.spin_once(self.node, timeout_sec=0.1)
+            time.sleep(0.05)
 
         # Destinations: robot 1 goes to (9.0, 0.0), robot 2 goes to (10.0, 0.0)
         dest_1 = self.create_destination(1, 9.0, 0.0, 1.0)
@@ -250,12 +284,13 @@ class TestPathServerFollow(unittest.TestCase):
         r1_reached = False
         r2_reached = False
         min_distance = float('inf')
+        max_x1_minus_x2 = float('-inf')
         distances = []
 
         try:
             while time.time() - start_time < timeout:
                 discovery_pub.publish(discovery_msg)
-                rclpy.spin_once(self.node, timeout_sec=0.1)
+                rclpy.spin_once(self.node, timeout_sec=0.05)
 
                 if r1_positions and r2_positions:
                     pos1 = r1_positions[-1]
@@ -266,6 +301,8 @@ class TestPathServerFollow(unittest.TestCase):
                     distances.append(dist)
                     if dist < min_distance:
                         min_distance = dist
+                    if dx > max_x1_minus_x2:
+                        max_x1_minus_x2 = dx
 
                     # Goal checks (within 0.25m from the target points)
                     if abs(pos1[0] - 9.0) < 0.25 and abs(pos1[1] - 0.0) < 0.25:
@@ -276,7 +313,7 @@ class TestPathServerFollow(unittest.TestCase):
                 if r1_reached and r2_reached:
                     break
 
-                time.sleep(0.2)
+                time.sleep(0.05)
 
             # Asserts
             self.assertTrue(
@@ -290,17 +327,33 @@ class TestPathServerFollow(unittest.TestCase):
                 f'Last pos: {r2_positions[-1] if r2_positions else "None"}'
             )
 
+            # Verify robot_1's plan includes departure_blockers on robot_2
+            has_r2_blockers = any(
+                any(b.name == 'robot_2' for b in wp.departure_blockers)
+                for plan in r1_plans
+                for wp in plan.waypoints
+            )
+            self.assertTrue(
+                has_r2_blockers,
+                'Expected robot_1 plan waypoints to include departure_blockers on robot_2',
+            )
+
             print(f'Recorded distances between robots: {distances}')
             print(f'Minimum distance recorded: {min_distance}')
 
             # Footprint check: radius of each is 0.49.
             # Sum of radii = 0.98.
             # If they get closer than 0.95 (with minor tolerances), we consider it a collision.
-            # Let's verify that the minimum distance is at least 0.95.
             self.assertGreaterEqual(
                 min_distance,
                 0.95,
                 f'Collision detected! Minimum distance was {min_distance}, expected >= 0.95'
+            )
+            self.assertLessEqual(
+                max_x1_minus_x2,
+                -0.95,
+                f'Trailing robot_1 encroached or overtook leading robot_2 '
+                f'(max x1 - x2 = {max_x1_minus_x2:.3f}m)',
             )
         finally:
             # Save trajectories to a single file
