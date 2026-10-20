@@ -59,6 +59,8 @@ pub(crate) struct PlanRegistry {
     robot_to_progress: HashMap<String, usize>,
     /// Robots with no active plan and their stationary position (if known).
     inactive_robots: BTreeMap<String, Option<Isometry2<f32>>>,
+    /// Latest known real-world position for each robot.
+    latest_positions: HashMap<String, Isometry2<f32>>,
     /// Footprint radius for each registered robot.
     robot_radii: HashMap<String, f32>,
 }
@@ -66,17 +68,22 @@ pub(crate) struct PlanRegistry {
 impl PlanRegistry {
     pub(crate) fn add_robot(&mut self, robot: String, radius: f32) {
         self.robot_radii.insert(robot.clone(), radius);
-        self.inactive_robots.insert(robot, None);
+        if !self.active_plans.contains_key(&robot) {
+            let known_pos = self.latest_positions.get(&robot).copied();
+            self.inactive_robots.entry(robot).or_insert(known_pos);
+        }
     }
 
     pub(crate) fn remove_robot(&mut self, robot: &str) {
         self.active_plans.remove(robot);
         self.robot_to_progress.remove(robot);
         self.inactive_robots.remove(robot);
+        self.latest_positions.remove(robot);
         self.robot_radii.remove(robot);
     }
 
     pub(crate) fn update_stationary_position(&mut self, robot: &str, position: Isometry2<f32>) {
+        self.latest_positions.insert(robot.to_string(), position);
         if let Some(pos) = self.inactive_robots.get_mut(robot) {
             *pos = Some(position);
         }
@@ -217,8 +224,12 @@ impl PlanRegistry {
         }
 
         for (robot, maybe_pos) in &self.inactive_robots {
-            if let Some(pos) = *maybe_pos {
-                trajectories_by_robot.insert(robot.clone(), vec![pos; total_len]);
+            if !trajectories_by_robot.contains_key(robot) {
+                if let Some(pos) =
+                    (*maybe_pos).or_else(|| self.latest_positions.get(robot).copied())
+                {
+                    trajectories_by_robot.insert(robot.clone(), vec![pos; total_len]);
+                }
             }
         }
 
@@ -363,6 +374,35 @@ mod tests {
         assert_eq!(
             xy_coords(&snapshot.mapf_result.trajectories[1]),
             vec![[5.0, 0.0], [5.0, 1.0]]
+        );
+    }
+
+    #[test]
+    fn duplicate_add_robot_does_not_overwrite_active_plan_or_stationary_pose() {
+        let mut registry = PlanRegistry::default();
+        registry.add_robot("robot_1".to_string(), 0.5);
+        registry.add_robot("robot_2".to_string(), 0.5);
+
+        registry.update_stationary_position("robot_2", Isometry2::new(Vector2::new(5.0, 0.0), 0.0));
+
+        let plan_1 = make_plan(1, 1, &[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]);
+        registry.add_robot_plan("robot_1".to_string(), plan_1);
+
+        // Simulate duplicate discovery callbacks re-adding both robots
+        registry.add_robot("robot_1".to_string(), 0.5);
+        registry.add_robot("robot_2".to_string(), 0.5);
+        registry.update_stationary_position("robot_1", Isometry2::new(Vector2::new(0.0, 0.0), 0.0));
+
+        let snapshot = registry.get_mapf_snapshot();
+        assert_eq!(snapshot.get_agent_index("robot_1"), Some(0));
+        assert_eq!(snapshot.get_agent_index("robot_2"), Some(1));
+        assert_eq!(
+            xy_coords(&snapshot.mapf_result.trajectories[0]),
+            vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]
+        );
+        assert_eq!(
+            xy_coords(&snapshot.mapf_result.trajectories[1]),
+            vec![[5.0, 0.0], [5.0, 0.0], [5.0, 0.0]]
         );
     }
 }
