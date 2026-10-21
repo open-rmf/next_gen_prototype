@@ -94,6 +94,10 @@ impl<T: MessageIDL + Debug> RosSubscription<T> {
     pub fn data_callback(&self) -> Option<T> {
         self.data.lock().unwrap().as_ref().cloned()
     }
+
+    pub fn take_data(&self) -> Option<T> {
+        self.data.lock().unwrap().take()
+    }
 }
 
 // Template for creating ROS 2 publishers
