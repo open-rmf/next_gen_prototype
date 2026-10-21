@@ -1,5 +1,6 @@
 use crate::{
-    navigation_server::CurrentNavigationRequest,
+    inner_navigation_client::InnerNavigationClient,
+    navigation_server::{AgentPose, CurrentNavigationRequest},
     safe_zone::{
         build_robot_status, CurrentSafeZone, LatestProgress, ProgressPublisher, ProgressTracker,
         RobotStatusPublisher,
@@ -97,9 +98,8 @@ pub struct Nav2AgentPlugin {}
 impl Plugin for Nav2AgentPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DiscoveryPublisher>()
-            .add_systems(PreUpdate, update_amcl_pose)
-            .add_observer(create_amcl_pose_subscriber)
-            .add_observer(publish_discovery);
+            .add_systems(PreUpdate, (publish_discovery, update_amcl_pose))
+            .add_observer(create_amcl_pose_subscriber);
     }
 }
 
@@ -133,7 +133,9 @@ fn create_amcl_pose_subscriber(
 }
 
 fn update_amcl_pose(
+    mut commands: Commands,
     mut agents: Query<(
+        Entity,
         &mut Nav2Agent,
         &mut AmclPose,
         &AmclPoseSubscription,
@@ -144,9 +146,11 @@ fn update_amcl_pose(
         Option<&ProgressTracker>,
         Option<&CurrentSafeZone>,
         Option<&CurrentNavigationRequest>,
+        Option<&InnerNavigationClient>,
     )>,
 ) {
     for (
+        entity,
         mut agent,
         mut amcl_pose,
         amcl_pose_sub,
@@ -157,15 +161,20 @@ fn update_amcl_pose(
         progress_tracker,
         current_safe_zone,
         current_nav_req,
+        inner_nav_client,
     ) in agents.iter_mut()
     {
-        if let Some(amcl_pose_msg) = amcl_pose_sub.subscriber.data_callback() {
-            amcl_pose.0 = amcl_pose_msg.clone();
-            agent.localized = true;
-        }
-        if !agent.localized {
+        let Some(amcl_pose_msg) = amcl_pose_sub.subscriber.take_data() else {
             continue;
-        }
+        };
+        amcl_pose.0 = amcl_pose_msg;
+        agent.localized = true;
+
+        let pose = PoseStamped {
+            header: amcl_pose.0.header.clone(),
+            pose: amcl_pose.0.pose.pose.clone(),
+        };
+        commands.entity(entity).insert(AgentPose(pose.clone()));
 
         let mut odom = Odometry::default();
         odom.header = amcl_pose.0.header.clone();
@@ -174,11 +183,9 @@ fn update_amcl_pose(
         odom.twist = TwistWithCovariance::default();
         let _ = odom_pub.publisher.publish(odom);
 
-        let current_pose = Some(amcl_pose.xy_yaw());
-        if let (Some(tracker), Some(ref mut latest_prog)) =
-            (progress_tracker, latest_progress.as_mut())
-        {
+        if let (Some(tracker), Some(latest_prog)) = (progress_tracker, latest_progress.as_mut()) {
             if tracker.plan_id.is_some() {
+                let current_pose = Some(amcl_pose.xy_yaw());
                 let updated_prog = tracker.compute_progress(current_pose, latest_prog.0.as_ref());
                 if latest_prog.0.as_ref() != Some(&updated_prog) {
                     if let Some(prog_pub) = progress_pub {
@@ -190,11 +197,9 @@ fn update_amcl_pose(
         }
 
         if let Some(status_pub) = status_pub {
-            let pose = PoseStamped {
-                header: amcl_pose.0.header.clone(),
-                pose: amcl_pose.0.pose.pose.clone(),
-            };
-            let mode = if current_nav_req.is_some() {
+            let mode = if current_nav_req.is_some()
+                || inner_nav_client.is_some_and(|c| c.goal().is_some())
+            {
                 RobotStatus::MODE_NAVIGATING
             } else {
                 RobotStatus::MODE_IDLE
@@ -208,10 +213,13 @@ fn update_amcl_pose(
 }
 
 fn publish_discovery(
-    _trigger: Trigger<OnAdd, Nav2Agent>,
+    added: Query<(), Added<Nav2Agent>>,
     publisher: Res<DiscoveryPublisher>,
     agents: Query<&Nav2Agent>,
 ) {
+    if added.is_empty() {
+        return;
+    }
     let mut msg = ParticipantList::default();
     for agent in agents.iter() {
         msg.participants.push(Participant {
