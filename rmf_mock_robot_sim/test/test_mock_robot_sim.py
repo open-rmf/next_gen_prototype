@@ -25,7 +25,15 @@ import pytest
 import rclpy
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_mock_robot_sim.mock_robot_sim_node import MockRobotSimNode
-from rmf_prototype_msgs.msg import ParticipantList, Plan, PlanId, PlanRelease, Progress, Waypoint
+from rmf_prototype_msgs.msg import (
+    ParticipantList,
+    Plan,
+    PlanId,
+    PlanRelease,
+    Progress,
+    RobotStatus,
+    Waypoint,
+)
 
 
 @pytest.mark.launch_test
@@ -115,9 +123,10 @@ class TestMockRobotSim(unittest.TestCase):
 
         self.assertTrue(discovered, 'Robot did not advertise itself on discovery topics')
 
-        # 2. Setup plan and progress tracking
+        # 2. Setup plan, progress, and status tracking
         received_odoms = []
         received_progress = []
+        received_statuses = []
 
         self.node.create_subscription(
             Odometry,
@@ -137,6 +146,13 @@ class TestMockRobotSim(unittest.TestCase):
             Progress,
             f'{robot_name}/plan/progress',
             lambda msg: received_progress.append(msg),
+            qos_profile=reliable_transient_qos
+        )
+
+        self.node.create_subscription(
+            RobotStatus,
+            f'{robot_name}/status',
+            lambda msg: received_statuses.append(msg),
             qos_profile=reliable_transient_qos
         )
 
@@ -225,15 +241,17 @@ class TestMockRobotSim(unittest.TestCase):
         while time.time() - start_time < timeout:
             rclpy.spin_once(self.node, timeout_sec=0.05)
 
-            if received_odoms and received_progress:
+            if received_odoms and received_progress and received_statuses:
                 latest_odom = received_odoms[-1]
                 latest_prog = received_progress[-1]
+                latest_status = received_statuses[-1]
                 current_x = latest_odom.pose.pose.position.x
                 if (
                     abs(current_x - 4.0) < 0.05
                     and latest_prog.reached_waypoint == 2
                     and latest_prog.target_waypoint == 2
                     and abs(latest_prog.progress - 3.0) < 1e-3
+                    and latest_status.mode == RobotStatus.MODE_IDLE
                 ):
                     plan_completed = True
                     break
@@ -280,9 +298,24 @@ class TestMockRobotSim(unittest.TestCase):
         self.assertTrue(saw_stationary_segment, 'Did not observe progress on segment 0 -> 1')
         self.assertTrue(saw_final_segment, 'Did not observe progress on segment 1 -> 2')
 
+        # Verify RobotStatus messages were published alongside Progress
+        self.assertGreater(len(received_statuses), 0, 'Expected RobotStatus messages')
+        status_modes = {s.mode for s in received_statuses}
+        self.assertIn(RobotStatus.MODE_NAVIGATING, status_modes)
+        self.assertIn(RobotStatus.MODE_WAITING, status_modes)
+        self.assertEqual(received_statuses[-1].mode, RobotStatus.MODE_IDLE)
+        self.assertEqual(len(received_statuses[-1].progress), 1)
+        self.assertAlmostEqual(
+            received_statuses[-1].pose.pose.position.x, 4.0, delta=0.05
+        )
+        self.assertAlmostEqual(
+            received_statuses[-1].progress[0].progress, 3.0, delta=1e-3
+        )
+
         print(
-            f'Test finished. Received {len(received_odoms)} odom and '
-            f'{len(received_progress)} progress messages.'
+            f'Test finished. Received {len(received_odoms)} odom, '
+            f'{len(received_progress)} progress, and '
+            f'{len(received_statuses)} status messages.'
         )
 
     def test_site_file_and_random_action_duration(self):
@@ -395,6 +428,8 @@ class TestMockRobotSim(unittest.TestCase):
                 self.assertEqual(
                     sim.active_transition_action, 'custom_dock_action'
                 )
+                sim.released_waypoint_idx = 1
+                self.assertEqual(sim.determine_mode(), RobotStatus.MODE_ACTION)
                 self.assertTrue(
                     sim.default_action_duration * 0.5
                     <= sim.active_transition_duration

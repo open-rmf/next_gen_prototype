@@ -17,11 +17,19 @@ import math
 import os
 import random
 
-from geometry_msgs.msg import Point, Quaternion
+from geometry_msgs.msg import Point, PoseStamped, Quaternion
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from rmf_prototype_msgs.msg import Participant, ParticipantList, Plan, PlanRelease, Progress
+from rmf_prototype_msgs.msg import (
+    Participant,
+    ParticipantList,
+    Plan,
+    PlanRelease,
+    Progress,
+    RobotStatus,
+    SafeZone,
+)
 
 
 class MockRobotSimNode(Node):
@@ -105,6 +113,7 @@ class MockRobotSimNode(Node):
         self.sampled_action_durations = []
         self.released_waypoint_idx = 0
         self.latest_release = None
+        self.latest_safe_zone_id = None
         self.was_blocked = False
 
         self.site_anchors = {}
@@ -142,6 +151,12 @@ class MockRobotSimNode(Node):
             qos_profile=reliable_transient_qos
         )
 
+        self.status_pub = self.create_publisher(
+            RobotStatus,
+            f'{self.robot_name}/status',
+            qos_profile=reliable_transient_qos
+        )
+
         self.dest_discovery_pub = self.create_publisher(
             ParticipantList,
             '/destination/discovery',
@@ -176,6 +191,14 @@ class MockRobotSimNode(Node):
             PlanRelease,
             f'{self.robot_name}/plan/release',
             self.handle_release,
+            qos_profile=reliable_transient_qos
+        )
+
+        # Subscribe to safe zone topic
+        self.safe_zone_sub = self.create_subscription(
+            SafeZone,
+            f'{self.robot_name}/plan/safe_zone',
+            self.handle_safe_zone,
             qos_profile=reliable_transient_qos
         )
 
@@ -505,12 +528,22 @@ class MockRobotSimNode(Node):
             self.released_waypoint_idx = self.latest_release.waypoint_id
         else:
             self.released_waypoint_idx = 0
+        if self.latest_safe_zone_id and not self._plan_id_matches(
+            self.latest_safe_zone_id.plan_id, self.current_plan_id
+        ):
+            self.latest_safe_zone_id = None
         self.was_blocked = False
 
         # If the path is not empty and we are far from the start,
         # we could either teleport or travel there.
         # The standard practice is to just start moving from current
         # position to waypoints[0].
+
+    def handle_safe_zone(self, msg: SafeZone):
+        if not self.current_plan_id or self._plan_id_matches(
+            msg.id.plan_id, self.current_plan_id
+        ):
+            self.latest_safe_zone_id = msg.id
 
     def handle_release(self, msg: PlanRelease):
         self.get_logger().info(
@@ -599,15 +632,19 @@ class MockRobotSimNode(Node):
                         self._configure_transition(self.current_waypoint_idx + 1)
 
         # 2. Publish plan progress
+        progress_msg = None
         if self.current_path:
-            self.publish_progress()
+            progress_msg = self.publish_progress()
 
         # 3. Publish Odometry
         self.publish_odometry()
 
-    def publish_progress(self):
+        # 4. Publish unified RobotStatus
+        self.publish_status(progress_msg)
+
+    def build_progress_msg(self):
         if not self.current_plan_id or not self.current_path:
-            return
+            return None
 
         progress_msg = Progress()
         progress_msg.plan_id = self.current_plan_id
@@ -682,7 +719,57 @@ class MockRobotSimNode(Node):
                 )
 
         progress_msg.reached_keys = []
+        return progress_msg
+
+    def publish_progress(self):
+        progress_msg = self.build_progress_msg()
+        if progress_msg is None:
+            return None
         self.progress_pub.publish(progress_msg)
+        return progress_msg
+
+    def determine_mode(self):
+        if (
+            not self.current_plan_id
+            or not self.current_path
+            or self.current_waypoint_idx >= len(self.current_path)
+        ):
+            return RobotStatus.MODE_IDLE
+        if self.is_blocked():
+            return RobotStatus.MODE_WAITING
+        if self.active_transition_action is not None:
+            return RobotStatus.MODE_ACTION
+        if self.wait_time_remaining > 0.0:
+            return RobotStatus.MODE_WAITING
+        return RobotStatus.MODE_NAVIGATING
+
+    def publish_status(self, progress_msg=None):
+        status = RobotStatus()
+        status.pose = PoseStamped()
+        status.pose.header.stamp = self.get_clock().now().to_msg()
+        status.pose.header.frame_id = 'map'
+        status.pose.pose.position = Point(x=self.x, y=self.y, z=0.0)
+        status.pose.pose.orientation = self.yaw_to_quaternion(self.yaw)
+        status.mode = self.determine_mode()
+
+        if progress_msg is None:
+            progress_msg = self.build_progress_msg()
+        if progress_msg is not None:
+            status.progress = [progress_msg]
+        else:
+            status.progress = []
+
+        if self.latest_safe_zone_id is not None and (
+            not self.current_plan_id
+            or self._plan_id_matches(
+                self.latest_safe_zone_id.plan_id, self.current_plan_id
+            )
+        ):
+            status.safe_zone_id = [self.latest_safe_zone_id]
+        else:
+            status.safe_zone_id = []
+
+        self.status_pub.publish(status)
 
     def publish_odometry(self):
         odom = Odometry()
