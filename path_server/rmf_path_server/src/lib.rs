@@ -563,7 +563,7 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
                 let plan_error_sub = match server
                     .destinations_worker
                     .create_subscription::<PlanError, _>(
-                        plan_error_topic.as_str(),
+                        plan_error_topic.as_str().transient_local().reliable(),
                         move |dest_server: &mut PlanServer<P>, error_msg: PlanError| {
                             dest_server.handle_plan_error(&robot_id_clone3, error_msg);
                         },

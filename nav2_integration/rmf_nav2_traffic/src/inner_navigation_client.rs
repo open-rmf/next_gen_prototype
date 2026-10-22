@@ -1,4 +1,11 @@
-use crate::{safe_zone::PlanErrorPublisher, Nav2Agent};
+use crate::{
+    agent::AmclPose,
+    safe_zone::{
+        build_robot_status, CurrentSafeZone, LatestProgress, PlanErrorPublisher, ProgressPublisher,
+        ProgressTracker, RobotStatusPublisher,
+    },
+    Nav2Agent,
+};
 use bevy::prelude::*;
 use bevy_ros2::{RclrsExecutorCommands, RclrsNode, RosActionClient};
 use crossflow::{prelude::*, service::Service};
@@ -736,9 +743,66 @@ fn process_navigation_result(
     mut cancelling_inner: Query<&mut CancellingInnerNavigation>,
     inner_nav_clients: Query<&InnerNavigationClient>,
     plan_error_publishers: Query<&PlanErrorPublisher>,
+    mut progress_query: Query<(
+        &ProgressTracker,
+        &mut LatestProgress,
+        &ProgressPublisher,
+        Option<&RobotStatusPublisher>,
+        Option<&AmclPose>,
+        Option<&CurrentSafeZone>,
+    )>,
 ) -> Result<InnerNavigationRequest, InnerNavigationResult> {
     match result {
-        Ok(_) => return Err(result),
+        Ok(ref success) => {
+            let agent = success.handle.request.agent;
+            if let Ok((
+                tracker,
+                mut latest_prog,
+                prog_pub,
+                status_pub,
+                amcl_pose,
+                current_safe_zone,
+            )) = progress_query.get_mut(agent)
+            {
+                if tracker.plan_id.as_ref() == Some(&success.handle.request.safe_zone_id.plan_id) {
+                    let current_pose = amcl_pose.map(|p| p.xy_yaw());
+                    if !tracker.is_target_pose_satisfied(current_pose) {
+                        warn!(
+                            "[{:?}] Nav2 reported goal succeeded before target pose was satisfied (current={:?}); retrying goal {:?}.",
+                            agent.index(),
+                            current_pose,
+                            success.handle.request.safe_zone_id,
+                        );
+                        return Ok(success.handle.request.clone());
+                    }
+                    if let Some(updated_prog) = tracker.mark_target_reached(latest_prog.0.as_ref())
+                    {
+                        if latest_prog.0.as_ref() != Some(&updated_prog) {
+                            let _ = prog_pub.publisher.publish(updated_prog.clone());
+                            latest_prog.0 = Some(updated_prog.clone());
+                            if let Some(status_pub) = status_pub {
+                                let pose = amcl_pose
+                                    .map(|p| PoseStamped {
+                                        header: p.0.header.clone(),
+                                        pose: p.0.pose.pose.clone(),
+                                    })
+                                    .unwrap_or_default();
+                                let sz_id = current_safe_zone
+                                    .and_then(|csz| csz.0.as_ref().map(|sz| &sz.id));
+                                let status_msg = build_robot_status(
+                                    pose,
+                                    ros_env::rmf_prototype_msgs::msg::RobotStatus::MODE_NAVIGATING,
+                                    Some(&updated_prog),
+                                    sz_id,
+                                );
+                                let _ = status_pub.publisher.publish(status_msg);
+                            }
+                        }
+                    }
+                }
+            }
+            return Err(result);
+        }
         Err(ref err) => match err.kind {
             InnerNavigationErrorKind::GoalAbortedError => {
                 let Some(ref handle) = err.handle else {

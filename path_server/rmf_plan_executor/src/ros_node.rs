@@ -165,7 +165,10 @@ impl PlanExecutorRosNode {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let topic = format!("{robot_id}/plan/error");
-                match self.node.create_publisher(topic.as_str()) {
+                match self
+                    .node
+                    .create_publisher(topic.as_str().transient_local().reliable())
+                {
                     Ok(publisher) => entry.insert(publisher),
                     Err(err) => {
                         rclrs::log_error!(

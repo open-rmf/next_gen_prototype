@@ -1,6 +1,9 @@
 use crate::{
     navigation_server::CurrentNavigationRequest,
-    safe_zone::{build_robot_status, CurrentSafeZone, LatestProgress, RobotStatusPublisher},
+    safe_zone::{
+        build_robot_status, CurrentSafeZone, LatestProgress, ProgressPublisher, ProgressTracker,
+        RobotStatusPublisher,
+    },
 };
 use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
@@ -50,6 +53,17 @@ impl Nav2Agent {
 
 #[derive(Component)]
 pub struct AmclPose(pub PoseWithCovarianceStamped);
+
+impl AmclPose {
+    pub fn xy_yaw(&self) -> (f32, f32, f32) {
+        let pos = &self.0.pose.pose.position;
+        let q = &self.0.pose.pose.orientation;
+        let siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+        let cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+        let yaw = siny_cosp.atan2(cosy_cosp) as f32;
+        (pos.x as f32, pos.y as f32, yaw)
+    }
+}
 
 #[derive(Component)]
 pub struct AmclPoseSubscription {
@@ -125,7 +139,9 @@ fn update_amcl_pose(
         &AmclPoseSubscription,
         &OdomPublisher,
         Option<&RobotStatusPublisher>,
-        Option<&LatestProgress>,
+        Option<&ProgressPublisher>,
+        Option<&mut LatestProgress>,
+        Option<&ProgressTracker>,
         Option<&CurrentSafeZone>,
         Option<&CurrentNavigationRequest>,
     )>,
@@ -136,7 +152,9 @@ fn update_amcl_pose(
         amcl_pose_sub,
         odom_pub,
         status_pub,
-        latest_progress,
+        progress_pub,
+        mut latest_progress,
+        progress_tracker,
         current_safe_zone,
         current_nav_req,
     ) in agents.iter_mut()
@@ -156,6 +174,21 @@ fn update_amcl_pose(
         odom.twist = TwistWithCovariance::default();
         let _ = odom_pub.publisher.publish(odom);
 
+        let current_pose = Some(amcl_pose.xy_yaw());
+        if let (Some(tracker), Some(ref mut latest_prog)) =
+            (progress_tracker, latest_progress.as_mut())
+        {
+            if tracker.plan_id.is_some() {
+                let updated_prog = tracker.compute_progress(current_pose, latest_prog.0.as_ref());
+                if latest_prog.0.as_ref() != Some(&updated_prog) {
+                    if let Some(prog_pub) = progress_pub {
+                        let _ = prog_pub.publisher.publish(updated_prog.clone());
+                    }
+                    latest_prog.0 = Some(updated_prog);
+                }
+            }
+        }
+
         if let Some(status_pub) = status_pub {
             let pose = PoseStamped {
                 header: amcl_pose.0.header.clone(),
@@ -166,7 +199,7 @@ fn update_amcl_pose(
             } else {
                 RobotStatus::MODE_IDLE
             };
-            let prog = latest_progress.and_then(|lp| lp.0.as_ref());
+            let prog = latest_progress.as_ref().and_then(|lp| lp.0.as_ref());
             let sz_id = current_safe_zone.and_then(|csz| csz.0.as_ref().map(|sz| &sz.id));
             let status_msg = build_robot_status(pose, mode, prog, sz_id);
             let _ = status_pub.publisher.publish(status_msg);
