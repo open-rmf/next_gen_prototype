@@ -1,15 +1,21 @@
 use crate::{
-    agent::AmclPose, inner_navigation_client::InnerNavigationTarget,
-    navigation_server::CurrentNavigationRequest, Nav2Agent,
+    agent::AmclPose,
+    inner_navigation_client::{CancellingInnerNavigation, InnerNavigationTarget},
+    Nav2Agent,
 };
 use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
 use ros_env::{
+    builtin_interfaces::msg::Time as RosTime,
     geometry_msgs::msg::PoseStamped,
     nav2_msgs::msg::Costmap,
     rmf_prototype_msgs::msg::{PlanError, Progress, Region, RobotStatus, SafeZone, SafeZoneId},
+    std_msgs::msg::Header,
 };
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[derive(Component)]
 pub struct SafeZoneSubscription {
@@ -19,6 +25,38 @@ pub struct SafeZoneSubscription {
 #[derive(Component)]
 pub struct CostmapPublisher {
     pub publisher: Arc<RosPublisher<Costmap>>,
+}
+
+#[derive(Component)]
+pub struct CostmapUpdatedSubscription {
+    pub subscriber: Arc<RosSubscription<Header>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingNavigationTarget {
+    pub required_seq: u64,
+    pub target: InnerNavigationTarget,
+    pub target_xy_yaw: (f32, f32, f32),
+    pub costmap: Costmap,
+    pub last_published: Instant,
+}
+
+#[derive(Component, Debug, Clone, Default)]
+pub struct CostmapHandshakeState {
+    pub next_seq: u64,
+    pub acked_seq: u64,
+    pub pending_target: Option<PendingNavigationTarget>,
+}
+
+pub fn seq_to_stamp(seq: u64) -> RosTime {
+    RosTime {
+        sec: (seq >> 32) as i32,
+        nanosec: (seq & 0xFFFF_FFFF) as u32,
+    }
+}
+
+pub fn stamp_to_seq(stamp: &RosTime) -> u64 {
+    ((stamp.sec as u32 as u64) << 32) | (stamp.nanosec as u64)
 }
 
 #[derive(Component)]
@@ -429,11 +467,19 @@ fn create_costmap_publisher(
         return;
     };
     // TODO(@xiyuoh) review this topic name
-    let topic = agent_name + "/inner/global_costmap/plan/costmap";
-    let publisher = Arc::new(RosPublisher::<Costmap>::new(&node, topic));
-    commands.entity(e).insert(CostmapPublisher {
-        publisher: Arc::clone(&publisher),
-    });
+    let topic = agent_name.clone() + "/inner/global_costmap/plan/costmap";
+    let publisher = Arc::new(RosPublisher::<Costmap>::new_transient_local(&node, topic));
+    let updated_topic = agent_name + "/inner/global_costmap/plan/costmap_updated";
+    let updated_subscriber = Arc::new(RosSubscription::<Header>::new(&node, updated_topic));
+    commands.entity(e).insert((
+        CostmapPublisher {
+            publisher: Arc::clone(&publisher),
+        },
+        CostmapUpdatedSubscription {
+            subscriber: Arc::clone(&updated_subscriber),
+        },
+        CostmapHandshakeState::default(),
+    ));
 }
 
 fn create_progress_publisher(
@@ -500,6 +546,8 @@ fn update_incremental_target(
             Entity,
             &SafeZoneSubscription,
             &CostmapPublisher,
+            &CostmapUpdatedSubscription,
+            &mut CostmapHandshakeState,
             &ProgressPublisher,
             &RobotStatusPublisher,
             &mut LatestProgress,
@@ -508,15 +556,15 @@ fn update_incremental_target(
             Option<&AmclPose>,
             &Nav2Agent,
         ),
-        // Only respond to a SafeZone message if there is an active NavigationRequest
-        // for this agent
-        With<CurrentNavigationRequest>,
+        Without<CancellingInnerNavigation>,
     >,
 ) {
     for (
         e,
         safe_zone_sub,
         costmap_pub,
+        costmap_updated_sub,
+        mut handshake,
         progress_pub,
         status_pub,
         mut latest_progress,
@@ -526,70 +574,127 @@ fn update_incremental_target(
         agent,
     ) in subscriptions.iter_mut()
     {
-        let Some(safe_zone) = safe_zone_sub.subscriber.data_callback() else {
-            continue;
-        };
-        //if current_safe_zone.matches(&safe_zone) {
-        //    continue;
-        //}
-
-        // Call updateCosts() before setting new inner nav target
-        let Ok(_) = costmap_pub.publisher.publish(safe_zone.costmap.clone()) else {
-            error!("Failed to publish costmap for agent [{}]", agent.name);
-            continue;
-        };
-
-        // Validate safe zone msg
-        if !is_valid(&safe_zone) {
-            continue;
+        while let Some(ack_header) = costmap_updated_sub.subscriber.take_data() {
+            let seq = stamp_to_seq(&ack_header.stamp);
+            if seq > handshake.acked_seq {
+                handshake.acked_seq = seq;
+            }
         }
 
-        let Some((target_x, target_y, target_yaw)) = next_target(&safe_zone) else {
-            continue;
-        };
-
-        let current_pose = amcl_pose.map(|p| p.xy_yaw());
-
-        // Publish progress
-        let progress_msg =
-            progress_tracker.on_safe_zone(&safe_zone, current_pose, latest_progress.0.as_ref());
-        let Ok(_) = progress_pub.publisher.publish(progress_msg.clone()) else {
-            error!("Failed to publish progress for agent [{}]", agent.name);
-            continue;
-        };
-        latest_progress.0 = Some(progress_msg.clone());
-
-        let pose = amcl_pose
-            .map(|p| PoseStamped {
-                header: p.0.header.clone(),
-                pose: p.0.pose.pose.clone(),
-            })
-            .unwrap_or_default();
-        let status_msg = build_robot_status(
-            pose,
-            RobotStatus::MODE_NAVIGATING,
-            Some(&progress_msg),
-            Some(&safe_zone.id),
-        );
-        let _ = status_pub.publisher.publish(status_msg);
-
-        if !current_safe_zone.should_update_target(&safe_zone) {
-            continue;
+        let mut latest_safe_zone = None;
+        while let Some(safe_zone) = safe_zone_sub.subscriber.take_data() {
+            latest_safe_zone = Some(safe_zone);
         }
-        debug!(
-            "[{:?}] Updating SafeZone to target: ({:.2}, {:.2}, {:.2})",
-            agent.name, target_x, target_y, target_yaw
-        );
 
-        *current_safe_zone = CurrentSafeZone(Some(safe_zone.clone()));
+        if let Some(safe_zone) = latest_safe_zone {
+            if !current_safe_zone.matches(&safe_zone) && is_valid(&safe_zone) {
+                if let Some((target_x, target_y, target_yaw)) = next_target(&safe_zone) {
+                    handshake.next_seq += 1;
+                    let seq = handshake.next_seq;
+                    let mut costmap = safe_zone.costmap.clone();
+                    costmap.header.stamp = seq_to_stamp(seq);
 
-        nav_target.write(InnerNavigationTarget::new(
-            e,
-            safe_zone.id,
-            target_x as f64,
-            target_y as f64,
-            target_yaw as f64,
-        ));
+                    // Publish stamped costmap and wait for global_costmap ack before dispatching target
+                    if costmap_pub.publisher.publish(costmap.clone()).is_err() {
+                        error!("Failed to publish costmap for agent [{}]", agent.name);
+                        continue;
+                    }
+
+                    let current_pose = amcl_pose.map(|p| p.xy_yaw());
+
+                    // Publish progress when it changes
+                    let progress_msg = progress_tracker.on_safe_zone(
+                        &safe_zone,
+                        current_pose,
+                        latest_progress.0.as_ref(),
+                    );
+                    let progress_changed = latest_progress.0.as_ref() != Some(&progress_msg);
+                    if progress_changed {
+                        let Ok(_) = progress_pub.publisher.publish(progress_msg.clone()) else {
+                            error!("Failed to publish progress for agent [{}]", agent.name);
+                            continue;
+                        };
+                        latest_progress.0 = Some(progress_msg.clone());
+                    }
+
+                    if !current_safe_zone.should_update_target(&safe_zone) {
+                        if let Some(pending) = handshake.pending_target.as_mut() {
+                            pending.costmap = costmap;
+                        }
+                        if progress_changed {
+                            let pose = amcl_pose
+                                .map(|p| PoseStamped {
+                                    header: p.0.header.clone(),
+                                    pose: p.0.pose.pose.clone(),
+                                })
+                                .unwrap_or_default();
+                            let status_msg = build_robot_status(
+                                pose,
+                                RobotStatus::MODE_NAVIGATING,
+                                Some(&progress_msg),
+                                Some(&safe_zone.id),
+                            );
+                            let _ = status_pub.publisher.publish(status_msg);
+                        }
+                    } else {
+                        info!(
+                            "[{:?}] Queuing SafeZone target (waiting for costmap seq={}): ({:.2}, {:.2}, {:.2})",
+                            agent.name, seq, target_x, target_y, target_yaw
+                        );
+
+                        let pose = amcl_pose
+                            .map(|p| PoseStamped {
+                                header: p.0.header.clone(),
+                                pose: p.0.pose.pose.clone(),
+                            })
+                            .unwrap_or_default();
+                        let status_msg = build_robot_status(
+                            pose,
+                            RobotStatus::MODE_NAVIGATING,
+                            Some(&progress_msg),
+                            Some(&safe_zone.id),
+                        );
+                        let _ = status_pub.publisher.publish(status_msg);
+
+                        *current_safe_zone = CurrentSafeZone(Some(safe_zone.clone()));
+
+                        handshake.pending_target = Some(PendingNavigationTarget {
+                            required_seq: seq,
+                            target: InnerNavigationTarget::new(
+                                e,
+                                safe_zone.id,
+                                target_x as f64,
+                                target_y as f64,
+                                target_yaw as f64,
+                            ),
+                            target_xy_yaw: (target_x, target_y, target_yaw),
+                            costmap,
+                            last_published: Instant::now(),
+                        });
+                    }
+                }
+            }
+        }
+
+        let acked_seq = handshake.acked_seq;
+        if handshake
+            .pending_target
+            .as_ref()
+            .is_some_and(|pending| acked_seq >= pending.required_seq)
+        {
+            let pending = handshake.pending_target.take().unwrap();
+            let (tx, ty, tyaw) = pending.target_xy_yaw;
+            info!(
+                "[{:?}] Costmap (seq={}) applied, dispatching SafeZone target: ({:.2}, {:.2}, {:.2})",
+                agent.name, pending.required_seq, tx, ty, tyaw
+            );
+            nav_target.write(pending.target);
+        } else if let Some(pending) = handshake.pending_target.as_mut() {
+            if pending.last_published.elapsed() >= Duration::from_millis(500) {
+                let _ = costmap_pub.publisher.publish(pending.costmap.clone());
+                pending.last_published = Instant::now();
+            }
+        }
     }
 }
 
@@ -793,6 +898,14 @@ mod tests {
         assert_eq!(nav_status.progress[0].target_waypoint, 2);
         assert_eq!(nav_status.safe_zone_id.len(), 1);
         assert_eq!(nav_status.safe_zone_id[0].safe_zone_version, 5);
+    }
+
+    #[test]
+    fn costmap_seq_stamp_roundtrip() {
+        for seq in [0u64, 1, 42, u32::MAX as u64, (1u64 << 32) + 7, u64::MAX] {
+            let stamp = seq_to_stamp(seq);
+            assert_eq!(stamp_to_seq(&stamp), seq);
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ from launch import LaunchDescription
 import launch_ros.actions
 import launch_testing.actions
 from nav2_msgs.action import NavigateToPose
+from nav2_msgs.msg import Costmap
 import pytest
 import rclpy
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
@@ -33,6 +34,7 @@ from rmf_prototype_msgs.msg import (
     Plan,
     SafeZone,
 )
+from std_msgs.msg import Header
 
 
 def yaw_from_quaternion(q):
@@ -141,6 +143,19 @@ class TestTargetOrientationForwarding(unittest.TestCase):
             SafeZone,
             '/robot0/plan/safe_zone',
             lambda msg: received_safe_zones.append(msg),
+            qos_profile=transient_qos,
+            callback_group=self.cb_group,
+        )
+
+        costmap_ack_pub = self.node.create_publisher(
+            Header,
+            '/robot0/inner/global_costmap/plan/costmap_updated',
+            qos_profile=transient_qos,
+        )
+        self.node.create_subscription(
+            Costmap,
+            '/robot0/inner/global_costmap/plan/costmap',
+            lambda msg: costmap_ack_pub.publish(msg.header),
             qos_profile=transient_qos,
             callback_group=self.cb_group,
         )

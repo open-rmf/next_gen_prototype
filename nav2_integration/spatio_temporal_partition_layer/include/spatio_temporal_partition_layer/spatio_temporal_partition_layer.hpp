@@ -41,6 +41,7 @@
 #include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/pose_array.hpp"
 #include "nav2_msgs/msg/costmap.hpp"
+#include "std_msgs/msg/header.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "nav2_costmap_2d/layer.hpp"
 #include "nav2_costmap_2d/layered_costmap.hpp"
@@ -76,6 +77,8 @@ private:
 
   // Indicates that the entire gradient should be recalculated next time.
   bool need_recalculation_;
+  bool recalculating_ = false;
+  bool pending_ack_ = false;
 
   // Size of gradient in cells
   int GRADIENT_SIZE = 20;
@@ -90,6 +93,7 @@ private:
   std::mutex mutex_;
   nav2_msgs::msg::Costmap::SharedPtr costmap_msg_;
   rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr costmap_sub_;
+  rclcpp::Publisher<std_msgs::msg::Header>::SharedPtr costmap_updated_pub_;
 
   void costmap_cb(nav2_msgs::msg::Costmap::SharedPtr msg);
 };

@@ -16,7 +16,7 @@ use ros_env::{
     builtin_interfaces::msg::Time as RosTime,
     geometry_msgs::msg::{Point, Pose, PoseStamped, Quaternion},
     nav2_msgs::action::{NavigateToPose, NavigateToPose_Feedback, NavigateToPose_Goal},
-    rmf_prototype_msgs::msg::SafeZoneId,
+    rmf_prototype_msgs::msg::{RobotStatus, SafeZoneId},
     std_msgs::msg::Header,
 };
 use std::{future::Future, sync::Arc};
@@ -426,6 +426,7 @@ fn await_external_cancellation(
     }
 }
 
+#[allow(dead_code)]
 enum CheckExistingGoalResult {
     ReplanAndCancel(CancelInnerNavigation),
     NoExistingGoal(InnerNavigationRequest),
@@ -470,16 +471,13 @@ fn check_existing_goal(
     }
 
     if replan_and_cancel {
-        // Do not treat cancellation of this goal as a new blockage.
+        // Do not treat preemption of this goal as a new blockage.
+        // Send the new goal directly so Nav2's SimpleActionServer smoothly
+        // preempts the active goal in accept_pending_goal() without calling
+        // terminate_all() (which would abort a pending new goal if cancel() is
+        // still in flight).
         existing_goal.mark_superseded();
-        let client = existing_goal.client().clone();
-        return Ok(CheckExistingGoalResult::ReplanAndCancel(
-            CancelInnerNavigation {
-                agent: request.agent,
-                new_request: Some(request),
-                cancel_client: client,
-            },
-        ));
+        return Ok(CheckExistingGoalResult::NoExistingGoal(request));
     }
 
     // There is an existing goal but the new request is duplicate or outdated,
@@ -745,58 +743,65 @@ fn process_navigation_result(
     plan_error_publishers: Query<&PlanErrorPublisher>,
     mut progress_query: Query<(
         &ProgressTracker,
-        &mut LatestProgress,
         &ProgressPublisher,
-        Option<&RobotStatusPublisher>,
-        Option<&AmclPose>,
+        &RobotStatusPublisher,
+        &mut LatestProgress,
         Option<&CurrentSafeZone>,
+        Option<&AmclPose>,
     )>,
 ) -> Result<InnerNavigationRequest, InnerNavigationResult> {
     match result {
         Ok(ref success) => {
-            let agent = success.handle.request.agent;
-            if let Ok((
-                tracker,
-                mut latest_prog,
-                prog_pub,
-                status_pub,
-                amcl_pose,
-                current_safe_zone,
-            )) = progress_query.get_mut(agent)
-            {
-                if tracker.plan_id.as_ref() == Some(&success.handle.request.safe_zone_id.plan_id) {
-                    let current_pose = amcl_pose.map(|p| p.xy_yaw());
-                    if !tracker.is_target_pose_satisfied(current_pose) {
-                        warn!(
-                            "[{:?}] Nav2 reported goal succeeded before target pose was satisfied (current={:?}); retrying goal {:?}.",
-                            agent.index(),
-                            current_pose,
-                            success.handle.request.safe_zone_id,
-                        );
-                        return Ok(success.handle.request.clone());
-                    }
-                    if let Some(updated_prog) = tracker.mark_target_reached(latest_prog.0.as_ref())
-                    {
-                        if latest_prog.0.as_ref() != Some(&updated_prog) {
-                            let _ = prog_pub.publisher.publish(updated_prog.clone());
-                            latest_prog.0 = Some(updated_prog.clone());
-                            if let Some(status_pub) = status_pub {
-                                let pose = amcl_pose
-                                    .map(|p| PoseStamped {
-                                        header: p.0.header.clone(),
-                                        pose: p.0.pose.pose.clone(),
-                                    })
-                                    .unwrap_or_default();
-                                let sz_id = current_safe_zone
-                                    .and_then(|csz| csz.0.as_ref().map(|sz| &sz.id));
-                                let status_msg = build_robot_status(
-                                    pose,
-                                    ros_env::rmf_prototype_msgs::msg::RobotStatus::MODE_NAVIGATING,
-                                    Some(&updated_prog),
-                                    sz_id,
-                                );
-                                let _ = status_pub.publisher.publish(status_msg);
+            let target = &success.handle.request;
+            let is_current = inner_nav_clients
+                .get(target.agent)
+                .ok()
+                .and_then(|c| c.goal().as_ref())
+                .is_some_and(|goal| goal.id() == &target.safe_zone_id && !goal.is_superseded());
+            if is_current {
+                if let Ok((
+                    tracker,
+                    progress_pub,
+                    status_pub,
+                    mut latest_progress,
+                    current_safe_zone,
+                    amcl_pose,
+                )) = progress_query.get_mut(target.agent)
+                {
+                    if tracker.plan_id.as_ref() == Some(&target.safe_zone_id.plan_id) {
+                        let current_pose = amcl_pose.map(|p| p.xy_yaw());
+                        if !tracker.is_target_pose_satisfied(current_pose) {
+                            warn!(
+                                "[{:?}] Nav2 reported goal succeeded before target pose was satisfied (current={:?}); retrying goal {:?}.",
+                                target.agent.index(),
+                                current_pose,
+                                target.safe_zone_id,
+                            );
+                            return Ok(target.clone());
+                        }
+                        if let Some(reached_prog) =
+                            tracker.mark_target_reached(latest_progress.0.as_ref())
+                        {
+                            if latest_progress.0.as_ref() != Some(&reached_prog) {
+                                let _ = progress_pub.publisher.publish(reached_prog.clone());
+                                latest_progress.0 = Some(reached_prog.clone());
                             }
+                            let pose = amcl_pose
+                                .map(|p| PoseStamped {
+                                    header: p.0.header.clone(),
+                                    pose: p.0.pose.pose.clone(),
+                                })
+                                .unwrap_or_default();
+                            let sz_id = current_safe_zone
+                                .and_then(|csz| csz.0.as_ref().map(|sz| &sz.id))
+                                .or(Some(&target.safe_zone_id));
+                            let status_msg = build_robot_status(
+                                pose,
+                                RobotStatus::MODE_NAVIGATING,
+                                Some(&reached_prog),
+                                sz_id,
+                            );
+                            let _ = status_pub.publisher.publish(status_msg);
                         }
                     }
                 }
