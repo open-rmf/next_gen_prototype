@@ -127,6 +127,19 @@ fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
     let Some(target) = plan.waypoints.get(target_idx) else {
         return 0.0;
     };
+
+    for node in &target.arrival_constraints.nodes {
+        if let Some(target_ori) = node.orientations.first() {
+            return target_ori.orientation_radians;
+        }
+    }
+
+    for region in &target.arrival_constraints.regions {
+        if let Some(target_ori) = region.orientations.first() {
+            return target_ori.orientation_radians;
+        }
+    }
+
     let [target_x, target_y] = target.position;
 
     for waypoint in plan.waypoints[..target_idx].iter().rev() {
@@ -146,6 +159,37 @@ fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
     }
 
     0.0
+}
+
+fn is_constrained_orientation(ori: &TargetOrientation) -> bool {
+    let effective_tol = 0.5 * ori.spread_radians.max(0.0) + ori.tolerance_radians.max(0.0);
+    effective_tol < std::f32::consts::PI - 1e-3
+}
+
+fn target_orientation(plan: &Plan, target_idx: usize) -> TargetOrientation {
+    if let Some(target) = plan.waypoints.get(target_idx) {
+        let explicit_ori = target
+            .arrival_constraints
+            .nodes
+            .iter()
+            .find_map(|n| n.orientations.first())
+            .or_else(|| {
+                target
+                    .arrival_constraints
+                    .regions
+                    .iter()
+                    .find_map(|r| r.orientations.first())
+            });
+        if let Some(ori) = explicit_ori {
+            return ori.clone();
+        }
+    }
+
+    TargetOrientation {
+        orientation_radians: target_yaw(plan, target_idx),
+        spread_radians: 0.0,
+        tolerance_radians: std::f32::consts::PI,
+    }
 }
 
 impl PlanExecutor {
@@ -344,6 +388,18 @@ impl PlanExecutor {
         let mut released_wp_idx = curr_wp_idx;
         while released_wp_idx < plan.waypoints.len() {
             let wp = &plan.waypoints[released_wp_idx];
+            if released_wp_idx > curr_wp_idx
+                && (!wp.arrival_constraints.nodes.is_empty()
+                    || wp
+                        .arrival_constraints
+                        .regions
+                        .iter()
+                        .any(|r| r.orientations.iter().any(is_constrained_orientation))
+                    || !wp.arrival_action.is_empty()
+                    || !wp.departure_action.is_empty())
+            {
+                break;
+            }
             let mut blocked = false;
             for blocker in &wp.departure_blockers {
                 if let Some(blocker_sem) = semantic_waypoints.get(&blocker.name) {
@@ -519,10 +575,26 @@ impl PlanExecutor {
             .get_alloc_for_agent(agent_idx)
             .unwrap_or_default();
 
-        let target_x = plan.waypoints[released_wp_idx].position[0];
-        let target_y = plan.waypoints[released_wp_idx].position[1];
-        let target_yaw = target_yaw(plan, released_wp_idx);
-        let target_progress = plan.waypoints[released_wp_idx].progress;
+        let target_wp = &plan.waypoints[released_wp_idx];
+        let target_x = target_wp.position[0];
+        let target_y = target_wp.position[1];
+        let target_ori = target_orientation(plan, released_wp_idx);
+        let target_tolerance = target_wp
+            .arrival_constraints
+            .regions
+            .first()
+            .map(|r| r.tolerance)
+            .filter(|&t| t > 0.0)
+            .unwrap_or(0.2);
+        let mut target_nodes = target_wp.arrival_constraints.nodes.clone();
+        if is_constrained_orientation(&target_ori) {
+            for node in &mut target_nodes {
+                if node.orientations.is_empty() {
+                    node.orientations.push(target_ori.clone());
+                }
+            }
+        }
+        let target_progress = target_wp.progress;
 
         let costmap = Self::to_costmap_msg(
             &positions,
@@ -544,19 +616,14 @@ impl PlanExecutor {
         let safe_zone = SafeZone {
             incremental_target: DestinationConstraints {
                 regions: vec![rmf_prototype_msgs::msg::TargetRegion {
-                    tolerance: 0.2,
+                    tolerance: target_tolerance,
                     region: rmf_prototype_msgs::msg::Region {
                         points: vec![target_x, target_y],
                         hint: rmf_prototype_msgs::msg::Region::HINT_POINT,
                     },
-                    orientations: vec![TargetOrientation {
-                        // Avoid turning in place at hold points.
-                        orientation_radians: target_yaw,
-                        spread_radians: 0.0,
-                        tolerance_radians: 0.0,
-                    }],
+                    orientations: vec![target_ori],
                 }],
-                nodes: vec![],
+                nodes: target_nodes,
             },
             costmap,
             target_waypoint: vec![released_wp_idx as u64].try_into().unwrap(),
@@ -653,7 +720,7 @@ impl PlanExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{target_yaw, PlanExecutor, PlanExecutorConfig};
+    use super::{target_orientation, target_yaw, PlanExecutor, PlanExecutorConfig};
     use mapf_post::na::{Isometry2, Vector2};
     use mapf_post::{Trajectory, WaypointFollower};
     use ros_env::{
@@ -694,6 +761,31 @@ mod tests {
         let plan = plan_with_positions(&[[3.0, 4.0], [3.0, 4.0]]);
 
         assert_eq!(target_yaw(&plan, 1), 0.0);
+    }
+
+    #[test]
+    fn target_yaw_prefers_explicit_arrival_constraint_orientation() {
+        use ros_env::rmf_prototype_msgs::msg::{TargetOrientation, TargetRegion};
+
+        let mut plan = plan_with_positions(&[[0.0, 0.0], [5.0, 0.0]]);
+        let mut region = TargetRegion::default();
+        region.orientations.push(TargetOrientation {
+            orientation_radians: -std::f32::consts::FRAC_PI_2,
+            ..Default::default()
+        });
+        plan.waypoints[1].arrival_constraints.regions.push(region);
+
+        assert!((target_yaw(&plan, 1) - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-6);
+
+        // Unconstrained waypoint 0 gets travel heading 0.0 and tolerance PI
+        let ori0 = target_orientation(&plan, 0);
+        assert!((ori0.orientation_radians - 0.0).abs() < 1e-6);
+        assert!((ori0.tolerance_radians - std::f32::consts::PI).abs() < 1e-6);
+
+        // Constrained waypoint 1 gets explicit -PI/2 and preserves the input tolerance (0.0)
+        let ori1 = target_orientation(&plan, 1);
+        assert!((ori1.orientation_radians - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-6);
+        assert!((ori1.tolerance_radians - 0.0).abs() < 1e-6);
     }
 
     #[test]
@@ -885,5 +977,149 @@ mod tests {
         // Now robot_1 should be released up to waypoint 2
         let out1_released = plan_executor.handle_odometry("robot_1", odom1);
         assert_eq!(out1_released.plan_release.unwrap().waypoint_id, 2);
+    }
+
+    #[test]
+    fn test_safe_zone_forwards_target_nodes_and_tolerance() {
+        use ros_env::rmf_prototype_msgs::msg::{
+            GraphElementKey, Region, TargetNode, TargetOrientation, TargetRegion,
+        };
+
+        let mut plan_executor = PlanExecutor::new();
+        plan_executor.handle_robot_added("robot_1", 0.5);
+
+        let mut plan = plan_with_positions(&[[0.0, 0.0], [2.0, 0.0]]);
+        plan.waypoints[1].arrival_constraints.regions = vec![TargetRegion {
+            tolerance: 0.42,
+            region: Region {
+                points: vec![2.0, 0.0],
+                hint: Region::HINT_POINT,
+            },
+            orientations: vec![],
+        }];
+        let mut key = GraphElementKey::default();
+        key.key = vec![42i64].try_into().unwrap();
+        key.name = vec!["station_alpha".to_string().into()].try_into().unwrap();
+        plan.waypoints[1]
+            .arrival_constraints
+            .nodes
+            .push(TargetNode {
+                key,
+                orientations: vec![TargetOrientation {
+                    orientation_radians: std::f32::consts::FRAC_PI_2,
+                    spread_radians: 0.0,
+                    tolerance_radians: 0.12,
+                }],
+            });
+
+        assert!(plan_executor.handle_plan("robot_1", plan));
+
+        let mut odom1 = Odometry::default();
+        odom1.pose.pose.position.x = 0.0;
+        odom1.pose.pose.position.y = 0.0;
+        let out = plan_executor.handle_odometry("robot_1", odom1);
+        let sz = out.safe_zone.expect("SafeZone should be emitted");
+        assert_eq!(sz.incremental_target.regions.len(), 1);
+        assert!((sz.incremental_target.regions[0].tolerance - 0.42).abs() < 1e-5);
+        assert_eq!(sz.incremental_target.nodes.len(), 1);
+        assert_eq!(sz.incremental_target.nodes[0].key.key.as_slice(), &[42]);
+        assert!(
+            (sz.incremental_target.regions[0].orientations[0].orientation_radians
+                - std::f32::consts::FRAC_PI_2)
+                .abs()
+                < 1e-5
+        );
+        assert!(
+            (sz.incremental_target.regions[0].orientations[0].tolerance_radians - 0.12).abs()
+                < 1e-5
+        );
+    }
+
+    #[test]
+    fn test_intermediate_target_nodes_and_orientations_are_gated_and_forwarded() {
+        use ros_env::rmf_prototype_msgs::msg::{
+            GraphElementKey, TargetNode, TargetOrientation, TargetRegion,
+        };
+
+        let mut plan_executor = PlanExecutor::new();
+        plan_executor.handle_robot_added("robot_1", 0.5);
+
+        let mut plan = plan_with_positions(&[[0.0, 0.0], [2.0, 0.0], [4.0, 0.0], [6.0, 0.0]]);
+
+        // Intermediate wp[1] has a TargetNode with an orientation constraint (-pi/2)
+        let mut staging_key = GraphElementKey::default();
+        staging_key.key = vec![13i64].try_into().unwrap();
+        staging_key.name = vec!["staging_node".to_string().into()].try_into().unwrap();
+        plan.waypoints[1]
+            .arrival_constraints
+            .nodes
+            .push(TargetNode {
+                key: staging_key,
+                orientations: vec![TargetOrientation {
+                    orientation_radians: -std::f32::consts::FRAC_PI_2,
+                    spread_radians: 0.0,
+                    tolerance_radians: 0.05,
+                }],
+            });
+
+        // Intermediate wp[2] has a region orientation constraint (pi) without a TargetNode
+        let mut reg = TargetRegion::default();
+        reg.tolerance = 0.35;
+        reg.orientations.push(TargetOrientation {
+            orientation_radians: std::f32::consts::PI,
+            spread_radians: 0.0,
+            tolerance_radians: 0.1,
+        });
+        plan.waypoints[2].arrival_constraints.regions = vec![reg];
+
+        assert!(plan_executor.handle_plan("robot_1", plan));
+
+        // 1. At start (0, 0), execution gates at wp[1] and forwards its node + orientation (-pi/2)
+        let mut odom1 = Odometry::default();
+        odom1.pose.pose.position.x = 0.0;
+        odom1.pose.pose.position.y = 0.0;
+        let out1 = plan_executor.handle_odometry("robot_1", odom1);
+        assert_eq!(out1.plan_release.unwrap().waypoint_id, 1);
+        let sz1 = out1.safe_zone.expect("SafeZone should be emitted at start");
+        assert_eq!(sz1.target_waypoint.as_slice(), &[1]);
+        assert!(
+            (sz1.incremental_target.regions[0].orientations[0].orientation_radians
+                - (-std::f32::consts::FRAC_PI_2))
+                .abs()
+                < 1e-5
+        );
+        assert!(
+            (sz1.incremental_target.regions[0].orientations[0].tolerance_radians - 0.05).abs()
+                < 1e-5
+        );
+        assert_eq!(sz1.incremental_target.nodes.len(), 1);
+        assert_eq!(sz1.incremental_target.nodes[0].key.key.as_slice(), &[13]);
+
+        // 2. At wp[1] (2, 0), execution gates at wp[2] and forwards its region orientation (pi) and tolerance (0.35)
+        let mut odom2 = Odometry::default();
+        odom2.pose.pose.position.x = 2.0;
+        odom2.pose.pose.position.y = 0.0;
+        let out2 = plan_executor.handle_odometry("robot_1", odom2);
+        assert_eq!(out2.plan_release.unwrap().waypoint_id, 2);
+        let sz2 = out2.safe_zone.expect("SafeZone should be emitted at wp[1]");
+        assert_eq!(sz2.target_waypoint.as_slice(), &[2]);
+        assert!((sz2.incremental_target.regions[0].tolerance - 0.35).abs() < 1e-5);
+        assert!(
+            (sz2.incremental_target.regions[0].orientations[0].orientation_radians
+                - std::f32::consts::PI)
+                .abs()
+                < 1e-5
+        );
+        assert!(
+            (sz2.incremental_target.regions[0].orientations[0].tolerance_radians - 0.1).abs()
+                < 1e-5
+        );
+
+        // 3. At wp[2] (4, 0), execution releases to final wp[3]
+        let mut odom3 = Odometry::default();
+        odom3.pose.pose.position.x = 4.0;
+        odom3.pose.pose.position.y = 0.0;
+        let out3 = plan_executor.handle_odometry("robot_1", odom3);
+        assert_eq!(out3.plan_release.unwrap().waypoint_id, 3);
     }
 }

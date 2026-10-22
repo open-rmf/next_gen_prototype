@@ -199,7 +199,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                                 );
                                 continue;
                             };
-                            let plan = Self::to_plan_msg(
+                            let mut plan = Self::to_plan_msg(
                                 agent_idx,
                                 traj,
                                 plan_id,
@@ -208,6 +208,11 @@ impl<P: MapfPlanner> PlanServer<P> {
                                 &self.active_plan_ids,
                                 1.0,
                             );
+                            if let Some(dest) = goals.get(robot_id) {
+                                if let Some(last_wp) = plan.waypoints.last_mut() {
+                                    last_wp.arrival_constraints = dest.constraints.clone();
+                                }
+                            }
                             plans.insert(robot_id.clone(), plan);
                         }
 
