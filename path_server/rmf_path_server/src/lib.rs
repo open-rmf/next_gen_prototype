@@ -11,14 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use mapf_post::{na::Isometry2, MapfResult, SemanticPlan, SemanticWaypoint};
+use mapf_post::{na::Isometry2, MapfResult, SemanticPlan};
 use rclrs::{IntoPrimitiveOptions, Node};
 use ros_env::{
-    builtin_interfaces,
     nav_msgs::msg::OccupancyGrid,
     rmf_prototype_msgs::{
         self,
-        msg::{Destination, Plan, PlanError, PlanId, RobotStatus, TrafficDependency, Waypoint},
+        msg::{Destination, Plan, PlanError, RobotStatus},
     },
 };
 use std::{
@@ -26,7 +25,9 @@ use std::{
     sync::Arc,
 };
 
+pub mod plan_registry;
 pub mod planner;
+pub use plan_registry::PlanRegistry;
 pub use planner::{Map, MapfPlanner, MockPlanner, PibtPlanner};
 
 pub struct PlanSuccess {
@@ -36,6 +37,7 @@ pub struct PlanSuccess {
     pub goals: HashMap<String, Destination>,
     pub robot_ids: Vec<String>,
     pub active_plan: MapfResult,
+    pub plans: HashMap<String, Plan>,
 }
 
 pub enum PlanResult {
@@ -57,7 +59,7 @@ pub struct PlanServer<P: MapfPlanner> {
     pub planning_session_id: u64,
     pub current_planning_session: Option<u64>,
     pub footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
-    pub active_plan_ids: HashMap<String, PlanId>,
+    pub plan_registry: PlanRegistry,
     pub map: Arc<Map>,
 }
 
@@ -82,9 +84,23 @@ impl<P: MapfPlanner> PlanServer<P> {
             planning_session_id: 0,
             current_planning_session: None,
             footprints,
-            active_plan_ids: HashMap::new(),
+            plan_registry: PlanRegistry::new(),
             map: Arc::new(Map::default()),
         }
+    }
+
+    pub fn is_executing_action(&self, robot_id: &str) -> bool {
+        let Some(status) = self.latest_status.get(robot_id) else {
+            return false;
+        };
+        self.plan_registry.is_executing_action(robot_id, status)
+    }
+
+    pub fn occupied_path_of(&self, robot_id: &str) -> Vec<[f32; 2]> {
+        let Some(status) = self.latest_status.get(robot_id) else {
+            return Vec::new();
+        };
+        self.plan_registry.occupied_path_of(robot_id, status)
     }
 
     pub fn handle_destination(&mut self, robot_id: &str, msg: Destination) {
@@ -158,62 +174,13 @@ impl<P: MapfPlanner> PlanServer<P> {
                         self.current_planning_session = None;
 
                         let PlanSuccess {
-                            basic_plan,
-                            traffic_dependencies,
+                            session_id,
                             goals,
-                            robot_ids,
+                            plans,
                             ..
                         } = success;
 
-                        // First update the active_plan_ids for each robot with their new PlanId
-                        for robot_id in &robot_ids {
-                            let dest = goals.get(robot_id).unwrap();
-                            let prev_plan_id = self.active_plan_ids.get(robot_id);
-                            let new_version = match prev_plan_id {
-                                Some(p_id)
-                                    if p_id.destination_session.uuid == dest.session.uuid =>
-                                {
-                                    p_id.plan_version + 1
-                                }
-                                _ => 0,
-                            };
-
-                            let plan_id = PlanId {
-                                destination_session: dest.session.clone(),
-                                plan_version: new_version,
-                            };
-
-                            self.active_plan_ids.insert(robot_id.clone(), plan_id);
-                        }
-
-                        // Use traffic_dependencies to populate Plan message for each agent
-                        let mut plans = HashMap::new();
-                        for (agent_idx, robot_id) in robot_ids.iter().enumerate() {
-                            let plan_id = self.active_plan_ids.get(robot_id).unwrap().clone();
-                            let Some(traj) = &basic_plan.get(agent_idx) else {
-                                rclrs::log_error!(
-                                    self.node.logger(),
-                                    "Missing plan trajectory for agent {}",
-                                    agent_idx
-                                );
-                                continue;
-                            };
-                            let mut plan = Self::to_plan_msg(
-                                agent_idx,
-                                traj,
-                                plan_id,
-                                &traffic_dependencies,
-                                &robot_ids,
-                                &self.active_plan_ids,
-                                1.0,
-                            );
-                            if let Some(dest) = goals.get(robot_id) {
-                                if let Some(last_wp) = plan.waypoints.last_mut() {
-                                    last_wp.arrival_constraints = dest.constraints.clone();
-                                }
-                            }
-                            plans.insert(robot_id.clone(), plan);
-                        }
+                        self.plan_registry.record_session_plans(session_id, &plans);
 
                         for (robot_id, plan) in &plans {
                             let mut wp_strs = Vec::new();
@@ -271,7 +238,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                             }
                         }
 
-                        self.active_destinations = goals;
+                        self.active_destinations.extend(goals);
                     }
                     PlanResult::Failure { session_id, error } => {
                         // TODO(arjoc): Publish error message
@@ -297,25 +264,43 @@ impl<P: MapfPlanner> PlanServer<P> {
             return;
         }
 
-        // 3. If there is nothing new in the replan queue, we don't need to schedule a new plan
-        if self.replan_queue.is_empty() {
+        // 3. If there is no actionable (non-committed) robot in the replan queue,
+        // wait until either a non-committed robot requests a replan or a committed
+        // robot finishes its action.
+        if !self
+            .replan_queue
+            .iter()
+            .any(|(robot_id, _)| !self.is_executing_action(robot_id))
+        {
             return;
         }
 
         rclrs::log!(self.node.logger(), "Need to trigger plan");
         // Retrieve goals of all participants
-        let mut goals = self.active_destinations.clone();
+        let mut all_goals = self.active_destinations.clone();
 
         for (robot_id, dest) in &self.replan_queue {
-            goals.insert(robot_id.clone(), dest.clone());
+            all_goals.insert(robot_id.clone(), dest.clone());
         }
 
         let mut starts = HashMap::new();
-        for robot_id in goals.keys() {
+        let mut goals = HashMap::new();
+        let mut committed_robots = Vec::new();
+        for (robot_id, dest) in &all_goals {
             // Make sure we have the latest status for all robots.
             // Give up if status for some robots is stale.
             if let Some(status) = self.latest_status.get(robot_id) {
-                starts.insert(robot_id.clone(), status.clone());
+                if self.is_executing_action(robot_id) {
+                    rclrs::log!(
+                        self.node.logger(),
+                        "Robot {} is executing an action; excluding it from replanning and marking its occupied path",
+                        robot_id
+                    );
+                    committed_robots.push(robot_id.clone());
+                } else {
+                    starts.insert(robot_id.clone(), status.clone());
+                    goals.insert(robot_id.clone(), dest.clone());
+                }
             } else {
                 rclrs::log!(
                     self.node.logger(),
@@ -326,14 +311,24 @@ impl<P: MapfPlanner> PlanServer<P> {
             }
         }
 
-        // We can now safely drain/clear the replan queue since we are proceeding with the planning.
-        self.replan_queue.clear();
+        // Retain any replan requests for robots that were deferred because they are mid-action.
+        self.replan_queue
+            .retain(|(robot_id, _)| committed_robots.contains(robot_id));
+
+        if goals.is_empty() {
+            return;
+        }
 
         // Perform MAPF plan in background thread
         rclrs::log!(self.node.logger(), "Triggering new plan in background");
 
         let mut robot_ids: Vec<String> = goals.keys().cloned().collect();
         robot_ids.sort();
+
+        let mut map = (*self.map).clone();
+        for committed_id in &committed_robots {
+            map.mark(&self.occupied_path_of(committed_id));
+        }
 
         self.planning_session_id += 1;
         let session_id = self.planning_session_id;
@@ -346,7 +341,7 @@ impl<P: MapfPlanner> PlanServer<P> {
         let planner_clone = Arc::clone(&self.planner);
         let footprints_clone = Arc::clone(&self.footprints);
         let sender_clone = self.plan_sender.clone();
-        let map_clone = self.map.clone();
+        let registry_snapshot = self.plan_registry.clone();
 
         std::thread::spawn(move || {
             if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
@@ -355,20 +350,25 @@ impl<P: MapfPlanner> PlanServer<P> {
 
             let footprints_map: HashMap<String, Arc<dyn mapf_post::shape::Shape>> = {
                 let guard = footprints_clone.lock();
-                robot_ids
-                    .iter()
-                    .map(|id| {
-                        let radius = match guard.as_ref() {
-                            Ok(map) => *map.get(id).unwrap_or(&0.49),
-                            Err(_) => 0.49,
-                        };
-                        (
-                            id.clone(),
-                            Arc::new(mapf_post::shape::Ball::new(radius))
-                                as Arc<dyn mapf_post::shape::Shape>,
-                        )
-                    })
-                    .collect()
+                let mut map: HashMap<String, Arc<dyn mapf_post::shape::Shape>> =
+                    match guard.as_ref() {
+                        Ok(radii) => radii
+                            .iter()
+                            .map(|(id, &radius)| {
+                                (
+                                    id.clone(),
+                                    Arc::new(mapf_post::shape::Ball::new(radius))
+                                        as Arc<dyn mapf_post::shape::Shape>,
+                                )
+                            })
+                            .collect(),
+                        Err(_) => HashMap::new(),
+                    };
+                for id in &robot_ids {
+                    map.entry(id.clone())
+                        .or_insert_with(|| Arc::new(mapf_post::shape::Ball::new(0.49)));
+                }
+                map
             };
 
             let basic_plan = match planner_clone.plan(
@@ -376,7 +376,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                 &goals,
                 &footprints_map,
                 &robot_ids,
-                map_clone.as_ref(),
+                &map,
                 Arc::clone(&cancellation),
             ) {
                 Ok(plan) => plan,
@@ -394,25 +394,13 @@ impl<P: MapfPlanner> PlanServer<P> {
                 return;
             }
 
-            let trajectories: Vec<mapf_post::Trajectory> = basic_plan
-                .iter()
-                .map(|poses| mapf_post::Trajectory {
-                    poses: poses.clone(),
-                })
-                .collect();
-
-            let footprints: Vec<Arc<dyn mapf_post::shape::Shape>> = robot_ids
-                .iter()
-                .map(|id| footprints_map.get(id).unwrap().clone())
-                .collect();
-
-            let mapf_result = mapf_post::MapfResult {
-                trajectories,
-                footprints,
-                discretization_timestep: 1.0,
-            };
-
-            let traffic_dependencies = mapf_post::mapf_post(&mapf_result);
+            let (plans, mapf_result, traffic_dependencies) = registry_snapshot.build_session_plans(
+                &basic_plan,
+                &goals,
+                &robot_ids,
+                &footprints_map,
+                1.0,
+            );
 
             if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
@@ -425,64 +413,9 @@ impl<P: MapfPlanner> PlanServer<P> {
                 goals,
                 robot_ids,
                 active_plan: mapf_result,
+                plans,
             }));
         });
-    }
-
-    pub fn to_plan_msg(
-        agent_idx: usize,
-        traj: &[Isometry2<f32>],
-        plan_id: PlanId,
-        traffic_dependencies: &SemanticPlan,
-        robot_ids: &[String],
-        active_plan_ids: &HashMap<String, PlanId>,
-        timestep: f32,
-    ) -> Plan {
-        let mut waypoints = Vec::new();
-        for (i, pose) in traj.iter().enumerate() {
-            waypoints.push(Waypoint {
-                position: [pose.translation.x, pose.translation.y],
-                arrival_constraints: Default::default(),
-                progress: i as f32 * timestep,
-                maps: Vec::new(),
-                departure_blockers: Vec::new(),
-                departure_trajectory: Vec::new(),
-                departure_action: String::new(),
-                arrival_action: String::new(),
-            });
-        }
-
-        for i in 0..traj.len() {
-            if let Some(dep_ids) = traffic_dependencies.comes_before(&SemanticWaypoint {
-                agent: agent_idx,
-                trajectory_index: i,
-            }) {
-                for &dep_id in dep_ids {
-                    let dep_wp = &traffic_dependencies.waypoints[dep_id];
-                    if dep_wp.agent == agent_idx {
-                        continue;
-                    }
-                    if let Some(dep_robot_id) = robot_ids.get(dep_wp.agent) {
-                        if let Some(dep_plan_id) = active_plan_ids.get(dep_robot_id) {
-                            let req_progress = (dep_wp.trajectory_index + 1) as f32 * timestep;
-                            let blocker = TrafficDependency {
-                                name: dep_robot_id.clone(),
-                                plan_id: dep_plan_id.clone(),
-                                required_progress: req_progress,
-                            };
-                            waypoints[i].departure_blockers.push(blocker);
-                        }
-                    }
-                }
-            }
-        }
-
-        Plan {
-            waypoints,
-            start_time: builtin_interfaces::msg::Time { sec: 0, nanosec: 0 },
-            plan_id,
-            workflow: String::new(),
-        }
     }
 }
 
