@@ -487,6 +487,21 @@ parking_spots:
     }
 
     #[test]
+    fn loads_corridor_docks_site() {
+        let config = ReservationConfig::from_file(map_fixture("corridor_docks.site.json")).unwrap();
+
+        assert_eq!(config.safe_sets.len(), 1);
+        assert_eq!(
+            config
+                .parking_spots
+                .iter()
+                .map(|spot| spot.name.as_str())
+                .collect::<Vec<_>>(),
+            ["parking_west", "parking_east"]
+        );
+    }
+
+    #[test]
     fn legacy_building_and_native_site_are_equivalent() {
         let building = ReservationConfig::from_file(map_fixture("office.building.yaml")).unwrap();
         let native = ReservationConfig::from_file(map_fixture("office.site.json")).unwrap();

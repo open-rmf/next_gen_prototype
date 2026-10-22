@@ -65,6 +65,7 @@ def generate_launch_description():
     use_rviz = LaunchConfiguration('use_rviz')
     use_navigation = LaunchConfiguration('use_navigation')
     staged_startup = LaunchConfiguration('staged_startup')
+    robot_sdf = LaunchConfiguration('robot_sdf')
     log_settings = LaunchConfiguration('log_settings', default='true')
 
     # Declare the launch arguments
@@ -120,6 +121,12 @@ def generate_launch_description():
         'staged_startup',
         default_value='False',
         description='Start each robot stack after its transforms are ready.',
+    )
+
+    declare_robot_sdf_cmd = DeclareLaunchArgument(
+        'robot_sdf',
+        default_value=os.path.join(sim_dir, 'urdf', 'gz_waffle.sdf.xacro'),
+        description='Full path to robot sdf file to spawn the robot in gazebo',
     )
 
     # Start Gazebo with plugin providing the robot spawning service
@@ -197,6 +204,7 @@ def generate_launch_description():
                         'pitch': TextSubstitution(text=str(init_pose['pitch'])),
                         'yaw': TextSubstitution(text=str(init_pose['yaw'])),
                         'robot_name': TextSubstitution(text=robot_name),
+                        'robot_sdf': robot_sdf,
                     }.items(),
                 ),
             ]
@@ -244,6 +252,7 @@ def generate_launch_description():
     ld.add_action(declare_use_robot_state_pub_cmd)
     ld.add_action(declare_use_navigation_cmd)
     ld.add_action(declare_staged_startup_cmd)
+    ld.add_action(declare_robot_sdf_cmd)
 
     # initial localization node
     for robot_name in robots_list:

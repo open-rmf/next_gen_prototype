@@ -1,0 +1,34 @@
+# Common dock database for the 3x8 corridor + 6 protruding dock alcoves demo.
+#
+# Compatible with Nav2 opennav_docking's `dock_database` YAML format
+# (each dock entry specifies `type`, `frame`, and `pose: [x, y, yaw]`).
+# With `staging_x_offset: -1.0`, the staging pose for each north dock at
+# (x, 2.0, pi/2) lies at (x, 1.0, pi/2) on the north corridor lane, and the
+# staging pose for each south dock at (x, -2.0, -pi/2) lies at (x, -1.0, -pi/2)
+# on the south corridor lane.
+
+docks:
+  dock_north_1:
+    type: 'simple_charging_dock'
+    frame: 'map'
+    pose: [-1.0, 2.0, 1.5707963]
+  dock_north_2:
+    type: 'simple_charging_dock'
+    frame: 'map'
+    pose: [1.0, 2.0, 1.5707963]
+  dock_north_3:
+    type: 'simple_charging_dock'
+    frame: 'map'
+    pose: [3.0, 2.0, 1.5707963]
+  dock_south_1:
+    type: 'simple_charging_dock'
+    frame: 'map'
+    pose: [-1.0, -2.0, -1.5707963]
+  dock_south_2:
+    type: 'simple_charging_dock'
+    frame: 'map'
+    pose: [1.0, -2.0, -1.5707963]
+  dock_south_3:
+    type: 'simple_charging_dock'
+    frame: 'map'
+    pose: [3.0, -2.0, -1.5707963]
