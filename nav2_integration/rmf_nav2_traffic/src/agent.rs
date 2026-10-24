@@ -197,7 +197,9 @@ fn update_amcl_pose(
         }
 
         if let Some(status_pub) = status_pub {
-            let mode = if current_nav_req.is_some()
+            let mode = if progress_tracker.is_some_and(|t| t.is_holding_at_pre_waypoint()) {
+                RobotStatus::MODE_ACTION
+            } else if current_nav_req.is_some()
                 || inner_nav_client.is_some_and(|c| c.goal().is_some())
             {
                 RobotStatus::MODE_NAVIGATING
