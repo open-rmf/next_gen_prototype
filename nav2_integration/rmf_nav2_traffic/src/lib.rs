@@ -34,6 +34,9 @@ pub use navigation_server::*;
 pub mod safe_zone;
 pub use safe_zone::*;
 
+pub mod waypoint_workflow;
+pub use waypoint_workflow::*;
+
 #[derive(Default)]
 pub struct Nav2TrafficPlugin {}
 

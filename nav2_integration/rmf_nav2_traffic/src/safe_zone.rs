@@ -3,6 +3,9 @@ use crate::{
     inner_navigation_client::{
         CancellingInnerNavigation, InnerNavigationAction, InnerNavigationTarget,
     },
+    waypoint_workflow::{
+        evaluate_waypoint_diagram, parse_or_compile_waypoint_diagram, WaypointActionContext,
+    },
     Nav2Agent,
 };
 use bevy::prelude::*;
@@ -204,6 +207,40 @@ impl ProgressTracker {
         if trimmed.is_empty() {
             return None;
         }
+
+        if trimmed.starts_with('{') {
+            if let Ok(diagram) = parse_or_compile_waypoint_diagram(trimmed) {
+                let init_ctx = WaypointActionContext::new(
+                    "robot",
+                    0,
+                    target_xy.0 as f64,
+                    target_xy.1 as f64,
+                    0.0,
+                );
+                if let Ok(ctx) = evaluate_waypoint_diagram(&diagram, init_ctx) {
+                    let (mut nav_action, gate) = ctx.into_inner_action_and_gate();
+                    if let InnerNavigationAction::DockRobot {
+                        use_dock_id,
+                        dock_id,
+                        dock_type,
+                        ..
+                    } = &mut nav_action
+                    {
+                        if dock_id.is_empty() {
+                            if let Some(dock) =
+                                KnownDock::match_by_pose(target_xy.0, target_xy.1, 0.45)
+                            {
+                                *use_dock_id = true;
+                                *dock_id = dock.id;
+                                *dock_type = dock.dock_type;
+                            }
+                        }
+                    }
+                    return Some((nav_action, gate));
+                }
+            }
+        }
+
         let lower = trimmed.to_ascii_lowercase();
         let has_gate = lower.contains("gate")
             || lower.contains("load")
@@ -1572,5 +1609,114 @@ mod tests {
         let p_unblocked = tracker.compute_progress(Some((2.0, 0.0, 0.0)), Some(&p_after_dock));
         assert_eq!(p_unblocked.reached_waypoint, 2);
         assert!((p_unblocked.progress - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn progress_tracker_executes_crossflow_diagram_for_door_dock_and_handover() {
+        use ros_env::rmf_prototype_msgs::msg::Waypoint;
+
+        let mut tracker = ProgressTracker::default();
+        let mut sz = safe_zone(1, 0, 1, -1.0, 2.0);
+        sz.last_waypoint = 1;
+        sz.target_waypoint = vec![2].try_into().unwrap();
+        sz.target_progress = 2.0;
+
+        let mut plan = Plan::default();
+        plan.plan_id = sz.id.plan_id.clone();
+        let mut wp0 = Waypoint::default();
+        wp0.position = [0.0, 1.0];
+        wp0.progress = 0.0;
+        let mut wp1 = Waypoint::default();
+        wp1.position = [-1.0, 1.0];
+        wp1.progress = 1.0;
+        wp1.departure_action = r#"{
+            "version": "0.1.0",
+            "start": "open_door",
+            "ops": {
+                "open_door": {
+                    "type": "node",
+                    "builder": "facility/door_request",
+                    "config": {
+                        "door_id": "dock_bay_door_1",
+                        "mode": "open"
+                    },
+                    "next": "door_ok"
+                },
+                "door_ok": {
+                    "type": "fork_result",
+                    "ok": "custom_dock",
+                    "err": { "builtin": "dispose" }
+                },
+                "custom_dock": {
+                    "type": "node",
+                    "builder": "nav2/dock_robot",
+                    "config": {
+                        "use_dock_id": true,
+                        "dock_id": "dock_north_1",
+                        "dock_type": "custom_precision_dock",
+                        "navigate_to_staging_pose": false
+                    },
+                    "next": "dock_ok"
+                },
+                "dock_ok": {
+                    "type": "fork_result",
+                    "ok": "handover_tote",
+                    "err": { "builtin": "dispose" }
+                },
+                "handover_tote": {
+                    "type": "node",
+                    "builder": "workcell/handover",
+                    "config": {
+                        "station_id": "conveyor_north_1",
+                        "direction": "load",
+                        "item_type": "tote",
+                        "wait_for_gate_release": true
+                    },
+                    "next": "handover_ok"
+                },
+                "handover_ok": {
+                    "type": "fork_result",
+                    "ok": { "builtin": "terminate" },
+                    "err": { "builtin": "dispose" }
+                }
+            }
+        }"#
+        .to_string();
+        let mut wp2 = Waypoint::default();
+        wp2.position = [-1.0, 2.0];
+        wp2.progress = 2.0;
+        plan.waypoints = vec![wp0, wp1, wp2];
+
+        let p0 = tracker.on_safe_zone_with_plan(
+            &sz,
+            Some(&plan),
+            Some((-1.0, 1.0, std::f32::consts::FRAC_PI_2)),
+            None,
+        );
+        assert_eq!(
+            tracker.active_action,
+            InnerNavigationAction::DockRobot {
+                use_dock_id: true,
+                dock_id: "dock_north_1".to_string(),
+                dock_type: "custom_precision_dock".to_string(),
+                navigate_to_staging_pose: false,
+            }
+        );
+        assert!(tracker.gate_active);
+        assert!(tracker.is_holding_at_pre_waypoint());
+        assert_eq!(p0.reached_waypoint, 1);
+
+        // DockRobot completes, gate remains held for conveyor item handover
+        let p_after_dock = tracker.mark_target_reached(Some(&p0)).unwrap();
+        assert_eq!(p_after_dock.reached_waypoint, 1);
+
+        // Conveyor handover releases the gate -> progress advances to waypoint 2
+        tracker.release_gate();
+        let p_done = tracker.compute_progress(
+            Some((-1.0, 2.0, std::f32::consts::FRAC_PI_2)),
+            Some(&p_after_dock),
+        );
+        assert_eq!(p_done.reached_waypoint, 2);
+        assert!((p_done.progress - 2.0).abs() < 1e-4);
     }
 }
