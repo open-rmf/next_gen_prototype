@@ -1,6 +1,8 @@
 use crate::{
     agent::AmclPose,
-    inner_navigation_client::{CancellingInnerNavigation, InnerNavigationTarget},
+    inner_navigation_client::{
+        CancellingInnerNavigation, InnerNavigationAction, InnerNavigationTarget,
+    },
     Nav2Agent,
 };
 use bevy::prelude::*;
@@ -9,8 +11,10 @@ use ros_env::{
     builtin_interfaces::msg::Time as RosTime,
     geometry_msgs::msg::PoseStamped,
     nav2_msgs::msg::Costmap,
-    rmf_prototype_msgs::msg::{PlanError, Progress, Region, RobotStatus, SafeZone, SafeZoneId},
-    std_msgs::msg::Header,
+    rmf_prototype_msgs::msg::{
+        Plan, PlanError, Progress, Region, RobotStatus, SafeZone, SafeZoneId,
+    },
+    std_msgs::msg::{Empty as RosEmpty, Header},
 };
 use std::{
     sync::Arc,
@@ -20,6 +24,104 @@ use std::{
 #[derive(Component)]
 pub struct SafeZoneSubscription {
     pub subscriber: Arc<RosSubscription<SafeZone>>,
+}
+
+#[derive(Component)]
+pub struct PlanSubscription {
+    pub subscriber: Arc<RosSubscription<Plan>>,
+}
+
+#[derive(Component, Debug, Clone, Default, Deref)]
+pub struct CurrentPlan(pub Option<Plan>);
+
+#[derive(Component)]
+pub struct GateReleaseSubscription {
+    pub subscriber: Arc<RosSubscription<RosEmpty>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KnownDock {
+    pub id: String,
+    pub dock_type: String,
+    pub x: f32,
+    pub y: f32,
+    pub yaw: f32,
+    pub staging_x: f32,
+    pub staging_y: f32,
+}
+
+impl KnownDock {
+    pub fn corridor_docks() -> Vec<Self> {
+        use std::f32::consts::FRAC_PI_2;
+        vec![
+            Self {
+                id: "dock_north_1".to_string(),
+                dock_type: "simple_charging_dock".to_string(),
+                x: -1.0,
+                y: 2.0,
+                yaw: FRAC_PI_2,
+                staging_x: -1.0,
+                staging_y: 1.0,
+            },
+            Self {
+                id: "dock_north_2".to_string(),
+                dock_type: "simple_charging_dock".to_string(),
+                x: 1.0,
+                y: 2.0,
+                yaw: FRAC_PI_2,
+                staging_x: 1.0,
+                staging_y: 1.0,
+            },
+            Self {
+                id: "dock_north_3".to_string(),
+                dock_type: "simple_charging_dock".to_string(),
+                x: 3.0,
+                y: 2.0,
+                yaw: FRAC_PI_2,
+                staging_x: 3.0,
+                staging_y: 1.0,
+            },
+            Self {
+                id: "dock_south_1".to_string(),
+                dock_type: "simple_charging_dock".to_string(),
+                x: -1.0,
+                y: -2.0,
+                yaw: -FRAC_PI_2,
+                staging_x: -1.0,
+                staging_y: -1.0,
+            },
+            Self {
+                id: "dock_south_2".to_string(),
+                dock_type: "simple_charging_dock".to_string(),
+                x: 1.0,
+                y: -2.0,
+                yaw: -FRAC_PI_2,
+                staging_x: 1.0,
+                staging_y: -1.0,
+            },
+            Self {
+                id: "dock_south_3".to_string(),
+                dock_type: "simple_charging_dock".to_string(),
+                x: 3.0,
+                y: -2.0,
+                yaw: -FRAC_PI_2,
+                staging_x: 3.0,
+                staging_y: -1.0,
+            },
+        ]
+    }
+
+    pub fn match_by_id(id: &str) -> Option<Self> {
+        Self::corridor_docks()
+            .into_iter()
+            .find(|d| d.id.eq_ignore_ascii_case(id))
+    }
+
+    pub fn match_by_pose(x: f32, y: f32, tolerance: f32) -> Option<Self> {
+        Self::corridor_docks()
+            .into_iter()
+            .find(|d| (d.x - x).hypot(d.y - y) <= tolerance)
+    }
 }
 
 #[derive(Component)]
@@ -88,9 +190,185 @@ pub struct ProgressTracker {
     pub target_tolerance: f32,
     pub target_yaw: Option<f32>,
     pub target_yaw_tolerance: f32,
+    pub active_action: InnerNavigationAction,
+    pub action_completed: bool,
+    pub gate_active: bool,
 }
 
 impl ProgressTracker {
+    fn parse_action_string(
+        action_str: &str,
+        target_xy: (f32, f32),
+    ) -> Option<(InnerNavigationAction, bool)> {
+        let trimmed = action_str.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let has_gate = lower.contains("gate")
+            || lower.contains("load")
+            || lower.contains("offload")
+            || lower.contains("off-load");
+
+        if lower.starts_with("undock") {
+            let dock_type = trimmed
+                .split_once(':')
+                .and_then(|(_, rest)| KnownDock::match_by_id(rest.trim()))
+                .map(|d| d.dock_type)
+                .unwrap_or_else(|| "simple_charging_dock".to_string());
+            return Some((InnerNavigationAction::UndockRobot { dock_type }, has_gate));
+        }
+
+        if lower.starts_with("dock") {
+            let explicit_id = trimmed.split_once(':').map(|(_, rest)| rest.trim());
+            if let Some(dock_id) = explicit_id.filter(|s| !s.is_empty()) {
+                let dock_type = KnownDock::match_by_id(dock_id)
+                    .map(|d| d.dock_type)
+                    .unwrap_or_else(|| "simple_charging_dock".to_string());
+                return Some((
+                    InnerNavigationAction::DockRobot {
+                        use_dock_id: KnownDock::match_by_id(dock_id).is_some(),
+                        dock_id: dock_id.to_string(),
+                        dock_type,
+                        navigate_to_staging_pose: false,
+                    },
+                    has_gate,
+                ));
+            }
+            if let Some(dock) = KnownDock::match_by_pose(target_xy.0, target_xy.1, 0.45) {
+                return Some((
+                    InnerNavigationAction::DockRobot {
+                        use_dock_id: true,
+                        dock_id: dock.id,
+                        dock_type: dock.dock_type,
+                        navigate_to_staging_pose: false,
+                    },
+                    has_gate,
+                ));
+            }
+            return Some((
+                InnerNavigationAction::DockRobot {
+                    use_dock_id: false,
+                    dock_id: String::new(),
+                    dock_type: "simple_charging_dock".to_string(),
+                    navigate_to_staging_pose: false,
+                },
+                has_gate,
+            ));
+        }
+
+        if has_gate {
+            return Some((InnerNavigationAction::NavigateToPose, true));
+        }
+
+        None
+    }
+
+    pub fn resolve_target_action(
+        safe_zone: &SafeZone,
+        plan: Option<&Plan>,
+        start_xy: (f32, f32),
+        target_xy: (f32, f32),
+    ) -> (InnerNavigationAction, bool) {
+        let target_wp_idx = safe_zone.target_waypoint.first().copied().unwrap_or(0) as usize;
+        let last_wp_idx = safe_zone.last_waypoint as usize;
+
+        if let Some(plan) = plan.filter(|p| p.plan_id == safe_zone.id.plan_id) {
+            if let Some(wp) = plan.waypoints.get(target_wp_idx) {
+                if let Some(res) = Self::parse_action_string(&wp.arrival_action, target_xy) {
+                    return res;
+                }
+                for node in &wp.arrival_constraints.nodes {
+                    if let Some(name_seq) = node.key.name.first() {
+                        let name_str = name_seq.to_string();
+                        if let Some(dock) = KnownDock::match_by_id(&name_str) {
+                            return (
+                                InnerNavigationAction::DockRobot {
+                                    use_dock_id: true,
+                                    dock_id: dock.id,
+                                    dock_type: dock.dock_type,
+                                    navigate_to_staging_pose: false,
+                                },
+                                false,
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(prev_wp) = plan.waypoints.get(last_wp_idx) {
+                if let Some(res) = Self::parse_action_string(&prev_wp.departure_action, target_xy) {
+                    return res;
+                }
+            }
+            if target_wp_idx > 0 {
+                if let Some(prev_wp) = plan.waypoints.get(target_wp_idx - 1) {
+                    if let Some(res) =
+                        Self::parse_action_string(&prev_wp.departure_action, target_xy)
+                    {
+                        return res;
+                    }
+                }
+            }
+        }
+
+        for node in &safe_zone.incremental_target.nodes {
+            if let Some(name_seq) = node.key.name.first() {
+                let name_str = name_seq.to_string();
+                if let Some(dock) = KnownDock::match_by_id(&name_str) {
+                    return (
+                        InnerNavigationAction::DockRobot {
+                            use_dock_id: true,
+                            dock_id: dock.id,
+                            dock_type: dock.dock_type,
+                            navigate_to_staging_pose: false,
+                        },
+                        false,
+                    );
+                }
+            }
+        }
+
+        if let Some(dock) = KnownDock::match_by_pose(target_xy.0, target_xy.1, 0.35) {
+            let dist_to_dock = (start_xy.0 - dock.x).hypot(start_xy.1 - dock.y);
+            if dist_to_dock > 0.35 {
+                let dist_to_staging =
+                    (start_xy.0 - dock.staging_x).hypot(start_xy.1 - dock.staging_y);
+                let navigate_to_staging_pose = dist_to_staging > 0.45;
+                return (
+                    InnerNavigationAction::DockRobot {
+                        use_dock_id: true,
+                        dock_id: dock.id,
+                        dock_type: dock.dock_type,
+                        navigate_to_staging_pose,
+                    },
+                    false,
+                );
+            }
+        }
+
+        (InnerNavigationAction::NavigateToPose, false)
+    }
+
+    pub fn is_holding_at_pre_waypoint(&self) -> bool {
+        let waiting_for_dock_action = matches!(
+            self.active_action,
+            InnerNavigationAction::DockRobot { .. } | InnerNavigationAction::UndockRobot { .. }
+        ) && !self.action_completed;
+        waiting_for_dock_action || self.gate_active
+    }
+
+    pub fn set_gate(&mut self, gated: bool) {
+        self.gate_active = gated;
+    }
+
+    pub fn release_gate(&mut self) {
+        self.gate_active = false;
+    }
+
+    pub fn mark_action_completed(&mut self) {
+        self.action_completed = true;
+    }
+
     fn extract_orientation_constraint(safe_zone: &SafeZone) -> (Option<f32>, f32) {
         let ori = safe_zone
             .incremental_target
@@ -129,6 +407,12 @@ impl ProgressTracker {
     }
 
     pub fn is_target_pose_satisfied(&self, current_pose: Option<(f32, f32, f32)>) -> bool {
+        if matches!(
+            self.active_action,
+            InnerNavigationAction::DockRobot { .. } | InnerNavigationAction::UndockRobot { .. }
+        ) {
+            return self.action_completed;
+        }
         let Some((rx, ry, ryaw)) = current_pose else {
             return true;
         };
@@ -139,6 +423,16 @@ impl ProgressTracker {
     pub fn on_safe_zone(
         &mut self,
         safe_zone: &SafeZone,
+        current_pose: Option<(f32, f32, f32)>,
+        previous: Option<&Progress>,
+    ) -> Progress {
+        self.on_safe_zone_with_plan(safe_zone, None, current_pose, previous)
+    }
+
+    pub fn on_safe_zone_with_plan(
+        &mut self,
+        safe_zone: &SafeZone,
+        plan: Option<&Plan>,
         current_pose: Option<(f32, f32, f32)>,
         previous: Option<&Progress>,
     ) -> Progress {
@@ -161,6 +455,8 @@ impl ProgressTracker {
         let fallback_start = current_xy.unwrap_or(target_xy);
 
         if !same_plan {
+            let (action, has_gate) =
+                Self::resolve_target_action(safe_zone, plan, fallback_start, target_xy);
             self.plan_id = Some(plan_id);
             self.start_waypoint = safe_zone.last_waypoint;
             self.target_waypoint = target_wp;
@@ -170,6 +466,9 @@ impl ProgressTracker {
             self.target_tolerance = target_tolerance;
             self.target_yaw = target_yaw;
             self.target_yaw_tolerance = target_yaw_tolerance;
+            self.active_action = action;
+            self.action_completed = false;
+            self.gate_active = has_gate;
         } else {
             let yaw_changed = match (self.target_yaw, target_yaw) {
                 (Some(a), Some(b)) => shortest_angular_distance(a, b) > 0.05,
@@ -180,8 +479,14 @@ impl ProgressTracker {
                 || (target_xy.0 - self.target_xy.0).hypot(target_xy.1 - self.target_xy.1) > 1e-3
                 || yaw_changed;
             if target_changed {
-                self.start_xy = current_xy.unwrap_or(self.target_xy);
+                let new_start_xy = current_xy.unwrap_or(self.target_xy);
+                let (action, has_gate) =
+                    Self::resolve_target_action(safe_zone, plan, new_start_xy, target_xy);
+                self.start_xy = new_start_xy;
                 self.start_waypoint = self.start_waypoint.max(safe_zone.last_waypoint);
+                self.active_action = action;
+                self.action_completed = false;
+                self.gate_active = has_gate;
             }
             self.target_waypoint = target_wp;
             self.target_progress = safe_zone.target_progress;
@@ -209,6 +514,32 @@ impl ProgressTracker {
 
         let mut reached_waypoint = self.start_waypoint.max(prev_reached);
         let mut progress = (reached_waypoint as f32).max(prev_progress);
+
+        // Hold progress at the pre-dock / pre-gate waypoint while a docking action
+        // is in progress or while an explicit progress gate is active.
+        if self.is_holding_at_pre_waypoint() {
+            return Progress {
+                progress,
+                reached_waypoint,
+                target_waypoint: self.target_waypoint,
+                reached_keys: vec![],
+                plan_id,
+            };
+        }
+
+        if matches!(
+            self.active_action,
+            InnerNavigationAction::DockRobot { .. } | InnerNavigationAction::UndockRobot { .. }
+        ) && self.action_completed
+        {
+            return Progress {
+                progress: progress.max(self.target_progress),
+                reached_waypoint: reached_waypoint.max(self.target_waypoint),
+                target_waypoint: self.target_waypoint,
+                reached_keys: vec![],
+                plan_id,
+            };
+        }
 
         if let Some((rx, ry, ryaw)) = current_pose {
             let dist_to_target = (rx - self.target_xy.0).hypot(ry - self.target_xy.1);
@@ -267,11 +598,24 @@ impl ProgressTracker {
         }
     }
 
-    pub fn mark_target_reached(&self, previous: Option<&Progress>) -> Option<Progress> {
+    pub fn mark_target_reached(&mut self, previous: Option<&Progress>) -> Option<Progress> {
+        self.action_completed = true;
         let plan_id = self.plan_id.clone()?;
         let prev_same_plan = previous.filter(|p| p.plan_id == plan_id);
         let prev_reached = prev_same_plan.map(|p| p.reached_waypoint).unwrap_or(0);
         let prev_progress = prev_same_plan.map(|p| p.progress).unwrap_or(0.0);
+
+        if self.gate_active {
+            let reached_waypoint = self.start_waypoint.max(prev_reached);
+            let progress = (reached_waypoint as f32).max(prev_progress);
+            return Some(Progress {
+                progress,
+                reached_waypoint,
+                target_waypoint: self.target_waypoint,
+                reached_keys: vec![],
+                plan_id,
+            });
+        }
 
         Some(Progress {
             progress: prev_progress.max(self.target_progress),
@@ -429,6 +773,8 @@ impl Plugin for SafeZoneSubscriptionPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(PreUpdate, update_incremental_target)
             .add_observer(create_safe_zone_subscriber)
+            .add_observer(create_plan_subscriber)
+            .add_observer(create_gate_release_subscriber)
             .add_observer(create_costmap_publisher)
             .add_observer(create_progress_publisher)
             .add_observer(create_robot_status_publisher)
@@ -454,6 +800,43 @@ fn create_safe_zone_subscriber(
         },
         CurrentSafeZone::default(),
     ));
+}
+
+fn create_plan_subscriber(
+    trigger: Trigger<OnAdd, Nav2Agent>,
+    mut commands: Commands,
+    agents: Query<&Nav2Agent>,
+    node: Res<RclrsNode>,
+) {
+    let e = trigger.target();
+    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
+        return;
+    };
+    let topic = agent_name + "/plan";
+    let subscription = Arc::new(RosSubscription::<Plan>::new(&node, topic));
+    commands.entity(e).insert((
+        PlanSubscription {
+            subscriber: Arc::clone(&subscription),
+        },
+        CurrentPlan::default(),
+    ));
+}
+
+fn create_gate_release_subscriber(
+    trigger: Trigger<OnAdd, Nav2Agent>,
+    mut commands: Commands,
+    agents: Query<&Nav2Agent>,
+    node: Res<RclrsNode>,
+) {
+    let e = trigger.target();
+    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
+        return;
+    };
+    let topic = agent_name + "/plan/gate_release";
+    let subscription = Arc::new(RosSubscription::<RosEmpty>::new(&node, topic));
+    commands.entity(e).insert(GateReleaseSubscription {
+        subscriber: Arc::clone(&subscription),
+    });
 }
 
 fn create_costmap_publisher(
@@ -545,6 +928,8 @@ fn update_incremental_target(
         (
             Entity,
             &SafeZoneSubscription,
+            &PlanSubscription,
+            &GateReleaseSubscription,
             &CostmapPublisher,
             &CostmapUpdatedSubscription,
             &mut CostmapHandshakeState,
@@ -553,6 +938,7 @@ fn update_incremental_target(
             &mut LatestProgress,
             &mut ProgressTracker,
             &mut CurrentSafeZone,
+            &mut CurrentPlan,
             Option<&AmclPose>,
             &Nav2Agent,
         ),
@@ -562,6 +948,8 @@ fn update_incremental_target(
     for (
         e,
         safe_zone_sub,
+        plan_sub,
+        gate_release_sub,
         costmap_pub,
         costmap_updated_sub,
         mut handshake,
@@ -570,10 +958,46 @@ fn update_incremental_target(
         mut latest_progress,
         mut progress_tracker,
         mut current_safe_zone,
+        mut current_plan,
         amcl_pose,
         agent,
     ) in subscriptions.iter_mut()
     {
+        while let Some(plan) = plan_sub.subscriber.take_data() {
+            current_plan.0 = Some(plan);
+        }
+
+        let mut gate_released = false;
+        while gate_release_sub.subscriber.take_data().is_some() {
+            gate_released = true;
+        }
+        if gate_released {
+            progress_tracker.release_gate();
+            if progress_tracker.plan_id.is_some() {
+                let current_pose = amcl_pose.map(|p| p.xy_yaw());
+                let updated_prog =
+                    progress_tracker.compute_progress(current_pose, latest_progress.0.as_ref());
+                if latest_progress.0.as_ref() != Some(&updated_prog) {
+                    let _ = progress_pub.publisher.publish(updated_prog.clone());
+                    latest_progress.0 = Some(updated_prog.clone());
+                    let pose = amcl_pose
+                        .map(|p| PoseStamped {
+                            header: p.0.header.clone(),
+                            pose: p.0.pose.pose.clone(),
+                        })
+                        .unwrap_or_default();
+                    let sz_id = current_safe_zone.0.as_ref().map(|sz| &sz.id);
+                    let status_msg = build_robot_status(
+                        pose,
+                        RobotStatus::MODE_NAVIGATING,
+                        Some(&updated_prog),
+                        sz_id,
+                    );
+                    let _ = status_pub.publisher.publish(status_msg);
+                }
+            }
+        }
+
         while let Some(ack_header) = costmap_updated_sub.subscriber.take_data() {
             let seq = stamp_to_seq(&ack_header.stamp);
             if seq > handshake.acked_seq {
@@ -603,8 +1027,9 @@ fn update_incremental_target(
                     let current_pose = amcl_pose.map(|p| p.xy_yaw());
 
                     // Publish progress when it changes
-                    let progress_msg = progress_tracker.on_safe_zone(
+                    let progress_msg = progress_tracker.on_safe_zone_with_plan(
                         &safe_zone,
+                        current_plan.0.as_ref(),
                         current_pose,
                         latest_progress.0.as_ref(),
                     );
@@ -616,6 +1041,12 @@ fn update_incremental_target(
                         };
                         latest_progress.0 = Some(progress_msg.clone());
                     }
+
+                    let mode = if progress_tracker.is_holding_at_pre_waypoint() {
+                        RobotStatus::MODE_ACTION
+                    } else {
+                        RobotStatus::MODE_NAVIGATING
+                    };
 
                     if !current_safe_zone.should_update_target(&safe_zone) {
                         if let Some(pending) = handshake.pending_target.as_mut() {
@@ -630,16 +1061,17 @@ fn update_incremental_target(
                                 .unwrap_or_default();
                             let status_msg = build_robot_status(
                                 pose,
-                                RobotStatus::MODE_NAVIGATING,
+                                mode,
                                 Some(&progress_msg),
                                 Some(&safe_zone.id),
                             );
                             let _ = status_pub.publisher.publish(status_msg);
                         }
                     } else {
+                        let action = progress_tracker.active_action.clone();
                         info!(
-                            "[{:?}] Queuing SafeZone target (waiting for costmap seq={}): ({:.2}, {:.2}, {:.2})",
-                            agent.name, seq, target_x, target_y, target_yaw
+                            "[{:?}] Queuing SafeZone target (waiting for costmap seq={}, action={:?}): ({:.2}, {:.2}, {:.2})",
+                            agent.name, seq, action, target_x, target_y, target_yaw
                         );
 
                         let pose = amcl_pose
@@ -650,7 +1082,7 @@ fn update_incremental_target(
                             .unwrap_or_default();
                         let status_msg = build_robot_status(
                             pose,
-                            RobotStatus::MODE_NAVIGATING,
+                            mode,
                             Some(&progress_msg),
                             Some(&safe_zone.id),
                         );
@@ -660,12 +1092,13 @@ fn update_incremental_target(
 
                         handshake.pending_target = Some(PendingNavigationTarget {
                             required_seq: seq,
-                            target: InnerNavigationTarget::new(
+                            target: InnerNavigationTarget::with_action(
                                 e,
                                 safe_zone.id,
                                 target_x as f64,
                                 target_y as f64,
                                 target_yaw as f64,
+                                action,
                             ),
                             target_xy_yaw: (target_x, target_y, target_yaw),
                             costmap,
@@ -1047,5 +1480,97 @@ mod tests {
         let p_done = tracker.compute_progress(Some((1.0, 0.0, std::f32::consts::PI)), Some(&p0));
         assert_eq!(p_done.reached_waypoint, 1);
         assert!((p_done.progress - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn progress_tracker_holds_at_pre_dock_waypoint_during_docking() {
+        let mut tracker = ProgressTracker::default();
+        // SafeZone targets dock_north_1 at (-1.0, 2.0, pi/2) from pre-dock waypoint 1 at (-1.0, 1.0)
+        let mut sz = safe_zone(1, 0, 1, -1.0, 2.0);
+        sz.last_waypoint = 1;
+        sz.target_waypoint = vec![2].try_into().unwrap();
+        sz.target_progress = 2.0;
+        sz.incremental_target.regions[0].tolerance = 0.25;
+        sz.incremental_target.regions[0].orientations = vec![TargetOrientation {
+            orientation_radians: std::f32::consts::FRAC_PI_2,
+            spread_radians: 0.0,
+            tolerance_radians: 0.25,
+        }];
+
+        let p0 = tracker.on_safe_zone(&sz, Some((-1.0, 1.0, std::f32::consts::FRAC_PI_2)), None);
+        assert_eq!(
+            tracker.active_action,
+            InnerNavigationAction::DockRobot {
+                use_dock_id: true,
+                dock_id: "dock_north_1".to_string(),
+                dock_type: "simple_charging_dock".to_string(),
+                navigate_to_staging_pose: false,
+            }
+        );
+        assert_eq!(p0.reached_waypoint, 1);
+        assert!((p0.progress - 1.0).abs() < 1e-4);
+
+        // Even while moving into the dock (-1.0, 1.8) or arriving at (-1.0, 2.0),
+        // progress must remain held at pre-dock waypoint 1 (progress = 1.0) until DockRobot succeeds.
+        let p_mid =
+            tracker.compute_progress(Some((-1.0, 1.8, std::f32::consts::FRAC_PI_2)), Some(&p0));
+        assert_eq!(p_mid.reached_waypoint, 1);
+        assert!((p_mid.progress - 1.0).abs() < 1e-4);
+
+        let p_at_dock =
+            tracker.compute_progress(Some((-1.0, 2.0, std::f32::consts::FRAC_PI_2)), Some(&p_mid));
+        assert_eq!(p_at_dock.reached_waypoint, 1);
+        assert!((p_at_dock.progress - 1.0).abs() < 1e-4);
+
+        // Once DockRobot action succeeds, progress advances to target_waypoint 2 (progress = 2.0).
+        let p_completed = tracker.mark_target_reached(Some(&p_at_dock)).unwrap();
+        assert_eq!(p_completed.reached_waypoint, 2);
+        assert!((p_completed.progress - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn progress_tracker_plan_action_and_gate_hold_until_gate_released() {
+        use ros_env::rmf_prototype_msgs::msg::Waypoint;
+
+        let mut tracker = ProgressTracker::default();
+        let mut sz = safe_zone(1, 0, 1, 2.0, 0.0);
+        sz.last_waypoint = 1;
+        sz.target_waypoint = vec![2].try_into().unwrap();
+        sz.target_progress = 2.0;
+        sz.incremental_target.regions[0].tolerance = 0.25;
+
+        let mut plan = Plan::default();
+        plan.plan_id = sz.id.plan_id.clone();
+        let mut wp0 = Waypoint::default();
+        wp0.position = [0.0, 0.0];
+        wp0.progress = 0.0;
+        let mut wp1 = Waypoint::default();
+        wp1.position = [1.0, 0.0];
+        wp1.progress = 1.0;
+        let mut wp2 = Waypoint::default();
+        wp2.position = [2.0, 0.0];
+        wp2.progress = 2.0;
+        wp2.arrival_action = "dock:dock_north_1+load".to_string();
+        plan.waypoints = vec![wp0, wp1, wp2];
+
+        let p0 = tracker.on_safe_zone_with_plan(&sz, Some(&plan), Some((1.0, 0.0, 0.0)), None);
+        assert!(tracker.gate_active);
+        assert!(tracker.is_holding_at_pre_waypoint());
+        assert_eq!(p0.reached_waypoint, 1);
+        assert!((p0.progress - 1.0).abs() < 1e-4);
+
+        // DockRobot completes, but loading gate is still active -> progress stays held at waypoint 1
+        let p_after_dock = tracker.mark_target_reached(Some(&p0)).unwrap();
+        assert!(tracker.action_completed);
+        assert!(tracker.gate_active);
+        assert_eq!(p_after_dock.reached_waypoint, 1);
+        assert!((p_after_dock.progress - 1.0).abs() < 1e-4);
+
+        // External gate release triggers -> progress now advances to waypoint 2 (2.0)
+        tracker.release_gate();
+        assert!(!tracker.is_holding_at_pre_waypoint());
+        let p_unblocked = tracker.compute_progress(Some((2.0, 0.0, 0.0)), Some(&p_after_dock));
+        assert_eq!(p_unblocked.reached_waypoint, 2);
+        assert!((p_unblocked.progress - 2.0).abs() < 1e-4);
     }
 }
