@@ -1,12 +1,13 @@
 use crate::{
-    inner_navigation_client::InnerNavigationTarget, navigation_server::CurrentNavigationRequest,
-    Nav2Agent,
+    agent::AmclPose, inner_navigation_client::InnerNavigationTarget,
+    navigation_server::CurrentNavigationRequest, Nav2Agent,
 };
 use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
 use ros_env::{
+    geometry_msgs::msg::PoseStamped,
     nav2_msgs::msg::Costmap,
-    rmf_prototype_msgs::msg::{PlanError, Progress, Region, SafeZone},
+    rmf_prototype_msgs::msg::{PlanError, Progress, Region, RobotStatus, SafeZone, SafeZoneId},
 };
 use std::sync::Arc;
 
@@ -23,6 +24,50 @@ pub struct CostmapPublisher {
 #[derive(Component)]
 pub struct ProgressPublisher {
     pub publisher: Arc<RosPublisher<Progress>>,
+}
+
+#[derive(Component)]
+pub struct RobotStatusPublisher {
+    pub publisher: Arc<RosPublisher<RobotStatus>>,
+}
+
+#[derive(Component, Debug, Clone, Default, Deref)]
+pub struct LatestProgress(pub Option<Progress>);
+
+pub fn build_robot_status(
+    pose: PoseStamped,
+    mode: u8,
+    progress: Option<&Progress>,
+    safe_zone_id: Option<&SafeZoneId>,
+) -> RobotStatus {
+    let progress_seq = match progress {
+        Some(prog) => {
+            let rmw_prog = <Progress as rosidl_runtime_rs::Message>::into_rmw_message(
+                std::borrow::Cow::Borrowed(prog),
+            )
+            .into_owned();
+            vec![rmw_prog].try_into().unwrap()
+        }
+        None => vec![].try_into().unwrap(),
+    };
+
+    let safe_zone_seq = match safe_zone_id {
+        Some(sz_id) => {
+            let rmw_sz = <SafeZoneId as rosidl_runtime_rs::Message>::into_rmw_message(
+                std::borrow::Cow::Borrowed(sz_id),
+            )
+            .into_owned();
+            vec![rmw_sz].try_into().unwrap()
+        }
+        None => vec![].try_into().unwrap(),
+    };
+
+    RobotStatus {
+        pose,
+        mode,
+        progress: progress_seq,
+        safe_zone_id: safe_zone_seq,
+    }
 }
 
 #[derive(Component)]
@@ -137,6 +182,7 @@ impl Plugin for SafeZoneSubscriptionPlugin {
             .add_observer(create_safe_zone_subscriber)
             .add_observer(create_costmap_publisher)
             .add_observer(create_progress_publisher)
+            .add_observer(create_robot_status_publisher)
             .add_observer(create_plan_error_publisher);
     }
 }
@@ -191,7 +237,29 @@ fn create_progress_publisher(
     };
     let topic = agent_name + "/plan/progress";
     let publisher = Arc::new(RosPublisher::<Progress>::new_transient_local(&node, topic));
-    commands.entity(e).insert(ProgressPublisher {
+    commands.entity(e).insert((
+        ProgressPublisher {
+            publisher: Arc::clone(&publisher),
+        },
+        LatestProgress::default(),
+    ));
+}
+
+fn create_robot_status_publisher(
+    trigger: Trigger<OnAdd, Nav2Agent>,
+    mut commands: Commands,
+    agents: Query<&Nav2Agent>,
+    node: Res<RclrsNode>,
+) {
+    let e = trigger.target();
+    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
+        return;
+    };
+    let topic = agent_name + "/status";
+    let publisher = Arc::new(RosPublisher::<RobotStatus>::new_transient_local(
+        &node, topic,
+    ));
+    commands.entity(e).insert(RobotStatusPublisher {
         publisher: Arc::clone(&publisher),
     });
 }
@@ -221,7 +289,10 @@ fn update_incremental_target(
             &SafeZoneSubscription,
             &CostmapPublisher,
             &ProgressPublisher,
+            &RobotStatusPublisher,
+            &mut LatestProgress,
             &mut CurrentSafeZone,
+            Option<&AmclPose>,
             &Nav2Agent,
         ),
         // Only respond to a SafeZone message if there is an active NavigationRequest
@@ -229,8 +300,17 @@ fn update_incremental_target(
         With<CurrentNavigationRequest>,
     >,
 ) {
-    for (e, safe_zone_sub, costmap_pub, progress_pub, mut current_safe_zone, agent) in
-        subscriptions.iter_mut()
+    for (
+        e,
+        safe_zone_sub,
+        costmap_pub,
+        progress_pub,
+        status_pub,
+        mut latest_progress,
+        mut current_safe_zone,
+        amcl_pose,
+        agent,
+    ) in subscriptions.iter_mut()
     {
         let Some(safe_zone) = safe_zone_sub.subscriber.data_callback() else {
             continue;
@@ -255,16 +335,32 @@ fn update_incremental_target(
         };
 
         // Publish progress
-        let Ok(_) = progress_pub.publisher.publish(Progress {
+        let progress_msg = Progress {
             progress: safe_zone.last_waypoint as f32,
             reached_waypoint: safe_zone.last_waypoint,
             target_waypoint: safe_zone.target_waypoint[0], // TODO(@xiyuoh) review
             reached_keys: vec![],                          // TODO(@xiyuoh)
             plan_id: safe_zone.id.plan_id.clone(),
-        }) else {
+        };
+        let Ok(_) = progress_pub.publisher.publish(progress_msg.clone()) else {
             error!("Failed to publish progress for agent [{}]", agent.name);
             continue;
         };
+        latest_progress.0 = Some(progress_msg.clone());
+
+        let pose = amcl_pose
+            .map(|p| PoseStamped {
+                header: p.0.header.clone(),
+                pose: p.0.pose.pose.clone(),
+            })
+            .unwrap_or_default();
+        let status_msg = build_robot_status(
+            pose,
+            RobotStatus::MODE_NAVIGATING,
+            Some(&progress_msg),
+            Some(&safe_zone.id),
+        );
+        let _ = status_pub.publisher.publish(status_msg);
 
         if !current_safe_zone.should_update_target(&safe_zone) {
             continue;
@@ -453,5 +549,38 @@ mod tests {
             .push(ori2);
 
         assert!(current.should_update_target(&next_sz));
+    }
+
+    #[test]
+    fn build_robot_status_populates_optional_fields() {
+        let mut pose = PoseStamped::default();
+        pose.pose.position.x = 2.5;
+        pose.pose.position.y = -1.5;
+
+        let idle_status = build_robot_status(pose.clone(), RobotStatus::MODE_IDLE, None, None);
+        assert_eq!(idle_status.mode, RobotStatus::MODE_IDLE);
+        assert!(idle_status.progress.is_empty());
+        assert!(idle_status.safe_zone_id.is_empty());
+
+        let sz = safe_zone(7, 2, 5, 3.0, 4.0);
+        let prog = Progress {
+            progress: 1.5,
+            reached_waypoint: 1,
+            target_waypoint: 2,
+            reached_keys: vec![],
+            plan_id: sz.id.plan_id.clone(),
+        };
+        let nav_status = build_robot_status(
+            pose,
+            RobotStatus::MODE_NAVIGATING,
+            Some(&prog),
+            Some(&sz.id),
+        );
+        assert_eq!(nav_status.mode, RobotStatus::MODE_NAVIGATING);
+        assert_eq!(nav_status.progress.len(), 1);
+        assert_eq!(nav_status.progress[0].reached_waypoint, 1);
+        assert_eq!(nav_status.progress[0].target_waypoint, 2);
+        assert_eq!(nav_status.safe_zone_id.len(), 1);
+        assert_eq!(nav_status.safe_zone_id[0].safe_zone_version, 5);
     }
 }
