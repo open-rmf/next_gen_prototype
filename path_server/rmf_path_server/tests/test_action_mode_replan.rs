@@ -283,3 +283,50 @@ fn test_action_mode_robot_excluded_from_replan_and_cross_plan_dependencies_compu
 
     Err("Timeout waiting for deferred robot1 plan after leaving MODE_ACTION".into())
 }
+
+#[test]
+fn test_cancelled_snapshot_preserves_in_flight_destination(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let context = Context::default_from_env().unwrap();
+    let executor = context.create_basic_executor();
+    let server_node = executor.create_node("path_server_cancel_race")?;
+
+    let received_map = Arc::new(Mutex::new(None));
+    let planner = TestPlanner { received_map };
+    let footprints = Arc::new(Mutex::new(HashMap::new()));
+    let mut server = rmf_path_server::PlanServer::new(server_node, planner, footprints);
+
+    let mut progress = Progress::default();
+    progress.mode = Progress::MODE_IDLE;
+    server.handle_progress("robot1", progress.clone());
+    server.handle_progress("robot2", progress);
+
+    let mut dest1 = Destination::default();
+    dest1.session.uuid = [21; 16];
+    server.handle_destination("robot1", dest1);
+
+    // Take the first snapshot (simulating the 100ms timer firing right after robot1's destination)
+    let snapshot1 = server
+        .take_snapshot()
+        .expect("Expected snapshot for robot1");
+    assert_eq!(snapshot1.goals.len(), 1);
+    assert_eq!(snapshot1.goals["robot1"].session.uuid, [21; 16]);
+
+    // Before snapshot1 finishes, robot2's destination arrives and cancels snapshot1
+    let mut dest2 = Destination::default();
+    dest2.session.uuid = [22; 16];
+    server.handle_destination("robot2", dest2);
+    assert!(snapshot1
+        .cancellation
+        .load(std::sync::atomic::Ordering::Relaxed));
+
+    // The next snapshot must still include robot1's destination [21; 16] as well as robot2's [22; 16]
+    let snapshot2 = server
+        .take_snapshot()
+        .expect("Expected snapshot2 after cancellation");
+    assert_eq!(snapshot2.goals.len(), 2);
+    assert_eq!(snapshot2.goals["robot1"].session.uuid, [21; 16]);
+    assert_eq!(snapshot2.goals["robot2"].session.uuid, [22; 16]);
+
+    Ok(())
+}
