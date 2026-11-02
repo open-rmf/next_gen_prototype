@@ -49,6 +49,7 @@ def generate_test_description():
         package='rmf_path_server',
         executable='rmf_path_server',
         output='screen',
+        parameters=[{'site_file': site_file}],
     )
 
     plan_executor = launch_ros.actions.Node(

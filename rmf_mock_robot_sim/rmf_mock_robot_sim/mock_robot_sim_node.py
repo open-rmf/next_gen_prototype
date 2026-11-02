@@ -113,6 +113,7 @@ class MockRobotSimNode(Node):
         self.released_waypoint_idx = 0
         self.latest_release = None
         self.latest_safe_zone_id = None
+        self.safe_zone_dock = None
         self.was_blocked = False
 
         self.site_anchors = {}
@@ -416,11 +417,12 @@ class MockRobotSimNode(Node):
         scale = random.uniform(min_scale, max_scale)
         return max(0.05, float(base_duration) * scale)
 
-    def _match_waypoint_dock(self, wp):
-        if wp is None:
-            return None
-        constraints = getattr(wp, 'arrival_constraints', None)
-        nodes = getattr(constraints, 'nodes', None) if constraints is not None else None
+    def _match_constraints_dock(self, constraints):
+        nodes = (
+            getattr(constraints, 'nodes', None)
+            if constraints is not None
+            else None
+        )
         if not nodes:
             return None
         for node in nodes:
@@ -440,6 +442,11 @@ class MockRobotSimNode(Node):
                     if key_id in (dock.get('location_key'), dock.get('anchor_key')):
                         return dock
         return None
+
+    def _match_waypoint_dock(self, wp):
+        if wp is None:
+            return None
+        return self._match_constraints_dock(getattr(wp, 'arrival_constraints', None))
 
     def _get_transition_action(self, target_idx):
         if not self.current_path or target_idx < 0 or target_idx >= len(self.current_path):
@@ -554,6 +561,7 @@ class MockRobotSimNode(Node):
             self.latest_safe_zone_id.plan_id, self.current_plan_id
         ):
             self.latest_safe_zone_id = None
+            self.safe_zone_dock = None
         self.was_blocked = False
 
         # If the path is not empty and we are far from the start,
@@ -566,6 +574,11 @@ class MockRobotSimNode(Node):
             msg.id.plan_id, self.current_plan_id
         ):
             self.latest_safe_zone_id = msg.id
+            self.safe_zone_dock = self._match_constraints_dock(
+                getattr(msg, 'incremental_target', None)
+            )
+            if self.safe_zone_dock is not None:
+                self.publish_progress()
 
     def handle_release(self, msg: PlanRelease):
         self.get_logger().info(
@@ -768,10 +781,10 @@ class MockRobotSimNode(Node):
             or self.current_waypoint_idx >= len(self.current_path)
         ):
             return Progress.MODE_IDLE
+        if self.active_transition_action is not None or self.safe_zone_dock is not None:
+            return Progress.MODE_ACTION
         if self.is_blocked():
             return Progress.MODE_WAITING
-        if self.active_transition_action is not None:
-            return Progress.MODE_ACTION
         if self.wait_time_remaining > 0.0:
             return Progress.MODE_WAITING
         return Progress.MODE_NAVIGATING
