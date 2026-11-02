@@ -1,0 +1,46 @@
+services:
+
+  gazebo_server:
+    environment:
+      RMW_IMPLEMENTATION: rmw_zenoh_cpp
+      ZENOH_CONFIG_OVERRIDE: 'mode="client";connect/endpoints=["tcp/zenoh_router:7447"]'
+    depends_on:
+      - zenoh_router
+
+  robot0_nav2_sim:
+    environment:
+      RMW_IMPLEMENTATION: rmw_zenoh_cpp
+      ZENOH_CONFIG_OVERRIDE: 'mode="client";connect/endpoints=["tcp/zenoh_router:7447"]'
+    depends_on:
+      - gazebo_server
+      - zenoh_router
+
+  robot1_nav2_sim:
+    environment:
+      RMW_IMPLEMENTATION: rmw_zenoh_cpp
+      ZENOH_CONFIG_OVERRIDE: 'mode="client";connect/endpoints=["tcp/zenoh_router:7447"]'
+    depends_on:
+      - gazebo_server
+      - zenoh_router
+
+  next_gen_prototype:
+    environment:
+      RMW_IMPLEMENTATION: rmw_zenoh_cpp
+      ZENOH_CONFIG_OVERRIDE: 'mode="client";connect/endpoints=["tcp/zenoh_router:7447"]'
+    depends_on:
+      - robot0_nav2_sim
+      - robot1_nav2_sim
+      - zenoh_router
+  
+  zenoh_router:
+    image: eclipse/zenoh:latest
+    container_name: zenoh_router
+    restart: no
+
+    networks:
+      - ros2_net
+
+    command:
+      - --listen
+      - tcp/0.0.0.0:7447
+
