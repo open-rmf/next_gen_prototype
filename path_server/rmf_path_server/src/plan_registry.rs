@@ -19,12 +19,237 @@ use mapf_post::{
 };
 use ros_env::{
     builtin_interfaces,
-    rmf_prototype_msgs::msg::{Destination, Plan, PlanId, Progress, TrafficDependency, Waypoint},
+    rmf_prototype_msgs::msg::{
+        Destination, Plan, PlanId, Progress, TargetNode, TrafficDependency, Waypoint,
+    },
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    path::Path,
     sync::Arc,
 };
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KnownDock {
+    pub id: String,
+    pub location_key: Option<i64>,
+    pub anchor_key: Option<i64>,
+    pub x: f32,
+    pub y: f32,
+    pub yaw: f32,
+    pub staging_x: f32,
+    pub staging_y: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DockRegistry {
+    pub docks: Vec<KnownDock>,
+}
+
+impl DockRegistry {
+    pub fn new(docks: Vec<KnownDock>) -> Self {
+        Self { docks }
+    }
+
+    pub fn from_site_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
+            format!(
+                "Failed to read site_file '{}': {e}",
+                path.as_ref().display()
+            )
+        })?;
+        Self::from_site_json_str(&content)
+    }
+
+    pub fn from_site_json_str(json_str: &str) -> Result<Self, String> {
+        let root: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| format!("Invalid site JSON: {e}"))?;
+
+        fn extract_anchor_xy(val: &serde_json::Value) -> Option<(f32, f32)> {
+            if let Some(arr) = val.as_array() {
+                if arr.len() >= 2 {
+                    return Some((arr[0].as_f64()? as f32, arr[1].as_f64()? as f32));
+                }
+            }
+            if let Some(t2d) = val.get("Translate2D").and_then(|v| v.as_array()) {
+                if t2d.len() >= 2 {
+                    return Some((t2d[0].as_f64()? as f32, t2d[1].as_f64()? as f32));
+                }
+            }
+            None
+        }
+
+        let mut anchors: HashMap<String, (f32, f32)> = HashMap::new();
+        if let Some(top_anchors) = root.get("anchors").and_then(|v| v.as_object()) {
+            for (id, pose) in top_anchors {
+                if let Some(xy) = extract_anchor_xy(pose) {
+                    anchors.insert(id.clone(), xy);
+                }
+            }
+        }
+        if let Some(levels) = root.get("levels").and_then(|v| v.as_object()) {
+            for level in levels.values() {
+                if let Some(level_anchors) = level.get("anchors").and_then(|v| v.as_object()) {
+                    for (id, pose) in level_anchors {
+                        if let Some(xy) = extract_anchor_xy(pose) {
+                            anchors.insert(id.clone(), xy);
+                        }
+                    }
+                }
+            }
+        }
+
+        let val_to_id = |v: &serde_json::Value| -> Option<String> {
+            if let Some(s) = v.as_str() {
+                Some(s.to_string())
+            } else {
+                v.as_u64()
+                    .map(|n| n.to_string())
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            }
+        };
+
+        let mut neighbors: HashMap<String, Vec<(f32, f32)>> = HashMap::new();
+        let mut docks: Vec<KnownDock> = Vec::new();
+
+        let guided = root.get("navigation").and_then(|n| n.get("guided"));
+        if let Some(lanes) = guided
+            .and_then(|g| g.get("lanes"))
+            .and_then(|l| l.as_object())
+        {
+            for lane_data in lanes.values() {
+                let endpoints =
+                    if let Some(arr) = lane_data.get("anchors").and_then(|v| v.as_array()) {
+                        if arr.len() >= 2 {
+                            val_to_id(&arr[0]).zip(val_to_id(&arr[1]))
+                        } else {
+                            None
+                        }
+                    } else {
+                        lane_data
+                            .get("left")
+                            .and_then(val_to_id)
+                            .zip(lane_data.get("right").and_then(val_to_id))
+                    };
+
+                let Some((left_id, right_id)) = endpoints else {
+                    continue;
+                };
+                let (Some(&left_xy), Some(&right_xy)) =
+                    (anchors.get(&left_id), anchors.get(&right_id))
+                else {
+                    continue;
+                };
+
+                neighbors.entry(left_id.clone()).or_default().push(right_xy);
+                neighbors.entry(right_id.clone()).or_default().push(left_xy);
+            }
+        }
+
+        if let Some(locations) = guided
+            .and_then(|g| g.get("locations"))
+            .and_then(|l| l.as_object())
+        {
+            for (loc_id, loc_data) in locations {
+                let Some(anchor_id) = loc_data.get("anchor").and_then(val_to_id) else {
+                    continue;
+                };
+                let Some(&(x, y)) = anchors.get(&anchor_id) else {
+                    continue;
+                };
+                let default_name = format!("location_{loc_id}");
+                let name = loc_data
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&default_name)
+                    .to_string();
+
+                let mut is_parking_spot = false;
+                if let Some(tags) = loc_data.get("tags").and_then(|v| v.as_array()) {
+                    for tag in tags {
+                        if tag.as_str() == Some("ParkingSpot") || tag.get("ParkingSpot").is_some() {
+                            is_parking_spot = true;
+                        }
+                    }
+                }
+                if is_parking_spot {
+                    continue;
+                }
+
+                let Some(anchor_neighbors) = neighbors.get(&anchor_id) else {
+                    continue;
+                };
+                if anchor_neighbors.len() != 1 {
+                    continue;
+                }
+                let (staging_x, staging_y) = anchor_neighbors[0];
+                let yaw = (y - staging_y).atan2(x - staging_x);
+
+                if docks
+                    .iter()
+                    .any(|d| d.id.eq_ignore_ascii_case(&name) || (d.x - x).hypot(d.y - y) < 1e-3)
+                {
+                    continue;
+                }
+
+                docks.push(KnownDock {
+                    id: name,
+                    location_key: loc_id.parse::<i64>().ok(),
+                    anchor_key: anchor_id.parse::<i64>().ok(),
+                    x,
+                    y,
+                    yaw,
+                    staging_x,
+                    staging_y,
+                });
+            }
+        }
+
+        Ok(Self { docks })
+    }
+
+    pub fn match_by_id(&self, id: &str) -> Option<KnownDock> {
+        self.docks
+            .iter()
+            .find(|d| d.id.eq_ignore_ascii_case(id))
+            .cloned()
+    }
+
+    pub fn match_target_node(&self, node: &TargetNode) -> Option<KnownDock> {
+        if let Some(name_seq) = node.key.name.first() {
+            let name_str = name_seq.to_string();
+            if let Some(dock) = self.match_by_id(&name_str) {
+                return Some(dock);
+            }
+        }
+        if let Some(&key_id) = node.key.key.first() {
+            if let Some(dock) = self
+                .docks
+                .iter()
+                .find(|d| d.location_key == Some(key_id) || d.anchor_key == Some(key_id))
+            {
+                return Some(dock.clone());
+            }
+        }
+        None
+    }
+
+    pub fn match_target_nodes(&self, nodes: &[TargetNode]) -> Option<KnownDock> {
+        for node in nodes {
+            if let Some(dock) = self.match_target_node(node) {
+                return Some(dock);
+            }
+        }
+        None
+    }
+
+    pub fn match_by_position(&self, x: f32, y: f32, tolerance: f32) -> Option<KnownDock> {
+        self.docks
+            .iter()
+            .find(|d| (d.x - x).hypot(d.y - y) <= tolerance)
+            .cloned()
+    }
+}
 
 struct CollatedAgent {
     robot_id: String,
@@ -45,11 +270,24 @@ struct CollatedAgent {
 pub struct PlanRegistry {
     /// Active plans keyed by robot ID.
     active_plans: BTreeMap<String, Plan>,
+    /// Optional dock registry loaded from a `.site.json` file.
+    pub dock_registry: DockRegistry,
 }
 
 impl PlanRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_dock_registry(dock_registry: DockRegistry) -> Self {
+        Self {
+            active_plans: BTreeMap::new(),
+            dock_registry,
+        }
+    }
+
+    pub fn set_dock_registry(&mut self, dock_registry: DockRegistry) {
+        self.dock_registry = dock_registry;
     }
 
     /// Returns the currently active [`Plan`] for `robot_id`, if any.
@@ -102,17 +340,58 @@ impl PlanRegistry {
         if progress.mode == Progress::MODE_ACTION {
             return true;
         }
-        if progress.mode != Progress::MODE_IDLE {
-            if let Some(plan) = self.get_plan(robot_id) {
+        if let Some(plan) = self.get_plan(robot_id) {
+            let wp_has_dock_or_action = |wp: &Waypoint| -> bool {
+                !wp.arrival_action.is_empty()
+                    || !wp.departure_action.is_empty()
+                    || self
+                        .dock_registry
+                        .match_target_nodes(&wp.arrival_constraints.nodes)
+                        .is_some()
+            };
+            let wp0_is_undock = plan.waypoints.len() >= 2 && {
+                let start_pos = plan.waypoints[0].position;
+                let next_pos = plan.waypoints[1].position;
+                (next_pos[0] - start_pos[0]).hypot(next_pos[1] - start_pos[1]) > 1e-3
+                    && (self
+                        .dock_registry
+                        .match_target_nodes(&plan.waypoints[0].arrival_constraints.nodes)
+                        .is_some()
+                        || self
+                            .dock_registry
+                            .match_by_position(start_pos[0], start_pos[1], 0.45)
+                            .is_some())
+            };
+
+            if progress.mode != Progress::MODE_IDLE {
                 if let Some(wp) = plan.waypoints.get(progress.target_waypoint as usize) {
-                    if !wp.arrival_action.is_empty() || !wp.departure_action.is_empty() {
+                    if wp_has_dock_or_action(wp) {
                         return true;
                     }
+                }
+                if progress.reached_waypoint == 0 && wp0_is_undock {
+                    return true;
                 }
                 if let Some(wp) = plan.waypoints.get(progress.reached_waypoint as usize) {
                     if !wp.departure_action.is_empty() {
                         return true;
                     }
+                }
+            } else if progress.plan_id != plan.plan_id {
+                // Before the robot has reported Progress for the newly generated plan,
+                // block replans if the very first transition (wp 0 -> wp 1) is a dock/undock action.
+                if wp0_is_undock
+                    || plan
+                        .waypoints
+                        .first()
+                        .is_some_and(|wp0| !wp0.departure_action.is_empty())
+                {
+                    return true;
+                }
+                if plan.waypoints.len() == 2
+                    && plan.waypoints.get(1).is_some_and(wp_has_dock_or_action)
+                {
+                    return true;
                 }
             }
         }
@@ -128,6 +407,12 @@ impl PlanRegistry {
         ];
         let mut path = Vec::new();
         if let Some(plan) = self.get_plan(robot_id) {
+            if progress.plan_id != plan.plan_id && plan.waypoints.len() >= 2 {
+                path.push(plan.waypoints[0].position);
+                path.push(current_pos);
+                path.push(plan.waypoints[1].position);
+                return path;
+            }
             if let Some(reached_wp) = plan.waypoints.get(progress.reached_waypoint as usize) {
                 path.push(reached_wp.position);
             }
@@ -556,5 +841,109 @@ mod tests {
             "Expected robot2 to wait for robot1 to reach progress 2.0, got: {:?}",
             wp0_blockers
         );
+    }
+
+    #[test]
+    fn test_is_executing_action_checks_site_dock_target_node_constraints() {
+        let site_json = r#"{
+            "levels": {
+                "L1": {
+                    "anchors": {
+                        "1": [-1.0, 1.0],
+                        "2": [-1.0, 2.0]
+                    }
+                }
+            },
+            "navigation": {
+                "guided": {
+                    "lanes": {
+                        "10": { "left": 1, "right": 2 }
+                    },
+                    "locations": {
+                        "20": {
+                            "anchor": 2,
+                            "name": "dock_north_1",
+                            "tags": ["Dock"]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let dock_registry = DockRegistry::from_site_json_str(site_json).unwrap();
+        assert_eq!(dock_registry.docks.len(), 1);
+        assert_eq!(dock_registry.docks[0].id, "dock_north_1");
+
+        let mut registry = PlanRegistry::with_dock_registry(dock_registry);
+        let mut footprints: HashMap<String, Arc<dyn Shape>> = HashMap::new();
+        footprints.insert("robot_1".to_string(), Arc::new(Ball::new(0.49)));
+
+        let mut dest = make_destination(9);
+        let mut node = TargetNode::default();
+        node.key.name = vec!["dock_north_1".to_string().into()].try_into().unwrap();
+        dest.constraints.nodes.push(node);
+
+        let mut goals = HashMap::new();
+        goals.insert("robot_1".to_string(), dest);
+        let robot_ids = vec!["robot_1".to_string()];
+        let basic_plan = vec![make_poses(&[[-1.0, 0.0], [-1.0, 1.0], [-1.0, 2.0]])];
+
+        let (plans, _, _) =
+            registry.build_session_plans(&basic_plan, &goals, &robot_ids, &footprints, 1.0);
+        registry.record_session_plans(1, &plans);
+        let generated_plan = registry.get_plan("robot_1").unwrap().clone();
+        assert!(generated_plan.waypoints[2].arrival_action.is_empty());
+        assert_eq!(
+            generated_plan.waypoints[2].arrival_constraints.nodes.len(),
+            1
+        );
+
+        // Moving to intermediate waypoint 1 (not a dock node) -> false
+        let mut progress = Progress::default();
+        progress.plan_id = generated_plan.plan_id.clone();
+        progress.mode = Progress::MODE_NAVIGATING;
+        progress.reached_waypoint = 0;
+        progress.target_waypoint = 1;
+        assert!(!registry.is_executing_action("robot_1", &progress));
+
+        // Moving to final dock waypoint 2 (has dock TargetNode) -> true even before MODE_ACTION
+        progress.reached_waypoint = 1;
+        progress.target_waypoint = 2;
+        assert!(registry.is_executing_action("robot_1", &progress));
+
+        // Once finished and IDLE at waypoint 2 -> false
+        progress.mode = Progress::MODE_IDLE;
+        progress.reached_waypoint = 2;
+        assert!(!registry.is_executing_action("robot_1", &progress));
+
+        // Departing from the dock position (-1.0, 2.0) -> (-1.0, 1.0) -> (-1.0, 0.0)
+        // without stamping departure_action still detects undock via DockRegistry.
+        let mut goals_undock = HashMap::new();
+        goals_undock.insert("robot_1".to_string(), make_destination(10));
+        let basic_plan_undock = vec![make_poses(&[[-1.0, 2.0], [-1.0, 1.0], [-1.0, 0.0]])];
+        let (plans_undock, _, _) = registry.build_session_plans(
+            &basic_plan_undock,
+            &goals_undock,
+            &robot_ids,
+            &footprints,
+            1.0,
+        );
+        registry.record_session_plans(2, &plans_undock);
+        let undock_plan = registry.get_plan("robot_1").unwrap().clone();
+        assert!(undock_plan.waypoints[0].departure_action.is_empty());
+
+        // Before robot_1 updates progress.plan_id, wp 0 -> wp 1 undock blocks replans
+        assert!(registry.is_executing_action("robot_1", &progress));
+
+        // While navigating wp 0 -> wp 1 (undocking), is_executing_action is true
+        progress.plan_id = undock_plan.plan_id.clone();
+        progress.mode = Progress::MODE_NAVIGATING;
+        progress.reached_waypoint = 0;
+        progress.target_waypoint = 1;
+        assert!(registry.is_executing_action("robot_1", &progress));
+
+        // Once at staging waypoint 1 moving to corridor waypoint 2, is_executing_action is false
+        progress.reached_waypoint = 1;
+        progress.target_waypoint = 2;
+        assert!(!registry.is_executing_action("robot_1", &progress));
     }
 }

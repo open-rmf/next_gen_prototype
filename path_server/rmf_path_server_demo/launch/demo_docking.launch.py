@@ -57,6 +57,7 @@ def generate_launch_description():
         executable='rmf_path_server',
         name='rmf_path_server',
         output='both',
+        parameters=[{'site_file': site_file}],
     )
 
     # 2. Start the web spawner & web dashboard hosting server (REST & SSE Bridge)
