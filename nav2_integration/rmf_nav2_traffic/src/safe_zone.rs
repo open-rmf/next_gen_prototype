@@ -1,7 +1,8 @@
 use crate::{
     agent::AmclPose,
     inner_navigation_client::{
-        CancellingInnerNavigation, InnerNavigationAction, InnerNavigationTarget,
+        CancellingInnerNavigation, InnerNavigationAction, InnerNavigationClient,
+        InnerNavigationTarget,
     },
     Nav2Agent,
 };
@@ -973,6 +974,7 @@ fn create_plan_error_publisher(
 
 fn update_incremental_target(
     mut nav_target: EventWriter<InnerNavigationTarget>,
+    mut inner_nav_clients: Query<&mut InnerNavigationClient>,
     mut subscriptions: Query<
         (
             Entity,
@@ -1121,6 +1123,12 @@ fn update_incremental_target(
                             continue;
                         };
                         latest_progress.0 = Some(progress_msg);
+
+                        if let Ok(mut client) = inner_nav_clients.get_mut(e) {
+                            if let Some(existing_goal) = client.goal_mut().as_mut() {
+                                existing_goal.mark_superseded();
+                            }
+                        }
 
                         *current_safe_zone = CurrentSafeZone(Some(safe_zone.clone()));
 

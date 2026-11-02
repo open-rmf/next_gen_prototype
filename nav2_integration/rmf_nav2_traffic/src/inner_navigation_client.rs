@@ -503,6 +503,16 @@ enum CheckExistingGoalResult {
     NoExistingGoal(InnerNavigationRequest),
 }
 
+pub fn is_safe_zone_newer(candidate: &SafeZoneId, current: &SafeZoneId) -> bool {
+    if candidate.plan_id.destination_session.uuid != current.plan_id.destination_session.uuid {
+        return true;
+    }
+    if candidate.plan_id.plan_version != current.plan_id.plan_version {
+        return candidate.plan_id.plan_version > current.plan_id.plan_version;
+    }
+    candidate.safe_zone_version > current.safe_zone_version
+}
+
 /// Checks if there is an existing goal for the requested agent.
 /// If yes, check if the existing goal is outdated, i.e. it has a lower plan or
 /// safe zone version than the new request. If so, cancel the existing goal and
@@ -516,7 +526,6 @@ fn check_existing_goal(
 ) -> Result<CheckExistingGoalResult, InnerNavigationError> {
     // TODO(@xiyuoh) Create a replan mechanism instead of cancelling goal on every
     // new request
-    let mut replan_and_cancel = false;
     let Ok(mut inner_client) = inner_nav_clients.get_mut(request.agent) else {
         return Ok(CheckExistingGoalResult::NoExistingGoal(request));
     };
@@ -528,18 +537,7 @@ fn check_existing_goal(
     // If plan or safe zone version is later, then replan/cancel
     let curr_safe_zone_id = existing_goal.id();
     let next_safe_zone_id = &request.safe_zone_id;
-
-    if next_safe_zone_id.plan_id.destination_session.uuid
-        != curr_safe_zone_id.plan_id.destination_session.uuid
-    {
-        replan_and_cancel = true;
-    } else if next_safe_zone_id.plan_id.plan_version > curr_safe_zone_id.plan_id.plan_version {
-        replan_and_cancel = true;
-    } else if next_safe_zone_id.plan_id.plan_version == curr_safe_zone_id.plan_id.plan_version
-        && next_safe_zone_id.safe_zone_version > curr_safe_zone_id.safe_zone_version
-    {
-        replan_and_cancel = true;
-    }
+    let replan_and_cancel = is_safe_zone_newer(next_safe_zone_id, curr_safe_zone_id);
 
     if replan_and_cancel {
         existing_goal.mark_superseded();
@@ -657,8 +655,10 @@ fn async_request_new_goal(
     }
     let mut inner_nav_client = inner_nav_client_result.unwrap();
 
-    // Reset goal client before submitting new request
-    inner_nav_client.reset_goal();
+    // Mark any existing goal superseded while the new goal request is in flight
+    if let Some(existing_goal) = inner_nav_client.goal_mut().as_mut() {
+        existing_goal.mark_superseded();
+    }
 
     let mut pose = request.target_pose.clone();
     pose.header.frame_id = "map".to_string();
@@ -763,13 +763,22 @@ fn update_goal_client(
     Blocking {
         request: handle, ..
     }: Blocking<CurrentInnerNavigationGoal>,
-    mut inner_nav_clients: Query<&mut InnerNavigationClient>,
+    mut inner_nav_clients: Query<(&mut InnerNavigationClient, Option<&CurrentSafeZone>)>,
 ) -> CurrentInnerNavigationGoal {
-    if let Ok(mut inner_nav_client) = inner_nav_clients.get_mut(handle.request.agent) {
-        *inner_nav_client.goal_mut() = Some(ActiveInnerGoal::new(
+    if let Ok((mut inner_nav_client, current_safe_zone)) =
+        inner_nav_clients.get_mut(handle.request.agent)
+    {
+        let mut active_goal = ActiveInnerGoal::new(
             handle.goal_client.clone(),
             handle.request.safe_zone_id.clone(),
-        ));
+        );
+        if current_safe_zone
+            .and_then(|csz| csz.0.as_ref())
+            .is_some_and(|sz| is_safe_zone_newer(&sz.id, &handle.request.safe_zone_id))
+        {
+            active_goal.mark_superseded();
+        }
+        *inner_nav_client.goal_mut() = Some(active_goal);
     } else {
         warn!(
             "[{:?}] InnerNavigationClient not found!",
@@ -1011,7 +1020,12 @@ fn process_navigation_result(
                     amcl_pose,
                 )) = progress_query.get_mut(target.agent)
                 {
-                    if tracker.plan_id.as_ref() == Some(&target.safe_zone_id.plan_id) {
+                    let matches_current_safe_zone = current_safe_zone
+                        .and_then(|csz| csz.0.as_ref())
+                        .is_none_or(|sz| sz.id == target.safe_zone_id);
+                    if matches_current_safe_zone
+                        && tracker.plan_id.as_ref() == Some(&target.safe_zone_id.plan_id)
+                    {
                         if matches!(
                             target.action,
                             InnerNavigationAction::DockRobot { .. }
@@ -1068,11 +1082,19 @@ fn process_navigation_result(
                     .get(target.agent)
                     .ok()
                     .and_then(|inner_client| inner_client.goal().as_ref());
+                let matches_current_safe_zone = progress_query
+                    .get(target.agent)
+                    .ok()
+                    .and_then(|(_, _, _, current_safe_zone, _)| current_safe_zone)
+                    .and_then(|csz| csz.0.as_ref())
+                    .is_none_or(|sz| sz.id == target.safe_zone_id);
 
-                if !should_publish_path_blocked(
-                    &target.safe_zone_id,
-                    active_goal.map(|goal| (goal.id(), goal.is_superseded())),
-                ) {
+                if !matches_current_safe_zone
+                    || !should_publish_path_blocked(
+                        &target.safe_zone_id,
+                        active_goal.map(|goal| (goal.id(), goal.is_superseded())),
+                    )
+                {
                     info!(
                         "[{:?}] Ignoring stale Nav2 abort {:?}",
                         target.agent.index(),
@@ -1240,5 +1262,15 @@ mod tests {
         let completed = safe_zone_id(1, 3, 7);
 
         assert!(!should_publish_path_blocked(&completed, None));
+    }
+
+    #[test]
+    fn safe_zone_version_and_session_ordering() {
+        let base = safe_zone_id(1, 0, 1);
+        assert!(!is_safe_zone_newer(&base, &base));
+        assert!(is_safe_zone_newer(&safe_zone_id(1, 0, 2), &base));
+        assert!(!is_safe_zone_newer(&base, &safe_zone_id(1, 0, 2)));
+        assert!(is_safe_zone_newer(&safe_zone_id(1, 1, 0), &base));
+        assert!(is_safe_zone_newer(&safe_zone_id(2, 0, 0), &base));
     }
 }
