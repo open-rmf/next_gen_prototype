@@ -1,5 +1,6 @@
 use crate::{
     agent::AmclPose,
+    navigation_server::{AgentPose, CancelledNavigationSessions},
     safe_zone::{
         build_progress_status, CurrentSafeZone, LatestProgress, PlanErrorPublisher,
         ProgressPublisher, ProgressTracker,
@@ -42,12 +43,12 @@ pub enum InnerNavigationAction {
 
 #[derive(Clone, Debug, Event)]
 pub struct InnerNavigationTarget {
-    agent: Entity,
-    safe_zone_id: SafeZoneId,
-    x: f64,
-    y: f64,
-    yaw: f64,
-    action: InnerNavigationAction,
+    pub agent: Entity,
+    pub safe_zone_id: SafeZoneId,
+    pub x: f64,
+    pub y: f64,
+    pub yaw: f64,
+    pub action: InnerNavigationAction,
 }
 
 impl InnerNavigationTarget {
@@ -200,7 +201,8 @@ impl Plugin for InnerNavigationClientPlugin {
         app.add_event::<InnerNavigationTarget>()
             .add_event::<InnerNavigationFeedback>()
             .add_event::<CancelInnerForAgent>()
-            .add_observer(create_inner_navigation_client);
+            .add_observer(create_inner_navigation_client)
+            .add_observer(record_inner_navigation_feedback);
 
         // Initialize Navigation services
         let navigation_services = InnerNavigationServices::from_app(app);
@@ -260,7 +262,8 @@ struct CurrentInnerNavigationGoal {
 struct CancelInnerNavigation {
     agent: Entity,
     new_request: Option<InnerNavigationRequest>,
-    cancel_client: InnerGoalClient,
+    cancel_client: Option<InnerGoalClient>,
+    nav_action_client: Option<Arc<RosActionClient<NavigateToPose>>>,
 }
 
 #[derive(Clone)]
@@ -503,16 +506,22 @@ fn await_external_cancellation(
         let Ok(mut inner_client) = inner_nav_clients.get_mut(request.agent) else {
             continue;
         };
-        let Some(existing_goal) = inner_client.goal_mut().as_mut() else {
-            continue;
+        let nav_action_client = Some(Arc::clone(&inner_client.action_client));
+        let cancel_client = if let Some(existing_goal) = inner_client.goal_mut().as_mut() {
+            existing_goal.mark_superseded();
+            Some(existing_goal.client().clone())
+        } else {
+            None
         };
-        existing_goal.mark_superseded();
-        let client = existing_goal.client().clone();
+        if cancel_client.is_none() && inner_client.last_action.is_none() {
+            continue;
+        }
         orders.for_each(|order| {
             order.streams().send(CancelInnerNavigation {
                 agent: request.agent,
                 new_request: None,
-                cancel_client: client.clone(),
+                cancel_client: cancel_client.clone(),
+                nav_action_client: nav_action_client.clone(),
             })
         });
     }
@@ -544,7 +553,20 @@ pub fn is_safe_zone_newer(candidate: &SafeZoneId, current: &SafeZoneId) -> bool 
 fn check_existing_goal(
     Blocking { request, .. }: Blocking<InnerNavigationRequest>,
     mut inner_nav_clients: Query<&mut InnerNavigationClient>,
+    cancelled_sessions: Query<&CancelledNavigationSessions>,
 ) -> Result<CheckExistingGoalResult, InnerNavigationError> {
+    if cancelled_sessions
+        .get(request.agent)
+        .is_ok_and(|cancelled| {
+            cancelled.contains(&request.safe_zone_id.plan_id.destination_session)
+        })
+    {
+        return Err(InnerNavigationError {
+            handle: None,
+            kind: InnerNavigationErrorKind::DuplicateOrOutdatedRequestError,
+        });
+    }
+
     // TODO(@xiyuoh) Create a replan mechanism instead of cancelling goal on every
     // new request
     let Ok(mut inner_client) = inner_nav_clients.get_mut(request.agent) else {
@@ -574,12 +596,13 @@ fn check_existing_goal(
         }
         // When switching between different action servers (e.g. NavigateToPose <-> DockRobot),
         // cancel the existing action server's goal before dispatching to the other server.
-        let cancel_client = existing_goal.client().clone();
+        let cancel_client = Some(existing_goal.client().clone());
         return Ok(CheckExistingGoalResult::ReplanAndCancel(
             CancelInnerNavigation {
                 agent: request.agent,
                 new_request: Some(request),
                 cancel_client,
+                nav_action_client: None,
             },
         ));
     }
@@ -625,7 +648,16 @@ fn async_cancel_goal(
     }
     executor_commands
         .run(async move {
-            let accepted = request.cancel_client.is_cancellation_accepted().await;
+            let mut accepted = false;
+            if let Some(cancel_client) = &request.cancel_client {
+                accepted = cancel_client.is_cancellation_accepted().await;
+            }
+            if let Some(nav_action_client) = &request.nav_action_client {
+                let mut cancel_req = nav_action_client.cancel_all_goals();
+                if (&mut *cancel_req).await.is_ok() {
+                    accepted = true;
+                }
+            }
             if !accepted {
                 warn!(
                     "[{}] Cancellation request rejected for inner navigation, it may have already completed.",
@@ -647,7 +679,7 @@ fn async_cancel_goal(
                 );
                 return Err(InnerNavigationError {
                     handle: None,
-                    kind: InnerNavigationErrorKind::CancelGoalError,
+                    kind: InnerNavigationErrorKind::GoalCancelledError,
                 });
             }
         })
@@ -815,10 +847,17 @@ fn update_goal_client(
         request: handle, ..
     }: Blocking<CurrentInnerNavigationGoal>,
     mut inner_nav_clients: Query<(&mut InnerNavigationClient, Option<&CurrentSafeZone>)>,
+    cancelled_sessions: Query<&CancelledNavigationSessions>,
+    mut cancel_inner_for_agent: EventWriter<CancelInnerForAgent>,
 ) -> CurrentInnerNavigationGoal {
     if let Ok((mut inner_nav_client, current_safe_zone)) =
         inner_nav_clients.get_mut(handle.request.agent)
     {
+        let is_session_cancelled = cancelled_sessions
+            .get(handle.request.agent)
+            .is_ok_and(|cancelled| {
+                cancelled.contains(&handle.request.safe_zone_id.plan_id.destination_session)
+            });
         let mut active_goal = ActiveInnerGoal::new(
             handle.goal_client.clone(),
             handle.request.safe_zone_id.clone(),
@@ -830,6 +869,11 @@ fn update_goal_client(
             active_goal.mark_superseded();
         }
         *inner_nav_client.goal_mut() = Some(active_goal);
+        if is_session_cancelled {
+            cancel_inner_for_agent.write(CancelInnerForAgent {
+                agent: handle.request.agent,
+            });
+        }
     } else {
         warn!(
             "[{:?}] InnerNavigationClient not found!",
@@ -841,7 +885,11 @@ fn update_goal_client(
 
 /// Logs any errors that occur during the inner navigation workflow.
 fn log_inner_navigation_error(Blocking { request: err, .. }: Blocking<InnerNavigationError>) {
-    error!("InnerNavigationError occurred: {}", err.kind);
+    if matches!(err.kind, InnerNavigationErrorKind::GoalCancelledError) {
+        debug!("Inner navigation goal cancelled: {}", err.kind);
+    } else {
+        error!("InnerNavigationError occurred: {}", err.kind);
+    }
 }
 
 #[derive(Clone, Event)]
@@ -859,6 +907,29 @@ impl InnerNavigationFeedback {
             feedback,
         }
     }
+}
+
+#[derive(Component, Clone, Default)]
+pub struct LatestInnerFeedbackPose(pub Option<PoseStamped>);
+
+fn record_inner_navigation_feedback(
+    trigger: Trigger<InnerNavigationFeedback>,
+    mut commands: Commands,
+    inner_nav_clients: Query<&InnerNavigationClient>,
+) {
+    let event = trigger.event();
+    if let Ok(inner_nav_client) = inner_nav_clients.get(event.agent) {
+        if let Some(active_goal) = inner_nav_client.goal() {
+            if active_goal.id() != &event.safe_zone_id {
+                return;
+            }
+        }
+    }
+    commands
+        .entity(event.agent)
+        .insert(LatestInnerFeedbackPose(Some(
+            event.feedback.current_pose.clone(),
+        )));
 }
 
 /// Monitors the feedback of an ongoing navigation goal, and publish it back
@@ -1047,11 +1118,14 @@ fn process_navigation_result(
     inner_nav_clients: Query<&InnerNavigationClient>,
     plan_error_publishers: Query<&PlanErrorPublisher>,
     mut progress_query: Query<(
+        &Nav2Agent,
         &mut ProgressTracker,
         &ProgressPublisher,
         &mut LatestProgress,
         Option<&CurrentSafeZone>,
         Option<&AmclPose>,
+        Option<&AgentPose>,
+        Option<&LatestInnerFeedbackPose>,
     )>,
 ) -> Result<InnerNavigationRequest, InnerNavigationResult> {
     match result {
@@ -1064,11 +1138,14 @@ fn process_navigation_result(
                 .is_some_and(|goal| goal.id() == &target.safe_zone_id && !goal.is_superseded());
             if is_current {
                 if let Ok((
+                    agent,
                     mut tracker,
                     progress_pub,
                     mut latest_progress,
                     current_safe_zone,
                     amcl_pose,
+                    agent_pose,
+                    latest_fb_pose,
                 )) = progress_query.get_mut(target.agent)
                 {
                     let matches_current_safe_zone = current_safe_zone
@@ -1084,7 +1161,12 @@ fn process_navigation_result(
                         ) {
                             tracker.mark_action_completed();
                         }
-                        let current_pose = amcl_pose.map(|p| p.xy_yaw());
+                        let fb_pose = latest_fb_pose.and_then(|p| p.0.as_ref());
+                        let current_pose = amcl_pose
+                            .filter(|_| agent.localized)
+                            .map(|p| p.xy_yaw())
+                            .or_else(|| fb_pose.map(|p| AgentPose(p.clone()).xy_yaw()))
+                            .or_else(|| agent_pose.map(|p| p.xy_yaw()));
                         if !tracker.is_target_pose_satisfied(current_pose) {
                             warn!(
                                 "[{:?}] Nav2 reported goal succeeded before target pose was satisfied (current={:?}); retrying goal {:?}.",
@@ -1098,10 +1180,13 @@ fn process_navigation_result(
                             tracker.mark_target_reached(latest_progress.0.as_ref())
                         {
                             let pose = amcl_pose
+                                .filter(|_| agent.localized)
                                 .map(|p| PoseStamped {
                                     header: p.0.header.clone(),
                                     pose: p.0.pose.pose.clone(),
                                 })
+                                .or_else(|| fb_pose.cloned())
+                                .or_else(|| agent_pose.map(|p| p.0.clone()))
                                 .unwrap_or_default();
                             let sz_id = current_safe_zone
                                 .and_then(|csz| csz.0.as_ref().map(|sz| &sz.id))
@@ -1136,7 +1221,7 @@ fn process_navigation_result(
                 let matches_current_safe_zone = progress_query
                     .get(target.agent)
                     .ok()
-                    .and_then(|(_, _, _, current_safe_zone, _)| current_safe_zone)
+                    .and_then(|(_, _, _, _, current_safe_zone, _, _, _)| current_safe_zone)
                     .and_then(|csz| csz.0.as_ref())
                     .is_none_or(|sz| sz.id == target.safe_zone_id);
 

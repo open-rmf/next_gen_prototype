@@ -4,6 +4,7 @@ use crate::{
         CancellingInnerNavigation, InnerNavigationAction, InnerNavigationClient,
         InnerNavigationTarget,
     },
+    navigation_server::{CancelledNavigationSessions, CurrentNavigationRequest},
     Nav2Agent,
 };
 use bevy::prelude::*;
@@ -972,28 +973,28 @@ fn create_plan_error_publisher(
     });
 }
 
-fn update_incremental_target(
+pub(crate) fn update_incremental_target(
+    mut commands: Commands,
     mut nav_target: EventWriter<InnerNavigationTarget>,
+    mut current_nav_requests: Query<&mut CurrentNavigationRequest>,
+    mut cancelled_sessions: Query<&mut CancelledNavigationSessions>,
     mut inner_nav_clients: Query<&mut InnerNavigationClient>,
-    mut subscriptions: Query<
-        (
-            Entity,
-            &SafeZoneSubscription,
-            &PlanSubscription,
-            &GateReleaseSubscription,
-            &CostmapPublisher,
-            &CostmapUpdatedSubscription,
-            &mut CostmapHandshakeState,
-            &ProgressPublisher,
-            &mut LatestProgress,
-            &mut ProgressTracker,
-            &mut CurrentSafeZone,
-            &mut CurrentPlan,
-            Option<&AmclPose>,
-            &Nav2Agent,
-        ),
-        Without<CancellingInnerNavigation>,
-    >,
+    mut subscriptions: Query<(
+        Entity,
+        &SafeZoneSubscription,
+        &PlanSubscription,
+        &GateReleaseSubscription,
+        &CostmapPublisher,
+        &CostmapUpdatedSubscription,
+        &mut CostmapHandshakeState,
+        &ProgressPublisher,
+        &mut LatestProgress,
+        &mut ProgressTracker,
+        &mut CurrentSafeZone,
+        &mut CurrentPlan,
+        Option<&AmclPose>,
+        &Nav2Agent,
+    )>,
 ) {
     for (
         e,
@@ -1024,10 +1025,13 @@ fn update_incremental_target(
         if gate_released {
             progress_tracker.release_gate();
             if progress_tracker.plan_id.is_some() {
-                let current_pose = amcl_pose.map(|p| p.xy_yaw());
+                let current_pose = amcl_pose
+                    .filter(|_| agent.localized)
+                    .map(|p| p.xy_yaw());
                 let updated_prog =
                     progress_tracker.compute_progress(current_pose, latest_progress.0.as_ref());
                 let pose = amcl_pose
+                    .filter(|_| agent.localized)
                     .map(|p| PoseStamped {
                         header: p.0.header.clone(),
                         pose: p.0.pose.pose.clone(),
@@ -1062,6 +1066,46 @@ fn update_incremental_target(
         if let Some(safe_zone) = latest_safe_zone {
             if !current_safe_zone.matches(&safe_zone) && is_valid(&safe_zone) {
                 if let Some((target_x, target_y, target_yaw)) = next_target(&safe_zone) {
+                    let incoming_plan_id = &safe_zone.id.plan_id;
+                    let incoming_session = &incoming_plan_id.destination_session;
+
+                    if cancelled_sessions
+                        .get(e)
+                        .is_ok_and(|cancelled| cancelled.contains(incoming_session))
+                    {
+                        debug!(
+                            "[{:?}] Ignoring SafeZone for cancelled destination_session {:?}",
+                            agent.name, incoming_plan_id
+                        );
+                        continue;
+                    }
+
+                    if let Ok(mut current_nav_req) = current_nav_requests.get_mut(e) {
+                        if current_nav_req.session() == incoming_session {
+                            current_nav_req.clear_superseded_sessions();
+                        } else if current_nav_req.is_superseded_session(incoming_session) {
+                            continue;
+                        } else {
+                            info!(
+                                "[{:?}] Cancelling active NavigationRequest {:?} due to SafeZone plan_id {:?}",
+                                agent.name,
+                                current_nav_req.plan_id(),
+                                incoming_plan_id
+                            );
+                            if let Ok(mut cancelled) = cancelled_sessions.get_mut(e) {
+                                for session in current_nav_req.superseded_sessions() {
+                                    cancelled.insert(session.clone());
+                                }
+                                cancelled.insert(current_nav_req.session().clone());
+                            }
+                            current_nav_req.cancel();
+                            commands
+                                .entity(e)
+                                .remove::<CurrentNavigationRequest>()
+                                .remove::<CancellingInnerNavigation>();
+                        }
+                    }
+
                     handshake.next_seq += 1;
                     let seq = handshake.next_seq;
                     let mut costmap = safe_zone.costmap.clone();
@@ -1073,7 +1117,9 @@ fn update_incremental_target(
                         continue;
                     }
 
-                    let current_pose = amcl_pose.map(|p| p.xy_yaw());
+                    let current_pose = amcl_pose
+                        .filter(|_| agent.localized)
+                        .map(|p| p.xy_yaw());
 
                     let base_progress = progress_tracker.on_safe_zone_with_plan(
                         &safe_zone,
@@ -1082,6 +1128,7 @@ fn update_incremental_target(
                         latest_progress.0.as_ref(),
                     );
                     let pose = amcl_pose
+                        .filter(|_| agent.localized)
                         .map(|p| PoseStamped {
                             header: p.0.header.clone(),
                             pose: p.0.pose.pose.clone(),
@@ -1157,15 +1204,27 @@ fn update_incremental_target(
             .as_ref()
             .is_some_and(|pending| acked_seq >= pending.required_seq)
         {
-            let pending = handshake.pending_target.take().unwrap();
-            let (tx, ty, tyaw) = pending.target_xy_yaw;
-            info!(
-                "[{:?}] Costmap (seq={}) applied, dispatching SafeZone target: ({:.2}, {:.2}, {:.2})",
-                agent.name, pending.required_seq, tx, ty, tyaw
-            );
-            nav_target.write(pending.target);
+            if handshake.pending_target.as_ref().is_some_and(|pending| {
+                cancelled_sessions.get(e).is_ok_and(|cancelled| {
+                    cancelled.contains(&pending.target.safe_zone_id.plan_id.destination_session)
+                })
+            }) {
+                handshake.pending_target = None;
+            } else {
+                let pending = handshake.pending_target.take().unwrap();
+                let (tx, ty, tyaw) = pending.target_xy_yaw;
+                info!(
+                    "[{:?}] Costmap (seq={}) applied, dispatching SafeZone target: ({:.2}, {:.2}, {:.2})",
+                    agent.name, pending.required_seq, tx, ty, tyaw
+                );
+                nav_target.write(pending.target);
+            }
         } else if let Some(pending) = handshake.pending_target.as_mut() {
-            if pending.last_published.elapsed() >= Duration::from_millis(500) {
+            if cancelled_sessions.get(e).is_ok_and(|cancelled| {
+                cancelled.contains(&pending.target.safe_zone_id.plan_id.destination_session)
+            }) {
+                handshake.pending_target = None;
+            } else if pending.last_published.elapsed() >= Duration::from_millis(500) {
                 let _ = costmap_pub.publisher.publish(pending.costmap.clone());
                 pending.last_published = Instant::now();
             }
