@@ -5,8 +5,8 @@ edition = "2021"
 
 [dependencies]
 futures = "0.3.32"
-rclrs = "*"
-ros-env = "0.2.0"
+rclrs = "0.7.0"
+ros-env = "=0.2.0"
 rmf_participant_discovery = { path = "../../rmf_participant_discovery" }
 
 serde = { version = "1.0", features = ["derive"] }

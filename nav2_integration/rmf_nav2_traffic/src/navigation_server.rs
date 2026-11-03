@@ -4,6 +4,7 @@ use crate::{
         CancelInnerForAgent, CancellingInnerNavigation, InnerNavigationClient,
         InnerNavigationFeedback,
     },
+    safe_zone::{CurrentSafeZone, ProgressPublisher, SafeZoneSubscription},
     Nav2Agent,
 };
 use bevy::prelude::*;
@@ -15,7 +16,8 @@ use ros_env::{
     geometry_msgs::msg::PoseStamped,
     nav2_msgs::action::{NavigateToPose, NavigateToPose_Feedback, NavigateToPose_Result},
     rmf_prototype_msgs::msg::{
-        DestinationConstraints, DestinationGoal, PlanId, Region, TargetOrientation, TargetRegion,
+        DestinationConstraints, DestinationGoal, PlanId, Progress, Region, TargetOrientation,
+        TargetRegion,
     },
     unique_identifier_msgs::msg::UUID as RosUuid,
 };
@@ -470,11 +472,31 @@ fn cleanup_navigation(
     mut commands: Commands,
     mut nav_completed: EventReader<NavigationCompleted>,
     current_nav_requests: Query<&CurrentNavigationRequest>,
+    safe_zones: Query<(&SafeZoneSubscription, &CurrentSafeZone, &ProgressPublisher)>,
 ) {
     for event in nav_completed.read() {
         if current_nav_requests.get(event.agent).is_ok_and(|req| {
             req.request.agent == event.agent && req.request.plan_id == event.plan_id
         }) {
+            // Publish final Progress message to indicate path completion
+            if let Ok((safe_zone_sub, current_safe_zone, progress_pub)) =
+                safe_zones.get(event.agent)
+            {
+                if let Some(safe_zone) = safe_zone_sub
+                    .subscriber
+                    .data_callback()
+                    .or_else(|| current_safe_zone.0.clone())
+                {
+                    let target_wp = safe_zone.target_waypoint.first().copied().unwrap_or(0);
+                    let _ = progress_pub.publisher.publish(Progress {
+                        progress: safe_zone.target_progress,
+                        reached_waypoint: target_wp,
+                        target_waypoint: target_wp,
+                        reached_keys: vec![],
+                        plan_id: safe_zone.id.plan_id.clone(),
+                    });
+                }
+            }
             commands
                 .entity(event.agent)
                 .remove::<CurrentNavigationRequest>()

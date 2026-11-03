@@ -9,4 +9,4 @@ name = "bevy_ros2"
 [dependencies]
 bevy = "0.16"
 futures = "0.3"
-rclrs = "0.7"
+rclrs = "0.7.0"

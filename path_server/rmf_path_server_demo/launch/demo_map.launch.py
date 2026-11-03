@@ -13,13 +13,15 @@
 # limitations under the License.
 
 import os
+
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
 
+
 def generate_launch_description():
     package_name = 'rmf_path_server_demo'
-    
+
     # Map file path
     map_yaml_file = os.path.join(
         get_package_share_directory(package_name),
