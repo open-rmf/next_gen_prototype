@@ -111,9 +111,34 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_ok_response(config or {})
             return
 
+        elif self.path == '/site_file':
+            config_path = spawner_node.config_file if spawner_node else ''
+            if config_path and os.path.exists(config_path):
+                with open(config_path, 'rb') as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_error_response('Site file not found')
+            return
+
         elif self.path.startswith('/map'):
             map_data = spawner_node.current_map if spawner_node else None
-            self.send_ok_response(map_data or {})
+            if map_data:
+                self.send_ok_response(map_data)
+            elif spawner_node and spawner_node.config_file and os.path.exists(spawner_node.config_file):
+                with open(spawner_node.config_file, 'rb') as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_ok_response({})
             return
         elif self.path.startswith('/config'):
             use_dest = spawner_node.use_destination_server if spawner_node else False
@@ -175,6 +200,8 @@ class RobotSpawnerNode(Node):
         self.get_logger().info('Initializing Robot Spawner & HTTP Bridge Node...')
 
         # Parameters
+        self.declare_parameter('config_file', '')
+        self.config_file = self.get_parameter('config_file').value
         self.declare_parameter('use_destination_server', False)
         self.use_destination_server = self.get_parameter('use_destination_server').value
         self.declare_parameter('port', 8080)

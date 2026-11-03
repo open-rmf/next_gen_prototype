@@ -61,7 +61,10 @@ def generate_launch_description():
         executable='robot_spawner',
         name='robot_spawner',
         output='both',
-        parameters=[{'use_destination_server': True}]
+        parameters=[{
+            'use_destination_server': True,
+            'config_file': config_file,
+        }]
     )
 
     # 3. Start exactly one selectable destination implementation.
@@ -93,6 +96,14 @@ def generate_launch_description():
         output='both'
     )
 
+    # 5. Start the ROSBridge WebSocket Server
+    rosbridge_server = Node(
+        package='rosbridge_server',
+        executable='rosbridge_websocket',
+        name='rosbridge_websocket',
+        output='both'
+    )
+
     return LaunchDescription([
         declare_destination_server,
         declare_config_file,
@@ -100,5 +111,6 @@ def generate_launch_description():
         robot_spawner,
         simple_destination_server,
         reservation_destination_server,
-        plan_executor
+        plan_executor,
+        rosbridge_server
     ])

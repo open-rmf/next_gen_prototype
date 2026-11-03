@@ -41,8 +41,17 @@ def generate_launch_description():
         output='both'
     )
 
+    # 4. Start the ROSBridge WebSocket Server
+    rosbridge_server = Node(
+        package='rosbridge_server',
+        executable='rosbridge_websocket',
+        name='rosbridge_websocket',
+        output='both'
+    )
+
     return LaunchDescription([
         path_server,
         robot_spawner,
-        plan_executor
+        plan_executor,
+        rosbridge_server
     ])
