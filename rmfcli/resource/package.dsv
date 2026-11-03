@@ -1,0 +1,3 @@
+source;share/rmfcli/environment/rmf-argcomplete.bash
+source;share/rmfcli/environment/rmf-argcomplete.fish
+source;share/rmfcli/environment/rmf-argcomplete.zsh
