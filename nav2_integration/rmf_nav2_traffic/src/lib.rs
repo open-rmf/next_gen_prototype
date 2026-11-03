@@ -18,6 +18,8 @@
 use bevy::prelude::*;
 use bevy_ros2::RclrsPlugin;
 use crossflow::CrossflowPlugin;
+use serde::Deserialize;
+use std::collections::HashMap;
 
 pub mod agent;
 pub use agent::*;
@@ -34,6 +36,21 @@ pub use navigation_server::*;
 pub mod safe_zone;
 pub use safe_zone::*;
 
+#[derive(Deserialize, Debug, Default, Clone)]
+pub struct AgentConfigEntry {
+    // TODO(@xiyuoh) add configurable agent-specific fields here when we need it
+}
+
+#[derive(Deserialize, Debug)]
+pub struct AgentConfig {
+    pub agents: HashMap<String, Option<AgentConfigEntry>>,
+}
+
+#[derive(Resource, Debug, Clone)]
+pub struct ConfiguredAgents {
+    pub names: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct Nav2TrafficPlugin {}
 
@@ -46,12 +63,14 @@ impl Plugin for Nav2TrafficPlugin {
                 InnerNavigationClientPlugin::default(),
                 NavigationServerPlugin::default(),
                 Nav2AgentPlugin::default(),
-            ));
+            ))
+            .add_systems(Startup, spawn_configured_agents);
+    }
+}
 
-        // Spawn agents last
-        let agent_names = vec!["robot0".to_string(), "robot1".to_string()];
-        for name in agent_names {
-            app.world_mut().spawn(Nav2Agent::new(name));
-        }
+fn spawn_configured_agents(mut commands: Commands, configured_agents: Res<ConfiguredAgents>) {
+    for name in &configured_agents.names {
+        info!("Spawning configured agent: {}", name);
+        commands.spawn(Nav2Agent::new(name.clone()));
     }
 }

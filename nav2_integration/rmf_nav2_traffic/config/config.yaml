@@ -1,0 +1,4 @@
+agents:
+  robot0:
+    # TODO(@xiyuoh) add other configurable fields
+  robot1:
