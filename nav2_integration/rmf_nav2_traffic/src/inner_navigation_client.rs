@@ -91,9 +91,27 @@ pub enum InnerGoalClient {
 impl InnerGoalClient {
     pub async fn is_cancellation_accepted(&self) -> bool {
         match self {
-            Self::NavigateToPose(c) => c.cancellation.cancel().await.is_accepted(),
-            Self::DockRobot(c) => c.cancellation.cancel().await.is_accepted(),
-            Self::UndockRobot(c) => c.cancellation.cancel().await.is_accepted(),
+            Self::NavigateToPose(c) => {
+                let accepted = c.cancellation.cancel().await.is_accepted();
+                if accepted {
+                    let _ = c.result.clone().await;
+                }
+                accepted
+            }
+            Self::DockRobot(c) => {
+                let accepted = c.cancellation.cancel().await.is_accepted();
+                if accepted {
+                    let _ = c.result.clone().await;
+                }
+                accepted
+            }
+            Self::UndockRobot(c) => {
+                let accepted = c.cancellation.cancel().await.is_accepted();
+                if accepted {
+                    let _ = c.result.clone().await;
+                }
+                accepted
+            }
         }
     }
 }
@@ -142,6 +160,8 @@ pub struct InnerNavigationClient {
     pub undock_action_client: Arc<RosActionClient<UndockRobot>>,
     // The ongoing action goal (if any)
     pub active_goal: Option<ActiveInnerGoal>,
+    // The action type of the most recently dispatched goal
+    pub last_action: Option<InnerNavigationAction>,
 }
 
 impl InnerNavigationClient {
@@ -155,6 +175,7 @@ impl InnerNavigationClient {
             dock_action_client,
             undock_action_client,
             active_goal: None,
+            last_action: None,
         }
     }
 
@@ -656,87 +677,117 @@ fn async_request_new_goal(
     let mut inner_nav_client = inner_nav_client_result.unwrap();
 
     // Mark any existing goal superseded while the new goal request is in flight
+    let had_active_goal = inner_nav_client.goal().is_some();
     if let Some(existing_goal) = inner_nav_client.goal_mut().as_mut() {
         existing_goal.mark_superseded();
     }
+    let prev_action = inner_nav_client
+        .last_action
+        .replace(request.action.clone());
 
     let mut pose = request.target_pose.clone();
     pose.header.frame_id = "map".to_string();
 
-    enum PendingActionGoal {
-        NavigateToPose(RequestedGoalClient<NavigateToPose>),
-        DockRobot(RequestedGoalClient<DockRobot>),
-        UndockRobot(RequestedGoalClient<UndockRobot>),
-    }
-
-    let pending_goal = match &request.action {
-        InnerNavigationAction::NavigateToPose => {
-            debug!(
-                "[{:?}] Requesting new NavigateToPose goal to pose [{}, {}]",
-                request.agent.index(),
-                pose.pose.position.x,
-                pose.pose.position.y
-            );
-            PendingActionGoal::NavigateToPose(
-                inner_nav_client
-                    .action_client
-                    .request_goal(NavigateToPose_Goal { pose, ..default() }),
-            )
-        }
-        InnerNavigationAction::DockRobot {
-            use_dock_id,
-            dock_id,
-            dock_type,
-            navigate_to_staging_pose,
-        } => {
-            info!(
-                "[{:?}] Requesting new DockRobot goal (use_dock_id={}, dock_id='{}', dock_type='{}', navigate_to_staging_pose={}) to pose [{}, {}]",
-                request.agent.index(),
-                use_dock_id,
-                dock_id,
-                dock_type,
-                navigate_to_staging_pose,
-                pose.pose.position.x,
-                pose.pose.position.y
-            );
-            let dock_goal = DockRobot_Goal {
-                use_dock_id: *use_dock_id,
-                dock_id: dock_id.clone(),
-                dock_pose: pose,
-                dock_type: dock_type.clone(),
-                max_staging_time: 1000.0,
-                navigate_to_staging_pose: *navigate_to_staging_pose,
-            };
-            PendingActionGoal::DockRobot(
-                inner_nav_client.dock_action_client.request_goal(dock_goal),
-            )
-        }
-        InnerNavigationAction::UndockRobot { dock_type } => {
-            info!(
-                "[{:?}] Requesting new UndockRobot goal (dock_type='{}')",
-                request.agent.index(),
-                dock_type
-            );
-            let undock_goal = UndockRobot_Goal {
-                dock_type: dock_type.clone(),
-                max_undocking_time: 30.0,
-            };
-            PendingActionGoal::UndockRobot(
-                inner_nav_client
-                    .undock_action_client
-                    .request_goal(undock_goal),
-            )
-        }
-    };
+    let nav_action_client = Arc::clone(&inner_nav_client.action_client);
+    let dock_action_client = Arc::clone(&inner_nav_client.dock_action_client);
+    let undock_action_client = Arc::clone(&inner_nav_client.undock_action_client);
 
     executor_commands
         .run(async move {
-            let goal_client = match pending_goal {
-                PendingActionGoal::NavigateToPose(req) => {
+            // If we are switching action servers and `active_goal` was None when
+            // `check_existing_goal` ran (e.g. a previous goal was still in flight),
+            // ensure the previous action server has no lingering active goals so
+            // `bt_navigator` and `docking_server` never fight over `cmd_vel`.
+            if !had_active_goal {
+                let switching_from_nav = matches!(
+                    prev_action,
+                    Some(InnerNavigationAction::NavigateToPose)
+                ) && !matches!(
+                    request.action,
+                    InnerNavigationAction::NavigateToPose
+                );
+                let switching_from_dock = matches!(
+                    prev_action,
+                    Some(InnerNavigationAction::DockRobot { .. })
+                ) && !matches!(
+                    request.action,
+                    InnerNavigationAction::DockRobot { .. }
+                );
+                let switching_from_undock = matches!(
+                    prev_action,
+                    Some(InnerNavigationAction::UndockRobot { .. })
+                ) && !matches!(
+                    request.action,
+                    InnerNavigationAction::UndockRobot { .. }
+                );
+                if switching_from_nav {
+                    let mut cancel_req = nav_action_client.cancel_all_goals();
+                    let _ = (&mut *cancel_req).await;
+                } else if switching_from_dock {
+                    let mut cancel_req = dock_action_client.cancel_all_goals();
+                    let _ = (&mut *cancel_req).await;
+                } else if switching_from_undock {
+                    let mut cancel_req = undock_action_client.cancel_all_goals();
+                    let _ = (&mut *cancel_req).await;
+                }
+            }
+
+            // Call `request_goal` inside `executor_commands.run` so it executes on
+            // the single-threaded `BasicExecutorRuntime` thread. Calling `request_goal`
+            // from the Bevy thread can race with `execute_goal_response` on the rclrs
+            // executor thread before `pending_goal_clients.insert(seq, ...)` completes.
+            let goal_client = match &request.action {
+                InnerNavigationAction::NavigateToPose => {
+                    debug!(
+                        "[{:?}] Requesting new NavigateToPose goal to pose [{}, {}]",
+                        request.agent.index(),
+                        pose.pose.position.x,
+                        pose.pose.position.y
+                    );
+                    let req =
+                        nav_action_client.request_goal(NavigateToPose_Goal { pose, ..default() });
                     req.await.map(InnerGoalClient::NavigateToPose)
                 }
-                PendingActionGoal::DockRobot(req) => req.await.map(InnerGoalClient::DockRobot),
-                PendingActionGoal::UndockRobot(req) => req.await.map(InnerGoalClient::UndockRobot),
+                InnerNavigationAction::DockRobot {
+                    use_dock_id,
+                    dock_id,
+                    dock_type,
+                    navigate_to_staging_pose,
+                } => {
+                    info!(
+                        "[{:?}] Requesting new DockRobot goal (use_dock_id={}, dock_id='{}', dock_type='{}', navigate_to_staging_pose={}) to pose [{}, {}]",
+                        request.agent.index(),
+                        use_dock_id,
+                        dock_id,
+                        dock_type,
+                        navigate_to_staging_pose,
+                        pose.pose.position.x,
+                        pose.pose.position.y
+                    );
+                    let dock_goal = DockRobot_Goal {
+                        use_dock_id: *use_dock_id,
+                        dock_id: dock_id.clone(),
+                        dock_type: dock_type.clone(),
+                        dock_pose: pose,
+                        max_staging_time: 1000.0,
+                        navigate_to_staging_pose: *navigate_to_staging_pose,
+                    };
+                    let req = dock_action_client.request_goal(dock_goal);
+                    req.await.map(InnerGoalClient::DockRobot)
+                }
+                InnerNavigationAction::UndockRobot { dock_type } => {
+                    info!(
+                        "[{:?}] Requesting new UndockRobot goal (dock_type='{}')",
+                        request.agent.index(),
+                        dock_type
+                    );
+                    let undock_goal = UndockRobot_Goal {
+                        dock_type: dock_type.clone(),
+                        max_undocking_time: 30.0,
+                    };
+                    let req = undock_action_client.request_goal(undock_goal);
+                    req.await.map(InnerGoalClient::UndockRobot)
+                }
             };
             match goal_client {
                 Some(goal_client) => Ok(CurrentInnerNavigationGoal {
