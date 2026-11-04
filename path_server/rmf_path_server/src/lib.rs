@@ -15,10 +15,10 @@ use mapf_post::{na::Isometry2, MapfResult, SemanticPlan, SemanticWaypoint};
 use rclrs::{IntoPrimitiveOptions, Node};
 use ros_env::{
     builtin_interfaces,
-    nav_msgs::msg::{OccupancyGrid, Odometry},
+    nav_msgs::msg::OccupancyGrid,
     rmf_prototype_msgs::{
         self,
-        msg::{Destination, Plan, PlanError, PlanId, TrafficDependency, Waypoint},
+        msg::{Destination, Plan, PlanError, PlanId, Progress, TrafficDependency, Waypoint},
     },
 };
 use std::{
@@ -45,7 +45,7 @@ pub enum PlanResult {
 
 pub struct PlanServer<P: MapfPlanner> {
     pub active_destinations: HashMap<String, Destination>,
-    pub latest_pose_estimate: HashMap<String, Odometry>,
+    pub latest_progress: HashMap<String, Progress>,
     pub node: Node,
     pub replan_queue: Vec<(String, Destination)>,
     pub planner: Arc<P>,
@@ -70,7 +70,7 @@ impl<P: MapfPlanner> PlanServer<P> {
         let (plan_sender, plan_receiver) = std::sync::mpsc::channel();
         Self {
             active_destinations: HashMap::new(),
-            latest_pose_estimate: HashMap::new(),
+            latest_progress: HashMap::new(),
             node,
             replan_queue: Vec::new(),
             planner: Arc::new(planner),
@@ -121,14 +121,13 @@ impl<P: MapfPlanner> PlanServer<P> {
     /// For now both the plan server and executor's logic is embodied in this
     /// function.
     ///
-    /// Note: We do not trigger a replan directly from this function when new
-    /// odometry arrives. Instead, a 100ms periodic timer (configured in `start_path_server`)
+    /// Note: We do not trigger a replan directly from this function when a new
+    /// progress arrives. Instead, a 100ms periodic timer (configured in `start_path_server`)
     /// polls `replan()`, which will process any queued replan requests once
-    /// odometry for all active robots is available. This prevents planning freeze
-    /// if planning was previously skipped due to missing odometry.
-    pub fn handle_odometry(&mut self, robot_id: &str, msg: Odometry) {
-        self.latest_pose_estimate
-            .insert(robot_id.to_string(), msg.clone());
+    /// progress for all active robots is available. This prevents planning freeze
+    /// if planning was previously skipped due to missing progress.
+    pub fn handle_progress(&mut self, robot_id: &str, msg: Progress) {
+        self.latest_progress.insert(robot_id.to_string(), msg);
     }
 
     pub fn handle_plan_error(&mut self, robot_id: &str, msg: PlanError) {
@@ -313,14 +312,14 @@ impl<P: MapfPlanner> PlanServer<P> {
 
         let mut starts = HashMap::new();
         for robot_id in goals.keys() {
-            // Make sure we have the latest odometry for all robots.
-            // Give up if odometry for some robots is stale.
-            if let Some(odom) = self.latest_pose_estimate.get(robot_id) {
-                starts.insert(robot_id.clone(), odom.clone());
+            // Make sure we have the latest progress for all robots.
+            // Give up if progress for some robots is stale.
+            if let Some(progress) = self.latest_progress.get(robot_id) {
+                starts.insert(robot_id.clone(), progress.clone());
             } else {
                 rclrs::log!(
                     self.node.logger(),
-                    "Odometry for robot {} is missing or stale. Skipping plan.",
+                    "Progress for robot {} is missing or stale. Skipping plan.",
                     robot_id
                 );
                 return;
@@ -489,7 +488,7 @@ impl<P: MapfPlanner> PlanServer<P> {
 
 pub struct RobotPathConnections<P: MapfPlanner> {
     pub _destination_subscription: rclrs::WorkerSubscription<Destination, PlanServer<P>>,
-    pub _odom_subscription: rclrs::WorkerSubscription<Odometry, PlanServer<P>>,
+    pub _progress_subscription: rclrs::WorkerSubscription<Progress, PlanServer<P>>,
     pub _plan_error_subscription: rclrs::WorkerSubscription<PlanError, PlanServer<P>>,
 }
 
@@ -581,7 +580,7 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
 
                 let robot_id_clone = robot_id.to_string();
                 let destination_topic = robot_id.to_string() + "/destination";
-                let odom_topic = robot_id.to_string() + "/odom";
+                let progress_topic = robot_id.to_string() + "/plan/progress";
 
                 // Create the subscription on the destinations_worker thread context!
                 let destination_sub = match server
@@ -606,19 +605,19 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
                 };
 
                 let robot_id_clone2 = robot_id.to_string();
-                let odom_sub = match server
+                let progress_sub = match server
                     .destinations_worker
-                    .create_subscription::<Odometry, _>(
-                        odom_topic.as_str().reliable(),
-                        move |dest_server: &mut PlanServer<P>, odom_msg: Odometry| {
-                            dest_server.handle_odometry(&robot_id_clone2, odom_msg);
+                    .create_subscription::<Progress, _>(
+                        progress_topic.as_str().transient_local().reliable(),
+                        move |dest_server: &mut PlanServer<P>, progress_msg: Progress| {
+                            dest_server.handle_progress(&robot_id_clone2, progress_msg);
                         },
                     ) {
                     Ok(sub) => sub,
                     Err(err) => {
                         rclrs::log_error!(
                             server.node.logger(),
-                            "Failed to create odom subscription on DestinationsWorker for {}: {:?}",
+                            "Failed to create progress subscription on DestinationsWorker for {}: {:?}",
                             robot_id,
                             err
                         );
@@ -652,7 +651,7 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
                     robot_id.to_string(),
                     RobotPathConnections {
                         _destination_subscription: destination_sub,
-                        _odom_subscription: odom_sub,
+                        _progress_subscription: progress_sub,
                         _plan_error_subscription: plan_error_sub,
                     },
                 );
