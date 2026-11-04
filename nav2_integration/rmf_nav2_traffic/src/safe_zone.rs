@@ -1,46 +1,32 @@
-use crate::{
-    agent::AmclPose,
-    inner_navigation_client::{
-        CancellingInnerNavigation, InnerNavigationAction, InnerNavigationClient,
-        InnerNavigationTarget,
-    },
-    navigation_server::{CancelledNavigationSessions, CurrentNavigationRequest},
-    Nav2Agent,
-};
-use bevy::prelude::*;
-use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
+use crate::inner_navigation_client::{InnerNavigationAction, InnerNavigationTarget};
 use ros_env::{
     builtin_interfaces::msg::Time as RosTime,
     geometry_msgs::msg::PoseStamped,
     nav2_msgs::msg::Costmap,
-    rmf_prototype_msgs::msg::{Plan, PlanError, PlanId, Progress, Region, SafeZone, SafeZoneId},
-    std_msgs::msg::{Empty as RosEmpty, Header},
+    rmf_prototype_msgs::msg::{Plan, PlanId, Progress, Region, SafeZone, SafeZoneId},
 };
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
-    time::{Duration, Instant},
+    ops::Deref,
+    time::Instant,
 };
-
-#[derive(Component)]
-pub struct SafeZoneSubscription {
-    pub subscriber: Arc<RosSubscription<SafeZone>>,
-}
-
-#[derive(Component)]
-pub struct PlanSubscription {
-    pub subscriber: Arc<RosSubscription<Plan>>,
-}
 
 const MAX_CACHED_PLANS: usize = 16;
 type PlanRegistryKey = ([u8; 16], u64);
 
-#[derive(Component, Debug, Clone, Default, Deref)]
+#[derive(Debug, Clone, Default)]
 pub struct LocalPlanRegistry {
     plans: HashMap<PlanRegistryKey, Plan>,
     order: VecDeque<PlanRegistryKey>,
-    #[deref]
     pub latest_plan: Option<Plan>,
+}
+
+impl Deref for LocalPlanRegistry {
+    type Target = Option<Plan>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.latest_plan
+    }
 }
 
 impl LocalPlanRegistry {
@@ -78,11 +64,6 @@ impl LocalPlanRegistry {
 }
 
 pub type CurrentPlan = LocalPlanRegistry;
-
-#[derive(Component)]
-pub struct GateReleaseSubscription {
-    pub subscriber: Arc<RosSubscription<RosEmpty>>,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct KnownDock {
@@ -169,16 +150,6 @@ impl KnownDock {
     }
 }
 
-#[derive(Component)]
-pub struct CostmapPublisher {
-    pub publisher: Arc<RosPublisher<Costmap>>,
-}
-
-#[derive(Component)]
-pub struct CostmapUpdatedSubscription {
-    pub subscriber: Arc<RosSubscription<Header>>,
-}
-
 #[derive(Clone, Debug)]
 pub struct PendingNavigationTarget {
     pub required_seq: u64,
@@ -188,7 +159,7 @@ pub struct PendingNavigationTarget {
     pub last_published: Instant,
 }
 
-#[derive(Component, Debug, Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CostmapHandshakeState {
     pub next_seq: u64,
     pub acked_seq: u64,
@@ -217,22 +188,25 @@ pub fn stamp_to_seq(stamp: &RosTime) -> u64 {
     ((stamp.sec as u32 as u64) << 32) | (stamp.nanosec as u64)
 }
 
-#[derive(Component)]
-pub struct ProgressPublisher {
-    pub publisher: Arc<RosPublisher<Progress>>,
-}
-
-#[derive(Component, Debug, Clone, Default, Deref)]
+#[derive(Debug, Clone, Default)]
 pub struct LatestProgress(pub Option<Progress>);
+
+impl Deref for LatestProgress {
+    type Target = Option<Progress>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 pub fn shortest_angular_distance(a: f32, b: f32) -> f32 {
     let diff = (a - b).abs().rem_euclid(std::f32::consts::TAU);
     diff.min(std::f32::consts::TAU - diff)
 }
 
-#[derive(Component, Debug, Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ProgressTracker {
-    pub plan_id: Option<ros_env::rmf_prototype_msgs::msg::PlanId>,
+    pub plan_id: Option<PlanId>,
     pub plan_waypoints: Vec<([f32; 2], f32)>,
     pub start_waypoint: u64,
     pub target_waypoint: u64,
@@ -609,8 +583,6 @@ impl ProgressTracker {
         let mut reached_waypoint = self.start_waypoint.max(prev_reached);
         let mut progress = (reached_waypoint as f32).max(prev_progress);
 
-        // Hold progress at the pre-dock / pre-gate waypoint while a docking action
-        // is in progress or while an explicit progress gate is active.
         if self.is_holding_at_pre_waypoint() {
             return Progress {
                 progress,
@@ -790,13 +762,16 @@ pub fn build_progress_status(
     msg
 }
 
-#[derive(Component)]
-pub struct PlanErrorPublisher {
-    pub publisher: Arc<RosPublisher<PlanError>>,
-}
-
-#[derive(Component, Debug, Clone, Default, Deref)]
+#[derive(Debug, Clone, Default)]
 pub struct CurrentSafeZone(pub Option<SafeZone>);
+
+impl Deref for CurrentSafeZone {
+    type Target = Option<SafeZone>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl CurrentSafeZone {
     pub fn update(&mut self, value: SafeZone) {
@@ -816,17 +791,14 @@ impl CurrentSafeZone {
             return true;
         };
 
-        // Resend an unchanged target when it belongs to a new plan.
         if current.id.plan_id != other.id.plan_id {
             return true;
         }
 
-        // Resend when targeting a new waypoint in the plan (e.g. short step or final approach).
         if !other.target_waypoint.is_empty() && current.target_waypoint != other.target_waypoint {
             return true;
         }
 
-        // Resend if target orientation has significantly changed.
         if let (Some(cur_yaw), Some(other_yaw)) =
             (Self::get_orientation(current), Self::get_orientation(other))
         {
@@ -873,7 +845,7 @@ impl CurrentSafeZone {
         (sx - dx).powi(2) + (sy - dy).powi(2)
     }
 
-    fn get_point(safe_zone: &SafeZone) -> Option<(f64, f64)> {
+    pub fn get_point(safe_zone: &SafeZone) -> Option<(f64, f64)> {
         let Some(region) = safe_zone.incremental_target.regions.first() else {
             return None;
         };
@@ -893,508 +865,36 @@ impl CurrentSafeZone {
     }
 }
 
-#[derive(Default)]
-pub struct SafeZoneSubscriptionPlugin {}
-
-impl Plugin for SafeZoneSubscriptionPlugin {
-    fn build(&self, app: &mut App) {
-        app.add_systems(PreUpdate, update_incremental_target)
-            .add_observer(create_safe_zone_subscriber)
-            .add_observer(create_plan_subscriber)
-            .add_observer(create_gate_release_subscriber)
-            .add_observer(create_costmap_publisher)
-            .add_observer(create_progress_publisher)
-            .add_observer(create_plan_error_publisher);
-    }
-}
-
-fn create_safe_zone_subscriber(
-    trigger: Trigger<OnAdd, Nav2Agent>,
-    mut commands: Commands,
-    agents: Query<&Nav2Agent>,
-    node: Res<RclrsNode>,
-) {
-    let e = trigger.target();
-    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
-        return;
-    };
-    let topic = agent_name + "/plan/safe_zone";
-    let subscription = Arc::new(RosSubscription::<SafeZone>::new(&node, topic.clone()));
-    commands.entity(e).insert((
-        SafeZoneSubscription {
-            subscriber: Arc::clone(&subscription),
-        },
-        CurrentSafeZone::default(),
-    ));
-}
-
-fn create_plan_subscriber(
-    trigger: Trigger<OnAdd, Nav2Agent>,
-    mut commands: Commands,
-    agents: Query<&Nav2Agent>,
-    node: Res<RclrsNode>,
-) {
-    let e = trigger.target();
-    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
-        return;
-    };
-    let topic = agent_name + "/plan";
-    let subscription = Arc::new(RosSubscription::<Plan>::new(&node, topic));
-    commands.entity(e).insert((
-        PlanSubscription {
-            subscriber: Arc::clone(&subscription),
-        },
-        CurrentPlan::default(),
-    ));
-}
-
-fn create_gate_release_subscriber(
-    trigger: Trigger<OnAdd, Nav2Agent>,
-    mut commands: Commands,
-    agents: Query<&Nav2Agent>,
-    node: Res<RclrsNode>,
-) {
-    let e = trigger.target();
-    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
-        return;
-    };
-    let topic = agent_name + "/plan/gate_release";
-    let subscription = Arc::new(RosSubscription::<RosEmpty>::new(&node, topic));
-    commands.entity(e).insert(GateReleaseSubscription {
-        subscriber: Arc::clone(&subscription),
-    });
-}
-
-fn create_costmap_publisher(
-    trigger: Trigger<OnAdd, Nav2Agent>,
-    mut commands: Commands,
-    agents: Query<&Nav2Agent>,
-    node: Res<RclrsNode>,
-) {
-    let e = trigger.target();
-    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
-        return;
-    };
-    // TODO(@xiyuoh) review this topic name
-    let topic = agent_name.clone() + "/inner/global_costmap/plan/costmap";
-    let publisher = Arc::new(RosPublisher::<Costmap>::new_transient_local(&node, topic));
-    let updated_topic = agent_name + "/inner/global_costmap/plan/costmap_updated";
-    let updated_subscriber = Arc::new(RosSubscription::<Header>::new(&node, updated_topic));
-    commands.entity(e).insert((
-        CostmapPublisher {
-            publisher: Arc::clone(&publisher),
-        },
-        CostmapUpdatedSubscription {
-            subscriber: Arc::clone(&updated_subscriber),
-        },
-        CostmapHandshakeState::default(),
-    ));
-}
-
-fn create_progress_publisher(
-    trigger: Trigger<OnAdd, Nav2Agent>,
-    mut commands: Commands,
-    agents: Query<&Nav2Agent>,
-    node: Res<RclrsNode>,
-) {
-    let e = trigger.target();
-    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
-        return;
-    };
-    let topic = agent_name + "/plan/progress";
-    let publisher = Arc::new(RosPublisher::<Progress>::new_transient_local(&node, topic));
-    commands.entity(e).insert((
-        ProgressPublisher {
-            publisher: Arc::clone(&publisher),
-        },
-        LatestProgress::default(),
-        ProgressTracker::default(),
-    ));
-}
-
-fn create_plan_error_publisher(
-    trigger: Trigger<OnAdd, Nav2Agent>,
-    mut commands: Commands,
-    agents: Query<&Nav2Agent>,
-    node: Res<RclrsNode>,
-) {
-    let e = trigger.target();
-    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
-        return;
-    };
-    let topic = agent_name + "/plan/error";
-    let publisher = Arc::new(RosPublisher::<PlanError>::new_transient_local(&node, topic));
-    commands.entity(e).insert(PlanErrorPublisher {
-        publisher: Arc::clone(&publisher),
-    });
-}
-
-pub(crate) fn update_incremental_target(
-    mut commands: Commands,
-    mut nav_target: EventWriter<InnerNavigationTarget>,
-    mut current_nav_requests: Query<&mut CurrentNavigationRequest>,
-    mut cancelled_sessions: Query<&mut CancelledNavigationSessions>,
-    mut inner_nav_clients: Query<&mut InnerNavigationClient>,
-    mut subscriptions: Query<(
-        Entity,
-        &SafeZoneSubscription,
-        &PlanSubscription,
-        &GateReleaseSubscription,
-        &CostmapPublisher,
-        &CostmapUpdatedSubscription,
-        &mut CostmapHandshakeState,
-        &ProgressPublisher,
-        &mut LatestProgress,
-        &mut ProgressTracker,
-        &mut CurrentSafeZone,
-        &mut CurrentPlan,
-        Option<&AmclPose>,
-        &Nav2Agent,
-    )>,
-) {
-    for (
-        e,
-        safe_zone_sub,
-        plan_sub,
-        gate_release_sub,
-        costmap_pub,
-        costmap_updated_sub,
-        mut handshake,
-        progress_pub,
-        mut latest_progress,
-        mut progress_tracker,
-        mut current_safe_zone,
-        mut current_plan,
-        amcl_pose,
-        agent,
-    ) in subscriptions.iter_mut()
-    {
-        while let Some(plan) = plan_sub.subscriber.take_data() {
-            let prev_action = progress_tracker.active_action.clone();
-            progress_tracker.set_plan(&plan, current_safe_zone.0.as_ref());
-            let new_action = progress_tracker.active_action.clone();
-            if prev_action != new_action {
-                if let Some(sz) = current_safe_zone
-                    .0
-                    .as_ref()
-                    .filter(|sz| sz.id.plan_id == plan.plan_id)
-                {
-                    if let Some(pending) = handshake.pending_target.as_mut() {
-                        if pending.target.safe_zone_id.plan_id == plan.plan_id {
-                            pending.target.action = new_action;
-                        }
-                    } else if let Some((tx, ty, tyaw)) = next_target(sz) {
-                        nav_target.write(InnerNavigationTarget::with_action(
-                            e,
-                            sz.id.clone(),
-                            tx as f64,
-                            ty as f64,
-                            tyaw as f64,
-                            new_action,
-                        ));
-                    }
-                }
-            }
-            current_plan.insert(plan);
-        }
-
-        let mut gate_released = false;
-        while gate_release_sub.subscriber.take_data().is_some() {
-            gate_released = true;
-        }
-        if gate_released {
-            progress_tracker.release_gate();
-            if progress_tracker.plan_id.is_some() {
-                let current_pose = amcl_pose.filter(|_| agent.localized).map(|p| p.xy_yaw());
-                let updated_prog =
-                    progress_tracker.compute_progress(current_pose, latest_progress.0.as_ref());
-                let pose = amcl_pose
-                    .filter(|_| agent.localized)
-                    .map(|p| PoseStamped {
-                        header: p.0.header.clone(),
-                        pose: p.0.pose.pose.clone(),
-                    })
-                    .unwrap_or_default();
-                let sz_id = current_safe_zone.0.as_ref().map(|sz| &sz.id);
-                let progress_msg = build_progress_status(
-                    pose,
-                    Progress::MODE_NAVIGATING,
-                    Some(&updated_prog),
-                    sz_id,
-                );
-                if latest_progress.0.as_ref() != Some(&progress_msg) {
-                    let _ = progress_pub.publisher.publish(progress_msg.clone());
-                    latest_progress.0 = Some(progress_msg);
-                }
-            }
-        }
-
-        while let Some(ack_header) = costmap_updated_sub.subscriber.take_data() {
-            let seq = stamp_to_seq(&ack_header.stamp);
-            if seq > handshake.acked_seq {
-                handshake.acked_seq = seq;
-            }
-        }
-
-        let mut latest_safe_zone = None;
-        while let Some(safe_zone) = safe_zone_sub.subscriber.take_data() {
-            latest_safe_zone = Some(safe_zone);
-        }
-
-        if let Some(safe_zone) = latest_safe_zone {
-            if !current_safe_zone.matches(&safe_zone) && is_valid(&safe_zone) {
-                if let Some((target_x, target_y, target_yaw)) = next_target(&safe_zone) {
-                    let incoming_plan_id = &safe_zone.id.plan_id;
-                    let incoming_session = &incoming_plan_id.destination_session;
-
-                    if cancelled_sessions
-                        .get(e)
-                        .is_ok_and(|cancelled| cancelled.contains(incoming_session))
-                    {
-                        debug!(
-                            "[{:?}] Ignoring SafeZone for cancelled destination_session {:?}",
-                            agent.name, incoming_plan_id
-                        );
-                        continue;
-                    }
-
-                    if let Ok(mut current_nav_req) = current_nav_requests.get_mut(e) {
-                        if current_nav_req.session() == incoming_session {
-                            current_nav_req.clear_superseded_sessions();
-                        } else if current_nav_req.is_superseded_session(incoming_session) {
-                            continue;
-                        } else {
-                            info!(
-                                "[{:?}] Cancelling active NavigationRequest {:?} due to SafeZone plan_id {:?}",
-                                agent.name,
-                                current_nav_req.plan_id(),
-                                incoming_plan_id
-                            );
-                            if let Ok(mut cancelled) = cancelled_sessions.get_mut(e) {
-                                for session in current_nav_req.superseded_sessions() {
-                                    cancelled.insert(session.clone());
-                                }
-                                cancelled.insert(current_nav_req.session().clone());
-                            }
-                            current_nav_req.cancel();
-                            commands
-                                .entity(e)
-                                .remove::<CurrentNavigationRequest>()
-                                .remove::<CancellingInnerNavigation>();
-                        }
-                    }
-
-                    let should_update = current_safe_zone.should_update_target(&safe_zone);
-                    let costmap_changed = handshake
-                        .last_published_costmap
-                        .as_ref()
-                        .is_none_or(|prev| !costmap_content_eq(prev, &safe_zone.costmap));
-
-                    let mut published_costmap = None;
-                    if should_update || costmap_changed {
-                        handshake.next_seq += 1;
-                        let seq = handshake.next_seq;
-                        let mut costmap = safe_zone.costmap.clone();
-                        costmap.header.stamp = seq_to_stamp(seq);
-
-                        // Publish stamped costmap and wait for global_costmap ack before dispatching target
-                        if costmap_pub.publisher.publish(costmap.clone()).is_err() {
-                            error!("Failed to publish costmap for agent [{}]", agent.name);
-                            continue;
-                        }
-                        handshake.last_published_costmap = Some(costmap.clone());
-                        published_costmap = Some((seq, costmap));
-                    }
-
-                    let current_pose = amcl_pose.filter(|_| agent.localized).map(|p| p.xy_yaw());
-
-                    let matching_plan = current_plan.get(&safe_zone.id.plan_id);
-                    let base_progress = progress_tracker.on_safe_zone_with_plan(
-                        &safe_zone,
-                        matching_plan,
-                        current_pose,
-                        latest_progress.0.as_ref(),
-                    );
-                    let pose = amcl_pose
-                        .filter(|_| agent.localized)
-                        .map(|p| PoseStamped {
-                            header: p.0.header.clone(),
-                            pose: p.0.pose.pose.clone(),
-                        })
-                        .unwrap_or_default();
-                    let mode = if progress_tracker.is_holding_at_pre_waypoint() {
-                        Progress::MODE_ACTION
-                    } else {
-                        Progress::MODE_NAVIGATING
-                    };
-                    let progress_msg = build_progress_status(
-                        pose,
-                        mode,
-                        Some(&base_progress),
-                        Some(&safe_zone.id),
-                    );
-                    let meaningful_progress_changed = match latest_progress.0.as_ref() {
-                        None => true,
-                        Some(prev) => {
-                            prev.plan_id != progress_msg.plan_id
-                                || prev.mode != progress_msg.mode
-                                || prev.reached_waypoint != progress_msg.reached_waypoint
-                                || prev.target_waypoint != progress_msg.target_waypoint
-                                || (prev.progress - progress_msg.progress).abs() > 1e-4
-                        }
-                    };
-
-                    if !should_update {
-                        if let (Some(pending), Some((_, costmap))) =
-                            (handshake.pending_target.as_mut(), published_costmap)
-                        {
-                            pending.costmap = costmap;
-                        }
-                        if meaningful_progress_changed {
-                            let Ok(_) = progress_pub.publisher.publish(progress_msg.clone()) else {
-                                error!("Failed to publish progress for agent [{}]", agent.name);
-                                continue;
-                            };
-                            latest_progress.0 = Some(progress_msg);
-                        }
-                    } else {
-                        let (seq, costmap) = published_costmap.unwrap_or_else(|| {
-                            let seq = handshake.next_seq;
-                            let mut cm = safe_zone.costmap.clone();
-                            cm.header.stamp = seq_to_stamp(seq);
-                            (seq, cm)
-                        });
-                        let action = progress_tracker.active_action.clone();
-                        info!(
-                            "[{:?}] Queuing SafeZone target (waiting for costmap seq={}, action={:?}): ({:.2}, {:.2}, {:.2})",
-                            agent.name, seq, action, target_x, target_y, target_yaw
-                        );
-
-                        let Ok(_) = progress_pub.publisher.publish(progress_msg.clone()) else {
-                            error!("Failed to publish progress for agent [{}]", agent.name);
-                            continue;
-                        };
-                        latest_progress.0 = Some(progress_msg);
-
-                        if let Ok(mut client) = inner_nav_clients.get_mut(e) {
-                            if let Some(existing_goal) = client.goal_mut().as_mut() {
-                                existing_goal.mark_superseded();
-                            }
-                        }
-
-                        *current_safe_zone = CurrentSafeZone(Some(safe_zone.clone()));
-
-                        handshake.pending_target = Some(PendingNavigationTarget {
-                            required_seq: seq,
-                            target: InnerNavigationTarget::with_action(
-                                e,
-                                safe_zone.id,
-                                target_x as f64,
-                                target_y as f64,
-                                target_yaw as f64,
-                                action,
-                            ),
-                            target_xy_yaw: (target_x, target_y, target_yaw),
-                            costmap,
-                            last_published: Instant::now(),
-                        });
-                    }
-                }
-            }
-        }
-
-        let acked_seq = handshake.acked_seq;
-        if handshake
-            .pending_target
-            .as_ref()
-            .is_some_and(|pending| acked_seq >= pending.required_seq)
-        {
-            if handshake.pending_target.as_ref().is_some_and(|pending| {
-                cancelled_sessions.get(e).is_ok_and(|cancelled| {
-                    cancelled.contains(&pending.target.safe_zone_id.plan_id.destination_session)
-                })
-            }) {
-                handshake.pending_target = None;
-            } else {
-                let pending = handshake.pending_target.take().unwrap();
-                let (tx, ty, tyaw) = pending.target_xy_yaw;
-                info!(
-                    "[{:?}] Costmap (seq={}) applied, dispatching SafeZone target: ({:.2}, {:.2}, {:.2})",
-                    agent.name, pending.required_seq, tx, ty, tyaw
-                );
-                nav_target.write(pending.target);
-            }
-        } else if let Some(pending) = handshake.pending_target.as_mut() {
-            if cancelled_sessions.get(e).is_ok_and(|cancelled| {
-                cancelled.contains(&pending.target.safe_zone_id.plan_id.destination_session)
-            }) {
-                handshake.pending_target = None;
-            } else if pending.last_published.elapsed() >= Duration::from_millis(500) {
-                let _ = costmap_pub.publisher.publish(pending.costmap.clone());
-                pending.last_published = Instant::now();
-            }
-        }
-    }
-}
-
-fn is_valid(safe_zone: &SafeZone) -> bool {
+pub fn is_valid(safe_zone: &SafeZone) -> bool {
     if safe_zone.target_waypoint.is_empty() {
-        error!("Received a SafeZone message with empty target_waypoint");
+        log::error!("Received a SafeZone message with empty target_waypoint");
         return false;
     }
     if safe_zone.incremental_target.regions.is_empty()
         && safe_zone.incremental_target.nodes.is_empty()
     {
-        error!("Received a SafeZone message with empty incremental_target");
+        log::error!("Received a SafeZone message with empty incremental_target");
         return false;
     }
 
     true
 }
 
-fn next_target(safe_zone: &SafeZone) -> Option<(f32, f32, f32)> {
-    // TODO(@xiyuoh) more sophisticated point selection taking into account
-    // all factors (region hints, orientations, etc.)
-
+pub fn next_target(safe_zone: &SafeZone) -> Option<(f32, f32, f32)> {
     let constraints = &safe_zone.incremental_target;
     let mut xy: Option<(f32, f32)> = None;
     let mut yaw: Option<f32> = None;
 
-    // Assume either regions or nodes will be populated, not both.
     for target_region in constraints.regions.iter() {
-        let _tolerance = target_region.tolerance;
         let region = &target_region.region;
         let points = &region.points;
 
-        match region.hint {
-            Region::HINT_POINT => {
-                // There should only be exactly 2 elements forming (x, y)
-                if points.len() != 2 {
-                    continue;
-                }
-                // TODO(@xiyuoh)
-                xy = Some((points[0], points[1]));
-            }
-            Region::HINT_AXIS_ALIGNED_RECTANGLE => {
-                //
-            }
-            Region::HINT_RECTANGLE => {
-                //
-            }
-            Region::HINT_CONVEX_POLYGON => {
-                //
-            }
-            Region::HINT_POLYGON | Region::HINT_UNSPECIFIED => {
-                //
-            }
-            _ => {
-                //
-            }
+        if region.hint == Region::HINT_POINT && points.len() == 2 {
+            xy = Some((points[0], points[1]));
         }
 
         for target_ori in target_region.orientations.iter() {
             yaw = Some(target_ori.orientation_radians);
-            // TODO(@xiyuoh) some processing using spread and tolerance
         }
     }
     for target_node in constraints.nodes.iter() {
@@ -1476,7 +976,6 @@ mod tests {
         current_sz.target_waypoint = vec![0].try_into().unwrap();
         let current = CurrentSafeZone(Some(current_sz));
 
-        // Next waypoint is only 0.5m away (distancesq = 0.25 < 0.5)
         let mut next_sz = safe_zone(1, 0, 1, 0.0, 1.5);
         next_sz.target_waypoint = vec![1].try_into().unwrap();
 
@@ -1485,8 +984,6 @@ mod tests {
 
     #[test]
     fn target_update_sent_when_orientation_changes() {
-        use ros_env::rmf_prototype_msgs::msg::TargetOrientation;
-
         let mut current_sz = safe_zone(1, 0, 0, 0.0, 1.5);
         let mut ori1 = TargetOrientation::default();
         ori1.orientation_radians = 0.0;
@@ -1495,7 +992,6 @@ mod tests {
             .push(ori1);
         let current = CurrentSafeZone(Some(current_sz));
 
-        // Same position, but orientation changes to -pi/2
         let mut next_sz = safe_zone(1, 0, 1, 0.0, 1.5);
         let mut ori2 = TargetOrientation::default();
         ori2.orientation_radians = -std::f32::consts::FRAC_PI_2;
@@ -1552,23 +1048,19 @@ mod tests {
         sz.target_progress = 4.0;
         sz.incremental_target.regions[0].tolerance = 0.25;
 
-        // Initial SafeZone at robot position (1.0, 0.0, 0.0)
         let p0 = tracker.on_safe_zone(&sz, Some((1.0, 0.0, 0.0)), None);
         assert_eq!(p0.reached_waypoint, 1);
         assert_eq!(p0.target_waypoint, 4);
         assert!((p0.progress - 1.0).abs() < 1e-4);
 
-        // Midway at (2.5, 0.0, 0.0) -> progress = 2.5, intermediate reached_waypoint = 2
         let p_mid = tracker.compute_progress(Some((2.5, 0.0, 0.0)), Some(&p0));
         assert_eq!(p_mid.reached_waypoint, 2);
         assert!((p_mid.progress - 2.5).abs() < 1e-4);
 
-        // Within tolerance at (3.85, 0.0, 0.0) -> target reached (wp 4, progress 4.0)
         let p_done = tracker.compute_progress(Some((3.85, 0.0, 0.0)), Some(&p_mid));
         assert_eq!(p_done.reached_waypoint, 4);
         assert!((p_done.progress - 4.0).abs() < 1e-4);
 
-        // Subsequent SafeZone for same plan with older last_waypoint must not regress progress
         let p_next_sz = tracker.on_safe_zone(&sz, Some((3.85, 0.0, 0.0)), Some(&p_done));
         assert_eq!(p_next_sz.reached_waypoint, 4);
         assert!((p_next_sz.progress - 4.0).abs() < 1e-4);
@@ -1590,9 +1082,6 @@ mod tests {
         assert_eq!(p_at_1_98.reached_waypoint, 1);
         assert!((p_at_1_98.progress - 1.98).abs() < 1e-4);
 
-        // When PlanExecutor echoes reached_waypoint=1 back in safe_zone.last_waypoint
-        // while target_waypoint=6 is unchanged, on_safe_zone must not double-count
-        // start_waypoint + dist_along_seg from the original start_xy=(0,0).
         sz.id.safe_zone_version = 2;
         sz.last_waypoint = 1;
         let p_at_1_10 = tracker.on_safe_zone(&sz, Some((1.10, 0.0, 0.0)), Some(&p_at_1_98));
@@ -1617,7 +1106,6 @@ mod tests {
         let p0 = tracker.on_safe_zone(&sz, Some((0.0, 0.0, 0.0)), None);
         assert_eq!(p0.reached_waypoint, 0);
 
-        // Robot arrives at (3.0, 0.0) with yaw = 0.0 (still needs to rotate to PI/2)
         let p_pos_only = tracker.compute_progress(Some((3.0, 0.0, 0.0)), Some(&p0));
         assert_eq!(p_pos_only.reached_waypoint, 3);
         assert!(
@@ -1626,7 +1114,6 @@ mod tests {
             p_pos_only.progress
         );
 
-        // Robot finishes rotating within tolerance of PI/2 (e.g. 1.45 rad)
         let p_oriented = tracker.compute_progress(Some((3.0, 0.0, 1.45)), Some(&p_pos_only));
         assert_eq!(p_oriented.reached_waypoint, 4);
         assert!((p_oriented.progress - 4.0).abs() < 1e-4);
@@ -1646,18 +1133,15 @@ mod tests {
             tolerance_radians: 0.25,
         }];
 
-        // Already at (0, 0) but yaw = 0.0 != PI
         let p0 = tracker.on_safe_zone(&sz, Some((0.0, 0.0, 0.0)), None);
         assert_eq!(p0.reached_waypoint, 0);
         assert!((p0.progress - 0.0).abs() < 1e-4);
 
-        // Halfway through rotation (yaw = PI/2) -> still not complete
         let p_half =
             tracker.compute_progress(Some((0.0, 0.0, std::f32::consts::FRAC_PI_2)), Some(&p0));
         assert_eq!(p_half.reached_waypoint, 0);
         assert!(p_half.progress < 1.0);
 
-        // Reaches yaw = 3.0 (within 0.25 rad of PI) -> now complete!
         let p_done = tracker.compute_progress(Some((0.0, 0.0, 3.0)), Some(&p_half));
         assert_eq!(p_done.reached_waypoint, 1);
         assert!((p_done.progress - 1.0).abs() < 1e-4);
@@ -1678,7 +1162,6 @@ mod tests {
         }];
 
         let p0 = tracker.on_safe_zone(&sz, Some((0.0, 0.0, 0.0)), None);
-        // Reaching (1.0, 0.0) even with opposite yaw = PI completes immediately when unconstrained
         let p_done = tracker.compute_progress(Some((1.0, 0.0, std::f32::consts::PI)), Some(&p0));
         assert_eq!(p_done.reached_waypoint, 1);
         assert!((p_done.progress - 1.0).abs() < 1e-4);
@@ -1687,7 +1170,6 @@ mod tests {
     #[test]
     fn progress_tracker_holds_at_pre_dock_waypoint_during_docking() {
         let mut tracker = ProgressTracker::default();
-        // SafeZone targets dock_north_1 at (-1.0, 2.0, pi/2) from pre-dock waypoint 1 at (-1.0, 1.0)
         let mut sz = safe_zone(1, 0, 1, -1.0, 2.0);
         sz.last_waypoint = 1;
         sz.target_waypoint = vec![2].try_into().unwrap();
@@ -1712,8 +1194,6 @@ mod tests {
         assert_eq!(p0.reached_waypoint, 1);
         assert!((p0.progress - 1.0).abs() < 1e-4);
 
-        // Even while moving into the dock (-1.0, 1.8) or arriving at (-1.0, 2.0),
-        // progress must remain held at pre-dock waypoint 1 (progress = 1.0) until DockRobot succeeds.
         let p_mid =
             tracker.compute_progress(Some((-1.0, 1.8, std::f32::consts::FRAC_PI_2)), Some(&p0));
         assert_eq!(p_mid.reached_waypoint, 1);
@@ -1724,7 +1204,6 @@ mod tests {
         assert_eq!(p_at_dock.reached_waypoint, 1);
         assert!((p_at_dock.progress - 1.0).abs() < 1e-4);
 
-        // Once DockRobot action succeeds, progress advances to target_waypoint 2 (progress = 2.0).
         let p_completed = tracker.mark_target_reached(Some(&p_at_dock)).unwrap();
         assert_eq!(p_completed.reached_waypoint, 2);
         assert!((p_completed.progress - 2.0).abs() < 1e-4);
@@ -1761,14 +1240,12 @@ mod tests {
         assert_eq!(p0.reached_waypoint, 1);
         assert!((p0.progress - 1.0).abs() < 1e-4);
 
-        // DockRobot completes, but loading gate is still active -> progress stays held at waypoint 1
         let p_after_dock = tracker.mark_target_reached(Some(&p0)).unwrap();
         assert!(tracker.action_completed);
         assert!(tracker.gate_active);
         assert_eq!(p_after_dock.reached_waypoint, 1);
         assert!((p_after_dock.progress - 1.0).abs() < 1e-4);
 
-        // External gate release triggers -> progress now advances to waypoint 2 (2.0)
         tracker.release_gate();
         assert!(!tracker.is_holding_at_pre_waypoint());
         let p_unblocked = tracker.compute_progress(Some((2.0, 0.0, 0.0)), Some(&p_after_dock));
@@ -1822,12 +1299,10 @@ mod tests {
         );
         assert_eq!(p0.reached_waypoint, 1);
 
-        // Moving along segment 1->2 at (3.0, 0.0) reaches waypoint 2
         let p_at_3_0 = tracker.compute_progress(Some((3.0, 0.0, std::f32::consts::PI)), Some(&p0));
         assert_eq!(p_at_3_0.reached_waypoint, 2);
         assert!((p_at_3_0.progress - 2.0).abs() < 1e-3);
 
-        // Turning North onto segment 4->5 ([3,0]->[3,1]) at (3.0, 0.5) advances to progress 4.5
         let p_turn = tracker.compute_progress(
             Some((3.0, 0.5, std::f32::consts::FRAC_PI_2)),
             Some(&p_at_3_0),
@@ -1835,8 +1310,6 @@ mod tests {
         assert_eq!(p_turn.reached_waypoint, 4);
         assert!((p_turn.progress - 4.5).abs() < 1e-3);
 
-        // Reaching (3.0, 1.0) on the upper lane reaches waypoint 5 (progress 5.0),
-        // unlocking the other robot's lower-lane blockers without waiting 3 extra meters!
         let p_upper =
             tracker.compute_progress(Some((3.0, 1.0, std::f32::consts::PI)), Some(&p_turn));
         assert_eq!(p_upper.reached_waypoint, 5);
@@ -1878,7 +1351,6 @@ mod tests {
         );
         assert_eq!(registry.latest().unwrap().plan_id, plan_v2.plan_id);
 
-        // If a SafeZone for v1 arrives before Plan v1 is registered, and Plan v1 arrives later:
         let mut sz_v1 = safe_zone(42, 1, 1, 2.0, 0.0);
         sz_v1.last_waypoint = 0;
         sz_v1.target_waypoint = vec![1].try_into().unwrap();

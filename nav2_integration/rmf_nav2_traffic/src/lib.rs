@@ -15,47 +15,22 @@
  *
 */
 
-use bevy::prelude::*;
-use bevy_ros2::RclrsPlugin;
-use crossflow::CrossflowPlugin;
-
-pub mod agent;
-pub use agent::*;
-
-pub mod destination;
-pub use destination::*;
+pub mod execution_node;
+pub use execution_node::*;
 
 pub mod inner_navigation_client;
 pub use inner_navigation_client::*;
 
-pub mod navigation_server;
-pub use navigation_server::*;
+pub mod mock_server_node;
+pub use mock_server_node::*;
+
+pub mod ros_helpers;
+pub use ros_helpers::*;
 
 pub mod safe_zone;
 pub use safe_zone::*;
 
-#[derive(Default)]
-pub struct Nav2TrafficPlugin {}
-
-impl Plugin for Nav2TrafficPlugin {
-    fn build(&self, app: &mut App) {
-        app.add_plugins((CrossflowPlugin::default(), RclrsPlugin::default()))
-            .add_plugins((
-                DestinationGoalPublisherPlugin::default(),
-                SafeZoneSubscriptionPlugin::default(),
-                InnerNavigationClientPlugin::default(),
-                NavigationServerPlugin::default(),
-                Nav2AgentPlugin::default(),
-            ));
-
-        // Spawn agents last
-        for name in resolve_agent_names() {
-            app.world_mut().spawn(Nav2Agent::new(name));
-        }
-    }
-}
-
-fn resolve_agent_names() -> Vec<String> {
+pub fn resolve_agent_names() -> Vec<String> {
     if let Ok(env_agents) = std::env::var("RMF_NAV2_AGENTS") {
         let names: Vec<String> = env_agents
             .split(|c: char| c == ',' || c.is_whitespace())
