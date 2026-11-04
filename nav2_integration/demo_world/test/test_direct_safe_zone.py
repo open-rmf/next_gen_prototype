@@ -149,7 +149,7 @@ class TestDirectSafeZone(unittest.TestCase):
         inner_server = ActionServer(
             self.node,
             NavigateToPose,
-            'robot0/inner/navigate_to_pose',
+            'robot0/navigate_to_pose',
             execute_callback=execute_cb,
             goal_callback=lambda _: GoalResponse.ACCEPT,
             cancel_callback=lambda _: CancelResponse.ACCEPT,
@@ -164,7 +164,7 @@ class TestDirectSafeZone(unittest.TestCase):
         )
         costmap_ack_pub = self.node.create_publisher(
             Header,
-            'robot0/inner/global_costmap/plan/costmap_updated',
+            'robot0/global_costmap/plan/costmap_updated',
             qos_profile=safe_zone_qos,
         )
 
@@ -174,7 +174,7 @@ class TestDirectSafeZone(unittest.TestCase):
 
         self.node.create_subscription(
             Costmap,
-            'robot0/inner/global_costmap/plan/costmap',
+            'robot0/global_costmap/plan/costmap',
             on_costmap,
             qos_profile=safe_zone_qos,
             callback_group=self.cb_group,

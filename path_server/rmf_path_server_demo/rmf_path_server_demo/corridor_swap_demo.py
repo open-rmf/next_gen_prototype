@@ -108,10 +108,10 @@ class CorridorSwapDemo(Node):
                 DestinationGoal, f'/{robot_name}/destination/goal', qos
             )
             self.inner_nav_clients[robot_name] = ActionClient(
-                self, NavigateToPose, f'/{robot_name}/inner/navigate_to_pose'
+                self, NavigateToPose, f'/{robot_name}/navigate_to_pose'
             )
             self.lifecycle_clients[robot_name] = self.create_client(
-                GetState, f'/{robot_name}/inner/bt_navigator/get_state'
+                GetState, f'/{robot_name}/bt_navigator/get_state'
             )
             self._robot_subs.append(
                 self.create_subscription(

@@ -98,12 +98,12 @@ class CorridorNav2E2ETestBase(unittest.TestCase):
             )
             cls.lifecycle_clients[robot] = cls.node.create_client(
                 GetState,
-                f'/{robot}/inner/bt_navigator/get_state',
+                f'/{robot}/bt_navigator/get_state',
             )
             cls.inner_nav_clients[robot] = ActionClient(
                 cls.node,
                 NavigateToPose,
-                f'/{robot}/inner/navigate_to_pose',
+                f'/{robot}/navigate_to_pose',
             )
             cls.node.create_subscription(
                 Progress,
@@ -131,7 +131,7 @@ class CorridorNav2E2ETestBase(unittest.TestCase):
             )
             cls.node.create_subscription(
                 Costmap,
-                f'/{robot}/inner/global_costmap/plan/costmap',
+                f'/{robot}/global_costmap/plan/costmap',
                 lambda msg, r=robot: cls.costmap_seqs[r].append(
                     stamp_to_seq(msg.header.stamp)
                 ),
@@ -139,7 +139,7 @@ class CorridorNav2E2ETestBase(unittest.TestCase):
             )
             cls.node.create_subscription(
                 Header,
-                f'/{robot}/inner/global_costmap/plan/costmap_updated',
+                f'/{robot}/global_costmap/plan/costmap_updated',
                 lambda msg, r=robot: cls.acked_seqs[r].append(
                     stamp_to_seq(msg.stamp)
                 ),

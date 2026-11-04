@@ -251,7 +251,7 @@ def generate_launch_description():
             package='rmf_path_server_demo',
             executable='ground_truth_localizer',
             name='ground_truth_localizer',
-            namespace=f'{robot_name}/inner',
+            namespace=robot_name,
             output='screen',
             parameters=[{'use_sim_time': True}],
             remappings=[('/tf', 'tf'), ('/tf_static', 'tf_static')],
