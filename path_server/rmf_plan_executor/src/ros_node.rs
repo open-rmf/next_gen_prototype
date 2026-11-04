@@ -132,23 +132,28 @@ impl PlanExecutorRosNode {
     }
 
     fn publish_plan_release(&mut self, robot_id: &str, pr: PlanRelease) {
-        if let Some(plan_release_pub) = self.plan_release_publishers.get_mut(robot_id) {
-            let _ = plan_release_pub.publish(pr);
-        } else {
-            let publisher = self
-                .node
-                .create_publisher(
-                    format!("{}/plan/release", robot_id)
-                        .as_str()
-                        .transient_local()
-                        .reliable(),
-                )
-                .unwrap();
-            let _ = publisher.publish(pr);
-            self.plan_release_publishers
-                .insert(robot_id.to_string(), publisher);
+    let publisher = match self.plan_release_publishers.entry(robot_id.to_string()) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let topic = format!("{robot_id}/plan/release").as_str().transient_local().reliable();
+            match self.node.create_publisher(topic) {
+                Ok(publisher) => entry.insert(publisher),
+                Err(err) => {
+                    rclrs::log_error!(
+                        self.node.logger(),
+                        "Failed to create plan release publisher for {robot_id}: {err:?}"
+                    );
+                    return;
+                }
+            }
         }
+    };
+
+    match publisher.publish(pr) {
+        Ok(_) => rclrs::log_info!(self.node.logger(), "Published plan release for {robot_id}"),
+        Err(err) => rclrs::log_warn!(self.node.logger(), "Failed to publish plan release for {robot_id}: {err:?}"),
     }
+}
 
     fn publish_safe_zone(&mut self, robot_id: &str, safe_zone: SafeZone) {
         if let Some(safe_zone_pub) = self.safezone_publishers.get_mut(robot_id) {
