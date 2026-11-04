@@ -159,15 +159,21 @@ impl PlanExecutorRosNode {
         if let Some(safe_zone_pub) = self.safezone_publishers.get_mut(robot_id) {
             let _ = safe_zone_pub.publish(safe_zone);
         } else {
-            let publisher = self
+            let Some(publisher) = self
                 .node
                 .create_publisher(
                     format!("{}/plan/safe_zone", robot_id)
                         .as_str()
                         .transient_local()
                         .reliable(),
-                )
-                .unwrap();
+                ) else {
+                    rclrs::log_error!(
+                        self.node.logger(),
+                        "Failed to create plan safe_zone publisher for {}:",
+                        robot_id,
+                    );
+                    return;
+                 };
             let _ = publisher.publish(safe_zone);
             self.safezone_publishers
                 .insert(robot_id.to_string(), publisher);
