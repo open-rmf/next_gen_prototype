@@ -60,16 +60,10 @@ BT::Tree build_agent_tree(const std::shared_ptr<rmf_nav2_traffic::AgentContext> 
 {
   BT::BehaviorTreeFactory factory;
 
-  factory.registerBuilder<rmf_nav2_traffic::HandleOuterGoalRequests>(
-    "HandleOuterGoalRequests",
+  factory.registerBuilder<rmf_nav2_traffic::SyncSafeZoneAndCostmap>(
+    "SyncSafeZoneAndCostmap",
     [ctx](const std::string & name, const BT::NodeConfig & config) {
-      return std::make_unique<rmf_nav2_traffic::HandleOuterGoalRequests>(name, config, ctx);
-    });
-
-  factory.registerBuilder<rmf_nav2_traffic::ProcessSafeZoneAndCostmap>(
-    "ProcessSafeZoneAndCostmap",
-    [ctx](const std::string & name, const BT::NodeConfig & config) {
-      return std::make_unique<rmf_nav2_traffic::ProcessSafeZoneAndCostmap>(name, config, ctx);
+      return std::make_unique<rmf_nav2_traffic::SyncSafeZoneAndCostmap>(name, config, ctx);
     });
 
   factory.registerBuilder<rmf_nav2_traffic::WaitForCostmapAck>(
@@ -78,16 +72,34 @@ BT::Tree build_agent_tree(const std::shared_ptr<rmf_nav2_traffic::AgentContext> 
       return std::make_unique<rmf_nav2_traffic::WaitForCostmapAck>(name, config, ctx);
     });
 
-  factory.registerBuilder<rmf_nav2_traffic::ExecuteInnerNavigation>(
-    "ExecuteInnerNavigation",
+  factory.registerBuilder<rmf_nav2_traffic::IsNextAction>(
+    "IsNextAction",
     [ctx](const std::string & name, const BT::NodeConfig & config) {
-      return std::make_unique<rmf_nav2_traffic::ExecuteInnerNavigation>(name, config, ctx);
+      return std::make_unique<rmf_nav2_traffic::IsNextAction>(name, config, ctx);
     });
 
-  factory.registerBuilder<rmf_nav2_traffic::MonitorOuterGoalCompletion>(
-    "MonitorOuterGoalCompletion",
+  factory.registerBuilder<rmf_nav2_traffic::ExecuteDockRobot>(
+    "ExecuteDockRobot",
     [ctx](const std::string & name, const BT::NodeConfig & config) {
-      return std::make_unique<rmf_nav2_traffic::MonitorOuterGoalCompletion>(name, config, ctx);
+      return std::make_unique<rmf_nav2_traffic::ExecuteDockRobot>(name, config, ctx);
+    });
+
+  factory.registerBuilder<rmf_nav2_traffic::ExecuteUndockRobot>(
+    "ExecuteUndockRobot",
+    [ctx](const std::string & name, const BT::NodeConfig & config) {
+      return std::make_unique<rmf_nav2_traffic::ExecuteUndockRobot>(name, config, ctx);
+    });
+
+  factory.registerBuilder<rmf_nav2_traffic::ExecuteNavigateToPose>(
+    "ExecuteNavigateToPose",
+    [ctx](const std::string & name, const BT::NodeConfig & config) {
+      return std::make_unique<rmf_nav2_traffic::ExecuteNavigateToPose>(name, config, ctx);
+    });
+
+  factory.registerBuilder<rmf_nav2_traffic::PublishRobotProgress>(
+    "PublishRobotProgress",
+    [ctx](const std::string & name, const BT::NodeConfig & config) {
+      return std::make_unique<rmf_nav2_traffic::PublishRobotProgress>(name, config, ctx);
     });
 
   return factory.createTreeFromText(rmf_nav2_traffic::kAgentBehaviorTreeXml);

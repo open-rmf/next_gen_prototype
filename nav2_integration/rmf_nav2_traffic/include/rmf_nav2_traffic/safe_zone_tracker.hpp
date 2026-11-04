@@ -9,7 +9,6 @@
 #include <deque>
 #include <limits>
 #include <optional>
-#include <random>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -19,7 +18,6 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav2_msgs/msg/costmap.hpp>
 #include <rmf_prototype_msgs/msg/destination_constraints.hpp>
-#include <rmf_prototype_msgs/msg/destination_goal.hpp>
 #include <rmf_prototype_msgs/msg/plan.hpp>
 #include <rmf_prototype_msgs/msg/plan_error.hpp>
 #include <rmf_prototype_msgs/msg/plan_id.hpp>
@@ -29,7 +27,6 @@
 #include <rmf_prototype_msgs/msg/safe_zone_id.hpp>
 #include <rmf_prototype_msgs/msg/target_orientation.hpp>
 #include <rmf_prototype_msgs/msg/target_region.hpp>
-#include <unique_identifier_msgs/msg/uuid.hpp>
 
 namespace rmf_nav2_traffic
 {
@@ -38,7 +35,6 @@ using RosTime = builtin_interfaces::msg::Time;
 using PoseStamped = geometry_msgs::msg::PoseStamped;
 using Costmap = nav2_msgs::msg::Costmap;
 using DestinationConstraints = rmf_prototype_msgs::msg::DestinationConstraints;
-using DestinationGoal = rmf_prototype_msgs::msg::DestinationGoal;
 using Plan = rmf_prototype_msgs::msg::Plan;
 using PlanError = rmf_prototype_msgs::msg::PlanError;
 using PlanId = rmf_prototype_msgs::msg::PlanId;
@@ -48,7 +44,6 @@ using SafeZone = rmf_prototype_msgs::msg::SafeZone;
 using SafeZoneId = rmf_prototype_msgs::msg::SafeZoneId;
 using TargetOrientation = rmf_prototype_msgs::msg::TargetOrientation;
 using TargetRegion = rmf_prototype_msgs::msg::TargetRegion;
-using RosUuid = unique_identifier_msgs::msg::UUID;
 
 enum class InnerActionKind
 {
@@ -926,50 +921,6 @@ inline bool should_preempt_goal(
 {
   return is_safe_zone_newer(candidate_id, current_id) ||
          (candidate_id == current_id && candidate_action != current_action);
-}
-
-inline RosUuid generate_random_uuid()
-{
-  static thread_local std::mt19937_64 rng{std::random_device{}()};
-  std::uniform_int_distribution<int> dist(0, 255);
-  RosUuid u;
-  for (auto & b : u.uuid) {
-    b = static_cast<std::uint8_t>(dist(rng));
-  }
-  return u;
-}
-
-inline DestinationGoal pose_stamped_to_destination_goal(
-  const PoseStamped & pose, const RosUuid & session)
-{
-  const float x = static_cast<float>(pose.pose.position.x);
-  const float y = static_cast<float>(pose.pose.position.y);
-  const auto & q = pose.pose.orientation;
-  const double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
-  const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
-  const float yaw = static_cast<float>(std::atan2(siny_cosp, cosy_cosp));
-
-  Region region;
-  region.points = {x, y};
-  region.hint = Region::HINT_POINT;
-
-  TargetOrientation target_ori;
-  target_ori.orientation_radians = yaw;
-  target_ori.spread_radians = 0.0f;
-  target_ori.tolerance_radians = 0.0f;
-
-  TargetRegion target_region;
-  target_region.tolerance = 0.5f;
-  target_region.region = region;
-  target_region.orientations = {target_ori};
-
-  DestinationConstraints constraints;
-  constraints.regions = {target_region};
-
-  DestinationGoal goal;
-  goal.one_of = {constraints};
-  goal.session = session;
-  return goal;
 }
 
 }  // namespace rmf_nav2_traffic

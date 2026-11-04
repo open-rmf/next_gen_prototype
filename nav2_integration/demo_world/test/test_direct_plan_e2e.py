@@ -17,25 +17,23 @@ import threading
 import time
 import unittest
 
-from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from launch import LaunchDescription
 import launch_ros.actions
 import launch_testing.actions
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.msg import Costmap
-from nav_msgs.msg import Odometry
 import pytest
 import rclpy
-from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import (
     Destination,
     DestinationConstraints,
-    DestinationGoal,
     Plan,
+    Progress,
     Region,
     TargetRegion,
 )
@@ -84,7 +82,7 @@ class MockNav2AgentHarness:
         self.speed = float(speed)
         self.lock = threading.Lock()
         self.received_targets = []
-        self.odoms = []
+        self.progress_poses = []
         self.plan_sessions = []
 
         transient_qos = QoSProfile(
@@ -96,15 +94,15 @@ class MockNav2AgentHarness:
 
         self.amcl_pub = self.node.create_publisher(
             PoseWithCovarianceStamped,
-            f'{self.name}/inner/amcl_pose',
+            f'{self.name}/amcl_pose',
             qos_profile=transient_qos,
         )
 
         self.node.create_subscription(
-            Odometry,
-            f'{self.name}/odom',
-            self._odom_cb,
-            qos_profile=10,
+            Progress,
+            f'{self.name}/plan/progress',
+            self._progress_cb,
+            qos_profile=transient_qos,
             callback_group=cb_group,
         )
 
@@ -118,12 +116,12 @@ class MockNav2AgentHarness:
 
         self.costmap_ack_pub = self.node.create_publisher(
             Header,
-            f'{self.name}/inner/global_costmap/plan/costmap_updated',
+            f'{self.name}/global_costmap/plan/costmap_updated',
             qos_profile=transient_qos,
         )
         self.node.create_subscription(
             Costmap,
-            f'{self.name}/inner/global_costmap/plan/costmap',
+            f'{self.name}/global_costmap/plan/costmap',
             lambda msg: self.costmap_ack_pub.publish(msg.header),
             qos_profile=transient_qos,
             callback_group=cb_group,
@@ -132,15 +130,15 @@ class MockNav2AgentHarness:
         self.action_server = ActionServer(
             self.node,
             NavigateToPose,
-            f'{self.name}/inner/navigate_to_pose',
+            f'{self.name}/navigate_to_pose',
             execute_callback=self._execute_cb,
             goal_callback=lambda _: GoalResponse.ACCEPT,
             cancel_callback=lambda _: CancelResponse.ACCEPT,
             callback_group=cb_group,
         )
 
-    def _odom_cb(self, msg):
-        self.odoms.append((msg.pose.pose.position.x, msg.pose.pose.position.y))
+    def _progress_cb(self, msg):
+        self.progress_poses.append((msg.pose.pose.position.x, msg.pose.pose.position.y))
 
     def _plan_cb(self, msg):
         with self.lock:
@@ -261,6 +259,24 @@ class TestDirectPlanE2E(unittest.TestCase):
         msg.constraints = constraint
         return msg
 
+    def wait_for_robots_to_reach(self, r0, target0, r1, target1, timeout_sec=30.0):
+        r0_reached = False
+        r1_reached = False
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if r0.progress_poses:
+                x0, y0 = r0.progress_poses[-1]
+                if abs(x0 - target0[0]) < 0.25 and abs(y0 - target0[1]) < 0.25:
+                    r0_reached = True
+            if r1.progress_poses:
+                x1, y1 = r1.progress_poses[-1]
+                if abs(x1 - target1[0]) < 0.25 and abs(y1 - target1[1]) < 0.25:
+                    r1_reached = True
+            if r0_reached and r1_reached:
+                return True, True
+            time.sleep(0.1)
+        return r0_reached, r1_reached
+
     def test_direct_destination_drives_nav2_agents_to_goal(self):
         r0 = MockNav2AgentHarness(self.node, self.cb_group, 'robot0', 0.0, 0.0)
         r1 = MockNav2AgentHarness(self.node, self.cb_group, 'robot1', 0.0, 3.0)
@@ -289,23 +305,27 @@ class TestDirectPlanE2E(unittest.TestCase):
         )
 
         try:
-            # Wait until nav2_traffic converts inner/amcl_pose into /odom for both robots
+            # Wait until nav2_traffic publishes /plan/progress for both robots
             # and rmf_path_server subscribes to both destination topics.
             deadline = time.time() + 10.0
             while time.time() < deadline:
                 if (
-                    r0.odoms
-                    and r1.odoms
+                    r0.progress_poses
+                    and r1.progress_poses
                     and r0_dest_pub.get_subscription_count() >= 1
                     and r1_dest_pub.get_subscription_count() >= 1
                 ):
                     break
                 time.sleep(0.1)
 
-            self.assertGreater(len(r0.odoms), 0, 'Expected robot0/odom from nav2_traffic')
-            self.assertGreater(len(r1.odoms), 0, 'Expected robot1/odom from nav2_traffic')
+            self.assertGreater(
+                len(r0.progress_poses), 0, 'Expected robot0/plan/progress from nav2_traffic'
+            )
+            self.assertGreater(
+                len(r1.progress_poses), 0, 'Expected robot1/plan/progress from nav2_traffic'
+            )
 
-            # Command both robots directly via ~/destination without calling ~/navigate_to_pose
+            # Part 1: Command both robots directly via ~/destination
             dest_r0 = self.create_destination(1, 3.0, 0.0)
             dest_r1 = self.create_destination(2, 3.0, 3.0)
 
@@ -331,357 +351,79 @@ class TestDirectPlanE2E(unittest.TestCase):
                 'Expected rmf_path_server to publish initial plan for robot1',
             )
 
-            r0_reached = False
-            r1_reached = False
-            deadline = time.time() + 25.0
-            while time.time() < deadline:
-                if r0.odoms:
-                    x0, y0 = r0.odoms[-1]
-                    if abs(x0 - 3.0) < 0.25 and abs(y0 - 0.0) < 0.25:
-                        r0_reached = True
-                if r1.odoms:
-                    x1, y1 = r1.odoms[-1]
-                    if abs(x1 - 3.0) < 0.25 and abs(y1 - 3.0) < 0.25:
-                        r1_reached = True
-                if r0_reached and r1_reached:
-                    break
-                time.sleep(0.1)
-
+            r0_reached, r1_reached = self.wait_for_robots_to_reach(
+                r0, (3.0, 0.0), r1, (3.0, 3.0), timeout_sec=25.0
+            )
             self.assertTrue(
                 r0_reached,
-                f'robot0 did not reach (3.0, 0.0); last odom={r0.odoms[-1] if r0.odoms else None}',
+                f'robot0 did not reach (3.0, 0.0); last pose={r0.progress_poses[-1]}',
             )
             self.assertTrue(
                 r1_reached,
-                f'robot1 did not reach (3.0, 3.0); last odom={r1.odoms[-1] if r1.odoms else None}',
+                f'robot1 did not reach (3.0, 3.0); last pose={r1.progress_poses[-1]}',
             )
             self.assertGreater(
                 len(r0.received_targets),
                 0,
-                'Expected inner NavigateToPose targets for robot0',
+                'Expected NavigateToPose targets for robot0',
             )
             self.assertGreater(
                 len(r1.received_targets),
                 0,
-                'Expected inner NavigateToPose targets for robot1',
+                'Expected NavigateToPose targets for robot1',
             )
 
-            # Part 2: Exact two-stage happy-path scenario from nav2_integration/README.md.
+            # Part 2: Two-stage happy-path scenario from nav2_integration/README.md.
             # Initial poses: robot0=(0.0, 5.0), robot1=(3.0, 5.0)
-            # First destination set: robot0 -> (5.0, 5.0), robot1 -> (0.0, 3.0)
-            # Second destination set: robot0 -> (9.0, 3.0), robot1 -> (9.0, 6.0)
-            forwarded_sessions = {'robot0': None, 'robot1': None}
-
-            def forward_goal(robot_name, pub, goal_msg):
-                if not goal_msg.one_of:
-                    return
-                dest = Destination()
-                dest.constraints = goal_msg.one_of[0]
-                dest.session = goal_msg.session
-                forwarded_sessions[robot_name] = list(goal_msg.session.uuid)
-                pub.publish(dest)
-
-            self.node.create_subscription(
-                DestinationGoal,
-                'robot0/destination/goal',
-                lambda msg: forward_goal('robot0', r0_dest_pub, msg),
-                qos_profile=dest_qos,
-                callback_group=self.cb_group,
-            )
-            self.node.create_subscription(
-                DestinationGoal,
-                'robot1/destination/goal',
-                lambda msg: forward_goal('robot1', r1_dest_pub, msg),
-                qos_profile=dest_qos,
-                callback_group=self.cb_group,
-            )
-
-            outer_r0 = ActionClient(
-                self.node,
-                NavigateToPose,
-                'robot0/navigate_to_pose',
-                callback_group=self.cb_group,
-            )
-            outer_r1 = ActionClient(
-                self.node,
-                NavigateToPose,
-                'robot1/navigate_to_pose',
-                callback_group=self.cb_group,
-            )
-            self.assertTrue(outer_r0.wait_for_server(timeout_sec=10.0))
-            self.assertTrue(outer_r1.wait_for_server(timeout_sec=10.0))
-
-            r0.set_pose_and_speed(0.0, 5.0, 0.0)
-            r1.set_pose_and_speed(3.0, 5.0, 0.0)
-            deadline = time.time() + 5.0
-            while time.time() < deadline:
-                if (
-                    r0.odoms
-                    and r1.odoms
-                    and math.hypot(r0.odoms[-1][0] - 0.0, r0.odoms[-1][1] - 5.0) < 0.1
-                    and math.hypot(r1.odoms[-1][0] - 3.0, r1.odoms[-1][1] - 5.0) < 0.1
-                ):
-                    break
-                time.sleep(0.05)
-
-            def make_nav_goal(x, y):
-                goal = NavigateToPose.Goal()
-                goal.pose.header.frame_id = 'map'
-                goal.pose.pose.position.x = float(x)
-                goal.pose.pose.position.y = float(y)
-                goal.pose.pose.orientation.w = 1.0
-                return goal
-
             # Stage 1: robot0 -> (5.0, 5.0), robot1 -> (0.0, 3.0)
-            fb_r0_stage1 = []
-            fb_r1_stage1 = []
-            forwarded_sessions['robot0'] = None
-            forwarded_sessions['robot1'] = None
-
+            # Stage 2: robot0 -> (9.0, 3.0), robot1 -> (9.0, 6.0)
             r0.set_pose_and_speed(0.0, 5.0, 4.0)
-            send_r0 = outer_r0.send_goal_async(
-                make_nav_goal(5.0, 5.0),
-                feedback_callback=lambda fb: fb_r0_stage1.append(fb.feedback),
-            )
-            deadline = time.time() + 10.0
-            while time.time() < deadline and not send_r0.done():
-                time.sleep(0.05)
-            handle_r0 = send_r0.result()
-            self.assertTrue(handle_r0.accepted)
-
-            deadline = time.time() + 10.0
-            while time.time() < deadline and not r0.has_plan_for_session(
-                forwarded_sessions['robot0']
-            ):
-                time.sleep(0.05)
-            self.assertTrue(
-                r0.has_plan_for_session(forwarded_sessions['robot0']),
-                'Expected rmf_path_server to publish Stage 1 plan for robot0',
-            )
-
             r1.set_pose_and_speed(3.0, 5.0, 4.0)
-            send_r1 = outer_r1.send_goal_async(
-                make_nav_goal(0.0, 3.0),
-                feedback_callback=lambda fb: fb_r1_stage1.append(fb.feedback),
-            )
-            deadline = time.time() + 10.0
-            while time.time() < deadline and not send_r1.done():
-                time.sleep(0.05)
-            handle_r1 = send_r1.result()
-            self.assertTrue(handle_r1.accepted)
-
-            res_r0 = handle_r0.get_result_async()
-            res_r1 = handle_r1.get_result_async()
-            deadline = time.time() + 30.0
-            while time.time() < deadline and (not res_r0.done() or not res_r1.done()):
-                time.sleep(0.1)
-
-            self.assertTrue(res_r0.done(), 'Stage 1 robot0 outer NavigateToPose did not finish')
-            self.assertTrue(res_r1.done(), 'Stage 1 robot1 outer NavigateToPose did not finish')
-            self.assertEqual(
-                res_r0.result().status,
-                GoalStatus.STATUS_SUCCEEDED,
-                f'Stage 1 robot0 outer goal failed with status {res_r0.result().status}',
-            )
-            self.assertEqual(
-                res_r1.result().status,
-                GoalStatus.STATUS_SUCCEEDED,
-                f'Stage 1 robot1 outer goal failed with status {res_r1.result().status}',
-            )
-            self.assertGreater(len(fb_r0_stage1), 0, 'Expected Stage 1 feedback for robot0')
-            self.assertGreater(len(fb_r1_stage1), 0, 'Expected Stage 1 feedback for robot1')
-
-            # Stage 2 ("Alternate navigation goals" in README):
-            # robot0 -> (9.0, 3.0), robot1 -> (9.0, 6.0)
-            fb_r0_stage2 = []
-            fb_r1_stage2 = []
-            forwarded_sessions['robot0'] = None
-            forwarded_sessions['robot1'] = None
-
-            send_r0_s2 = outer_r0.send_goal_async(
-                make_nav_goal(9.0, 3.0),
-                feedback_callback=lambda fb: fb_r0_stage2.append(fb.feedback),
-            )
-            deadline = time.time() + 10.0
-            while time.time() < deadline and not send_r0_s2.done():
-                time.sleep(0.05)
-            handle_r0_s2 = send_r0_s2.result()
-            self.assertTrue(handle_r0_s2.accepted)
-
-            deadline = time.time() + 10.0
-            while time.time() < deadline and not r0.has_plan_for_session(
-                forwarded_sessions['robot0']
-            ):
-                time.sleep(0.05)
-            self.assertTrue(
-                r0.has_plan_for_session(forwarded_sessions['robot0']),
-                'Expected rmf_path_server to publish Stage 2 plan for robot0',
-            )
-
-            send_r1_s2 = outer_r1.send_goal_async(
-                make_nav_goal(9.0, 6.0),
-                feedback_callback=lambda fb: fb_r1_stage2.append(fb.feedback),
-            )
-            deadline = time.time() + 10.0
-            while time.time() < deadline and not send_r1_s2.done():
-                time.sleep(0.05)
-            handle_r1_s2 = send_r1_s2.result()
-            self.assertTrue(handle_r1_s2.accepted)
-
-            res_r0_s2 = handle_r0_s2.get_result_async()
-            res_r1_s2 = handle_r1_s2.get_result_async()
-            deadline = time.time() + 30.0
-            while time.time() < deadline and (not res_r0_s2.done() or not res_r1_s2.done()):
-                time.sleep(0.1)
-
-            self.assertTrue(
-                res_r0_s2.done(), 'Stage 2 robot0 outer NavigateToPose did not finish'
-            )
-            self.assertTrue(
-                res_r1_s2.done(), 'Stage 2 robot1 outer NavigateToPose did not finish'
-            )
-            self.assertEqual(
-                res_r0_s2.result().status,
-                GoalStatus.STATUS_SUCCEEDED,
-                f'Stage 2 robot0 outer goal failed with status {res_r0_s2.result().status}',
-            )
-            self.assertEqual(
-                res_r1_s2.result().status,
-                GoalStatus.STATUS_SUCCEEDED,
-                f'Stage 2 robot1 outer goal failed with status {res_r1_s2.result().status}',
-            )
-            self.assertGreater(len(fb_r0_stage2), 0, 'Expected Stage 2 feedback for robot0')
-            self.assertGreater(len(fb_r1_stage2), 0, 'Expected Stage 2 feedback for robot1')
-
-            # Part 3: Two-robot follower scenario where the follower's outer
-            # ~/navigate_to_pose goal is cancelled mid-execution.
-            # Position robot0 (follower) at (0.0, 0.0) and robot1 (leader) at (3.0, 0.0).
-            r0.set_pose_and_speed(0.0, 0.0, 0.0)
-            r1.set_pose_and_speed(3.0, 0.0, 0.0)
             deadline = time.time() + 5.0
             while time.time() < deadline:
                 if (
-                    r0.odoms
-                    and r1.odoms
-                    and math.hypot(r0.odoms[-1][0] - 0.0, r0.odoms[-1][1] - 0.0) < 0.1
-                    and math.hypot(r1.odoms[-1][0] - 3.0, r1.odoms[-1][1] - 0.0) < 0.1
+                    math.hypot(r0.progress_poses[-1][0] - 0.0, r0.progress_poses[-1][1] - 5.0)
+                    < 0.1
+                    and math.hypot(
+                        r1.progress_poses[-1][0] - 3.0, r1.progress_poses[-1][1] - 5.0
+                    )
+                    < 0.1
                 ):
                     break
                 time.sleep(0.05)
 
-            leader_goal = NavigateToPose.Goal()
-            leader_goal.pose.header.frame_id = 'map'
-            leader_goal.pose.pose.position.x = 10.0
-            leader_goal.pose.pose.position.y = 0.0
-            leader_goal.pose.pose.orientation.w = 1.0
-
-            follower_goal = NavigateToPose.Goal()
-            follower_goal.pose.header.frame_id = 'map'
-            follower_goal.pose.pose.position.x = 9.0
-            follower_goal.pose.pose.position.y = 0.0
-            follower_goal.pose.pose.orientation.w = 1.0
-
-            forwarded_sessions['robot0'] = None
-            forwarded_sessions['robot1'] = None
-
-            r1.set_pose_and_speed(3.0, 0.0, 2.5)
-            send_leader = outer_r1.send_goal_async(leader_goal)
+            dest_r0_s1 = self.create_destination(3, 5.0, 5.0, size=0.1)
+            dest_r1_s1 = self.create_destination(4, 0.0, 3.0, size=0.1)
+            r0_dest_pub.publish(dest_r0_s1)
             deadline = time.time() + 10.0
-            while time.time() < deadline and not send_leader.done():
-                time.sleep(0.05)
-            handle_leader = send_leader.result()
-            self.assertTrue(handle_leader.accepted)
-
-            deadline = time.time() + 10.0
-            while time.time() < deadline and not r1.has_plan_for_session(
-                forwarded_sessions['robot1']
+            while time.time() < deadline and not r0.has_plan_for_session(
+                list(dest_r0_s1.session.uuid)
             ):
                 time.sleep(0.05)
-            self.assertTrue(
-                r1.has_plan_for_session(forwarded_sessions['robot1']),
-                'Expected rmf_path_server to publish leader plan for robot1',
-            )
+            r1_dest_pub.publish(dest_r1_s1)
 
-            r0.set_pose_and_speed(0.0, 0.0, 1.0)
-            send_follower = outer_r0.send_goal_async(follower_goal)
+            r0_s1_ok, r1_s1_ok = self.wait_for_robots_to_reach(
+                r0, (5.0, 5.0), r1, (0.0, 3.0), timeout_sec=30.0
+            )
+            self.assertTrue(r0_s1_ok, 'Stage 1 robot0 did not reach (5.0, 5.0)')
+            self.assertTrue(r1_s1_ok, 'Stage 1 robot1 did not reach (0.0, 3.0)')
+
+            # Stage 2: robot0 -> (9.0, 3.0), robot1 -> (9.0, 6.0)
+            dest_r0_s2 = self.create_destination(5, 9.0, 3.0, size=0.1)
+            dest_r1_s2 = self.create_destination(6, 9.0, 6.0, size=0.1)
+            r0_dest_pub.publish(dest_r0_s2)
             deadline = time.time() + 10.0
-            while time.time() < deadline and not send_follower.done():
+            while time.time() < deadline and not r0.has_plan_for_session(
+                list(dest_r0_s2.session.uuid)
+            ):
                 time.sleep(0.05)
-            handle_follower = send_follower.result()
-            self.assertTrue(handle_follower.accepted)
+            r1_dest_pub.publish(dest_r1_s2)
 
-            # Wait until follower robot0 has received its plan and started moving along y=0.0
-            deadline = time.time() + 10.0
-            while time.time() < deadline:
-                fx, _ = r0.get_pose()
-                if r0.has_plan_for_session(forwarded_sessions['robot0']) and fx > 0.15:
-                    break
-                time.sleep(0.05)
-            self.assertGreater(r0.get_pose()[0], 0.1, 'Follower robot0 did not start moving')
-
-            # Cancel the follower robot0's outer task
-            cancel_follower = handle_follower.cancel_goal_async()
-            deadline = time.time() + 10.0
-            while time.time() < deadline and not cancel_follower.done():
-                time.sleep(0.05)
-            self.assertTrue(cancel_follower.done(), 'Follower cancel_goal_async timed out')
-
-            res_follower = handle_follower.get_result_async()
-            deadline = time.time() + 10.0
-            while time.time() < deadline and not res_follower.done():
-                time.sleep(0.05)
-            self.assertTrue(res_follower.done(), 'Follower outer goal did not terminate')
-            self.assertEqual(
-                res_follower.result().status,
-                GoalStatus.STATUS_CANCELED,
-                'Follower outer goal should terminate with STATUS_CANCELED',
+            r0_s2_ok, r1_s2_ok = self.wait_for_robots_to_reach(
+                r0, (9.0, 3.0), r1, (9.0, 6.0), timeout_sec=30.0
             )
-
-            # Allow inner cancellation to settle and record the follower's stopped pose
-            time.sleep(0.3)
-            stopped_x, stopped_y = r0.get_pose()
-            stopped_targets = len(r0.received_targets)
-
-            # Wait for the leader robot1 to finish reaching (10.0, 0.0)
-            res_leader = handle_leader.get_result_async()
-            deadline = time.time() + 25.0
-            while time.time() < deadline and not res_leader.done():
-                time.sleep(0.1)
-            self.assertTrue(res_leader.done(), 'Leader outer goal did not finish')
-            self.assertEqual(
-                res_leader.result().status,
-                GoalStatus.STATUS_SUCCEEDED,
-            )
-
-            # Give rmf_plan_executor a brief window after leader completion and verify
-            # the cancelled follower remained completely stationary.
-            time.sleep(0.3)
-            final_x, final_y = r0.get_pose()
-            self.assertAlmostEqual(
-                final_x,
-                stopped_x,
-                places=3,
-                msg='Follower robot0 should remain stationary after task cancellation',
-            )
-            self.assertAlmostEqual(
-                final_y,
-                stopped_y,
-                places=3,
-                msg='Follower robot0 should remain stationary after task cancellation',
-            )
-            self.assertEqual(
-                len(r0.received_targets),
-                stopped_targets,
-                'Follower robot0 must not receive new inner targets after cancellation',
-            )
-            self.assertLess(
-                final_x,
-                5.0,
-                'Cancelled follower robot0 should have stopped well before its (9.0, 0.0) goal',
-            )
-
-            outer_r0.destroy()
-            outer_r1.destroy()
+            self.assertTrue(r0_s2_ok, 'Stage 2 robot0 did not reach (9.0, 3.0)')
+            self.assertTrue(r1_s2_ok, 'Stage 2 robot1 did not reach (9.0, 6.0)')
         finally:
             pose_timer.cancel()
             self.node.destroy_timer(pose_timer)

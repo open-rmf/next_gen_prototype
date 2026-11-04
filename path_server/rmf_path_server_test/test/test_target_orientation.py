@@ -17,7 +17,7 @@ import threading
 import time
 import unittest
 
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from launch import LaunchDescription
 import launch_ros.actions
 import launch_testing.actions
@@ -25,16 +25,22 @@ from nav2_msgs.action import NavigateToPose
 from nav2_msgs.msg import Costmap
 import pytest
 import rclpy
-from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import (
     Destination,
+    DestinationConstraints,
+    DestinationGoal,
     Plan,
+    Region,
     SafeZone,
+    TargetOrientation,
+    TargetRegion,
 )
 from std_msgs.msg import Header
+from unique_identifier_msgs.msg import UUID
 
 
 def yaw_from_quaternion(q):
@@ -114,7 +120,7 @@ class TestTargetOrientationForwarding(unittest.TestCase):
         received_destinations = []
         received_plans = []
         received_safe_zones = []
-        inner_goals = []
+        nav_goals = []
 
         transient_qos = QoSProfile(
             depth=10,
@@ -149,27 +155,27 @@ class TestTargetOrientationForwarding(unittest.TestCase):
 
         costmap_ack_pub = self.node.create_publisher(
             Header,
-            '/robot0/inner/global_costmap/plan/costmap_updated',
+            '/robot0/global_costmap/plan/costmap_updated',
             qos_profile=transient_qos,
         )
         self.node.create_subscription(
             Costmap,
-            '/robot0/inner/global_costmap/plan/costmap',
+            '/robot0/global_costmap/plan/costmap',
             lambda msg: costmap_ack_pub.publish(msg.header),
             qos_profile=transient_qos,
             callback_group=self.cb_group,
         )
 
-        def execute_inner(goal_handle):
-            inner_goals.append(goal_handle.request.pose)
+        def execute_nav(goal_handle):
+            nav_goals.append(goal_handle.request.pose)
             goal_handle.succeed()
             return NavigateToPose.Result()
 
-        inner_server = ActionServer(
+        nav_server = ActionServer(
             self.node,
             NavigateToPose,
-            '/robot0/inner/navigate_to_pose',
-            execute_callback=execute_inner,
+            '/robot0/navigate_to_pose',
+            execute_callback=execute_nav,
             goal_callback=lambda _: GoalResponse.ACCEPT,
             cancel_callback=lambda _: CancelResponse.ACCEPT,
             callback_group=self.cb_group,
@@ -177,7 +183,7 @@ class TestTargetOrientationForwarding(unittest.TestCase):
 
         amcl_pub = self.node.create_publisher(
             PoseWithCovarianceStamped,
-            '/robot0/inner/amcl_pose',
+            '/robot0/amcl_pose',
             qos_profile=transient_qos,
         )
         amcl_msg = PoseWithCovarianceStamped()
@@ -186,15 +192,10 @@ class TestTargetOrientationForwarding(unittest.TestCase):
         amcl_msg.pose.pose.position.y = 0.0
         amcl_msg.pose.pose.orientation.w = 1.0
 
-        outer_client = ActionClient(
-            self.node,
-            NavigateToPose,
-            '/robot0/navigate_to_pose',
-            callback_group=self.cb_group,
-        )
-        self.assertTrue(
-            outer_client.wait_for_server(timeout_sec=10.0),
-            'Timed out waiting for /robot0/navigate_to_pose action server',
+        dest_goal_pub = self.node.create_publisher(
+            DestinationGoal,
+            '/robot0/destination/goal',
+            qos_profile=transient_qos,
         )
 
         # Wait for discovery and subscriptions to settle while publishing pose
@@ -203,28 +204,32 @@ class TestTargetOrientationForwarding(unittest.TestCase):
             amcl_pub.publish(amcl_msg)
             time.sleep(0.1)
 
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose = PoseStamped()
-        goal_msg.pose.header.frame_id = 'map'
-        goal_msg.pose.pose.position.x = target_x
-        goal_msg.pose.pose.position.y = target_y
-        goal_msg.pose.pose.orientation.z = math.sin(target_yaw / 2.0)
-        goal_msg.pose.pose.orientation.w = math.cos(target_yaw / 2.0)
+        dest_goal = DestinationGoal()
+        constraints = DestinationConstraints()
+        target_region = TargetRegion()
+        target_region.tolerance = 0.5
+        target_region.region.hint = Region.HINT_POINT
+        target_region.region.points = [float(target_x), float(target_y)]
+        orientation = TargetOrientation()
+        orientation.orientation_radians = float(target_yaw)
+        target_region.orientations = [orientation]
+        constraints.regions = [target_region]
+        dest_goal.one_of = [constraints]
+        dest_goal.session = UUID(uuid=[42] * 16)
 
-        send_future = outer_client.send_goal_async(goal_msg)
+        dest_goal_pub.publish(dest_goal)
 
         deadline = time.time() + 15.0
         while time.time() < deadline and not (
             received_destinations
             and received_plans
             and received_safe_zones
-            and inner_goals
+            and nav_goals
         ):
             amcl_pub.publish(amcl_msg)
             time.sleep(0.1)
 
         try:
-            self.assertTrue(send_future.done(), 'Outer goal was not accepted')
             self.assertGreater(
                 len(received_destinations),
                 0,
@@ -265,15 +270,14 @@ class TestTargetOrientationForwarding(unittest.TestCase):
             )
 
             self.assertGreater(
-                len(inner_goals),
+                len(nav_goals),
                 0,
-                'Did not receive inner NavigateToPose goal on /robot0/inner/navigate_to_pose',
+                'Did not receive NavigateToPose goal on /robot0/navigate_to_pose',
             )
-            inner_pose = inner_goals[-1]
-            self.assertAlmostEqual(inner_pose.pose.position.x, target_x, places=4)
-            self.assertAlmostEqual(inner_pose.pose.position.y, target_y, places=4)
-            inner_yaw = yaw_from_quaternion(inner_pose.pose.orientation)
-            self.assertAlmostEqual(inner_yaw, target_yaw, places=4)
+            nav_pose = nav_goals[-1]
+            self.assertAlmostEqual(nav_pose.pose.position.x, target_x, places=4)
+            self.assertAlmostEqual(nav_pose.pose.position.y, target_y, places=4)
+            nav_yaw = yaw_from_quaternion(nav_pose.pose.orientation)
+            self.assertAlmostEqual(nav_yaw, target_yaw, places=4)
         finally:
-            inner_server.destroy()
-            outer_client.destroy()
+            nav_server.destroy()
