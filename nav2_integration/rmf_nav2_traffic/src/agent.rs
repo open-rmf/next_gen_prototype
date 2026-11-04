@@ -1,19 +1,21 @@
 use crate::{
     inner_navigation_client::InnerNavigationClient,
-    navigation_server::{AgentPose, CurrentNavigationRequest},
     safe_zone::{
-        build_progress_status, CurrentSafeZone, LatestProgress, ProgressPublisher, ProgressTracker,
+        build_progress_status, CostmapHandshakeState, CurrentSafeZone, LatestProgress,
+        ProgressPublisher, ProgressTracker,
     },
 };
 use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
 use mapf::negotiation::scenario::Agent;
 use ros_env::{
-    geometry_msgs::msg::{PoseStamped, PoseWithCovarianceStamped, TwistWithCovariance},
-    nav_msgs::msg::Odometry,
+    geometry_msgs::msg::{PoseStamped, PoseWithCovarianceStamped},
     rmf_prototype_msgs::msg::{Participant, ParticipantList, Progress, SafeZoneId},
 };
 use std::sync::Arc;
+
+#[derive(Component, Clone, Debug)]
+pub struct AgentPose(pub PoseStamped);
 
 #[derive(Component, Clone, Debug)]
 pub struct Nav2Agent {
@@ -26,8 +28,6 @@ pub struct Nav2Agent {
 
 impl Nav2Agent {
     pub fn new(name: String) -> Self {
-        // TODO(@xiyuoh) review this - danger of duplicate IDs
-        // Maybe have an accumulator mapping id to agent name as a resource
         let id = name
             .chars()
             .last()
@@ -70,11 +70,6 @@ pub struct AmclPoseSubscription {
     pub subscriber: Arc<RosSubscription<PoseWithCovarianceStamped>>,
 }
 
-#[derive(Component)]
-pub struct OdomPublisher {
-    pub publisher: Arc<RosPublisher<Odometry>>,
-}
-
 #[derive(Resource)]
 pub struct DiscoveryPublisher {
     pub publisher: Arc<RosPublisher<ParticipantList>>,
@@ -112,20 +107,14 @@ fn create_amcl_pose_subscriber(
     let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
         return;
     };
-    let pose_topic = agent_name.clone() + "/inner/amcl_pose";
+    let pose_topic = format!("/{}/amcl_pose", agent_name);
     let pose_subscriber = Arc::new(RosSubscription::<PoseWithCovarianceStamped>::new(
-        &node,
-        pose_topic.clone(),
+        &node, pose_topic,
     ));
-    let odom_topic = agent_name.clone() + "/odom";
-    let odom_publisher = Arc::new(RosPublisher::<Odometry>::new(&node, odom_topic));
 
     commands.entity(e).insert((
         AmclPoseSubscription {
             subscriber: Arc::clone(&pose_subscriber),
-        },
-        OdomPublisher {
-            publisher: Arc::clone(&odom_publisher),
         },
         AmclPose(PoseWithCovarianceStamped::default()),
     ));
@@ -138,12 +127,11 @@ fn update_amcl_pose(
         &mut Nav2Agent,
         &mut AmclPose,
         &AmclPoseSubscription,
-        &OdomPublisher,
         Option<&ProgressPublisher>,
         Option<&mut LatestProgress>,
         Option<&ProgressTracker>,
         Option<&CurrentSafeZone>,
-        Option<&CurrentNavigationRequest>,
+        Option<&CostmapHandshakeState>,
         Option<&InnerNavigationClient>,
     )>,
 ) {
@@ -152,20 +140,21 @@ fn update_amcl_pose(
         mut agent,
         mut amcl_pose,
         amcl_pose_sub,
-        odom_pub,
         progress_pub,
         mut latest_progress,
         progress_tracker,
         current_safe_zone,
-        current_nav_req,
+        handshake,
         inner_nav_client,
     ) in agents.iter_mut()
     {
-        if let Some(amcl_pose_msg) = amcl_pose_sub.subscriber.take_data() {
+        let mut received_amcl = false;
+        while let Some(amcl_pose_msg) = amcl_pose_sub.subscriber.take_data() {
             amcl_pose.0 = amcl_pose_msg;
             agent.localized = true;
+            received_amcl = true;
         }
-        if !agent.localized {
+        if !agent.localized || !received_amcl {
             continue;
         }
 
@@ -174,13 +163,6 @@ fn update_amcl_pose(
             pose: amcl_pose.0.pose.pose.clone(),
         };
         commands.entity(entity).insert(AgentPose(pose.clone()));
-
-        let mut odom = Odometry::default();
-        odom.header = amcl_pose.0.header.clone();
-        odom.child_frame_id = "odom".to_string();
-        odom.pose = amcl_pose.0.pose.clone();
-        odom.twist = TwistWithCovariance::default();
-        let _ = odom_pub.publisher.publish(odom);
 
         if let (Some(tracker), Some(latest_prog)) = (progress_tracker, latest_progress.as_mut()) {
             if tracker.plan_id.is_some() {
@@ -191,14 +173,10 @@ fn update_amcl_pose(
         }
 
         if let Some(progress_pub) = progress_pub {
-            let pose = PoseStamped {
-                header: amcl_pose.0.header.clone(),
-                pose: amcl_pose.0.pose.pose.clone(),
-            };
             let mode = if progress_tracker.is_some_and(|t| t.is_holding_at_pre_waypoint()) {
                 Progress::MODE_ACTION
-            } else if current_nav_req.is_some()
-                || inner_nav_client.is_some_and(|c| c.goal().is_some())
+            } else if inner_nav_client.is_some_and(|c| c.has_active_goal())
+                || handshake.is_some_and(|h| h.pending_target.is_some())
             {
                 Progress::MODE_NAVIGATING
             } else {

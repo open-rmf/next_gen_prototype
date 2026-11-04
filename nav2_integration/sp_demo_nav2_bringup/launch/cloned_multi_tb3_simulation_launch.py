@@ -185,7 +185,7 @@ def generate_launch_description():
     staged_groups = []
     for robot_index, robot_name in enumerate(robots_list):
         init_pose = robots_list[robot_name]
-        namespace = robot_name + '/inner'
+        namespace = robot_name
 
         def make_group(robot_autostart, condition, ready_node=None):
             actions = [
@@ -296,7 +296,7 @@ def generate_launch_description():
     # initial localization node
     for robot_name in robots_list:
         init_pose = robots_list[robot_name]
-        namespace = robot_name + '/inner'
+        namespace = robot_name
         ld.add_action(Node(
                       condition=UnlessCondition(staged_startup),
                       package='demo_world',
