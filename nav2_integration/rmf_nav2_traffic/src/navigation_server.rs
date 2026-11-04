@@ -6,8 +6,8 @@ use crate::{
         InnerNavigationFeedback,
     },
     safe_zone::{
-        build_progress_status, CurrentSafeZone, LatestProgress, ProgressPublisher,
-        SafeZoneSubscription,
+        build_progress_status, update_incremental_target, CurrentSafeZone, LatestProgress,
+        ProgressPublisher, SafeZoneSubscription,
     },
     Nav2Agent,
 };
@@ -29,11 +29,35 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{error::SendError, unbounded_channel, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
+#[derive(Clone, Debug)]
+pub enum NavigationActionUpdate {
+    Feedback(NavigateToPose_Feedback),
+    Completed,
+    Cancelled,
+}
+
 #[derive(Component)]
 pub struct NavigateToPoseServer {
     pub action_server: Arc<RosActionServer<NavigateToPose>>,
     pub request_receiver: Receiver<CurrentNavigationRequest>,
     pub request_sender: Sender<CurrentNavigationRequest>,
+}
+
+#[derive(Component, Clone, Debug, Default)]
+pub struct CancelledNavigationSessions {
+    sessions: Vec<RosUuid>,
+}
+
+impl CancelledNavigationSessions {
+    pub fn insert(&mut self, session: RosUuid) {
+        if !self.sessions.contains(&session) {
+            self.sessions.push(session);
+        }
+    }
+
+    pub fn contains(&self, session: &RosUuid) -> bool {
+        self.sessions.contains(session)
+    }
 }
 
 #[derive(Default)]
@@ -42,11 +66,17 @@ pub struct NavigationServerPlugin {}
 impl Plugin for NavigationServerPlugin {
     fn build(&self, app: &mut App) {
         // TODO(@xiyuoh) have a systematic approach to setting schedules for systems
-        app.add_systems(PreUpdate, request_publish_feedback_service)
-            .add_systems(PostUpdate, cleanup_navigation)
-            .add_event::<NavigationCompleted>()
-            .add_observer(create_navigation_server)
-            .add_observer(on_inner_navigation_feedback);
+        app.add_systems(
+            PreUpdate,
+            (
+                handle_navigation_cancellations.before(update_incremental_target),
+                request_publish_feedback_service.after(update_incremental_target),
+            ),
+        )
+        .add_systems(PostUpdate, cleanup_navigation)
+        .add_event::<NavigationCompleted>()
+        .add_observer(create_navigation_server)
+        .add_observer(on_inner_navigation_feedback);
 
         let navigation_services = NavigationServices::from_app(app);
         app.insert_resource(navigation_services);
@@ -72,15 +102,17 @@ fn create_navigation_server(
     let action_name = agent_name + "/navigate_to_pose";
     // Set up action server for incoming navigation goals
     let action_server = RosActionServer::<NavigateToPose>::new(&node, action_name, move |handle| {
-        let (feedback_sender, feedback_receiver) = unbounded_channel::<NavigateToPose_Feedback>();
+        let (feedback_sender, feedback_receiver) = unbounded_channel::<NavigationActionUpdate>();
         let (cancel_sender, cancel_receiver) = unbounded_channel::<CancelInnerForAgent>();
         let pose = &handle.goal().pose;
         info!("Received a new NavigationRequest to {:?}!", pose);
 
         // Throw sender into workflow
         let nav_request = NavigationRequest::new(agent_entity.clone(), pose.clone());
+        let session = nav_request.plan_id.destination_session.clone();
         let _ = tx_for_closure.send(CurrentNavigationRequest {
             request: nav_request,
+            superseded_sessions: Vec::new(),
             feedback_sender,
             cancel_receiver,
         });
@@ -92,34 +124,140 @@ fn create_navigation_server(
 
         nav_to_pose_action(
             handle,
+            session,
             feedback_receiver,
             send_cancel,
             publisher_for_closure.clone(),
         )
     });
 
-    commands.entity(agent_entity).insert(NavigateToPoseServer {
-        action_server: Arc::new(action_server),
-        request_receiver: rx,
-        request_sender: tx,
-    });
+    commands.entity(agent_entity).insert((
+        NavigateToPoseServer {
+            action_server: Arc::new(action_server),
+            request_receiver: rx,
+            request_sender: tx,
+        },
+        CancelledNavigationSessions::default(),
+    ));
+}
+
+fn handle_navigation_cancellations(
+    mut commands: Commands,
+    mut current_nav_requests: Query<(Entity, &mut CurrentNavigationRequest)>,
+    mut cancelled_sessions: Query<&mut CancelledNavigationSessions>,
+    mut cancel_inner_for_agent: EventWriter<CancelInnerForAgent>,
+) {
+    for (agent, mut current_nav_request) in current_nav_requests.iter_mut() {
+        if let Ok(cancel) = current_nav_request.cancel_receiver.try_recv() {
+            info!(
+                "[{:?}] Client cancelled NavigationRequest {:?}, cancelling inner navigation",
+                agent.index(),
+                current_nav_request.plan_id()
+            );
+            if let Ok(mut cancelled) = cancelled_sessions.get_mut(agent) {
+                for session in current_nav_request.superseded_sessions() {
+                    cancelled.insert(session.clone());
+                }
+                cancelled.insert(current_nav_request.session().clone());
+            }
+            cancel_inner_for_agent.write(cancel);
+            commands
+                .entity(agent)
+                .remove::<CurrentNavigationRequest>()
+                .remove::<CancellingInnerNavigation>();
+        }
+    }
 }
 
 fn request_publish_feedback_service(
     mut commands: Commands,
     mut navigation_servers: Query<&NavigateToPoseServer>,
+    current_nav_requests: Query<&CurrentNavigationRequest>,
+    current_safe_zones: Query<&CurrentSafeZone>,
+    mut cancelled_sessions: Query<&mut CancelledNavigationSessions>,
+    mut cancel_inner_for_agent: EventWriter<CancelInnerForAgent>,
     navigation_services: Res<NavigationServices>,
 ) {
     for server in navigation_servers.iter_mut() {
+        let mut latest_request: Option<CurrentNavigationRequest> = None;
+        let mut queued_superseded_sessions: Vec<RosUuid> = Vec::new();
         while let Ok(request) = server.request_receiver.try_recv() {
-            commands
-                .request(
-                    request.request.clone(),
-                    navigation_services.publish_feedback,
-                )
-                .detach();
-            commands.entity(request.request.agent).insert(request);
+            if let Some(prev) = latest_request.replace(request) {
+                info!(
+                    "[{:?}] Cancelling queued NavigationRequest {:?} superseded by newer request",
+                    prev.request.agent.index(),
+                    prev.plan_id()
+                );
+                queued_superseded_sessions.push(prev.session().clone());
+                prev.cancel();
+            }
         }
+
+        let Some(mut request) = latest_request else {
+            continue;
+        };
+        for session in queued_superseded_sessions {
+            request.add_superseded_session(session);
+        }
+        let agent = request.request.agent;
+        let mut should_cancel_inner = false;
+
+        if let Ok(existing) = current_nav_requests.get(agent) {
+            info!(
+                "[{:?}] Cancelling active NavigationRequest {:?} superseded by new NavigationRequest {:?}",
+                agent.index(),
+                existing.plan_id(),
+                request.plan_id()
+            );
+            for session in existing.superseded_sessions() {
+                request.add_superseded_session(session.clone());
+            }
+            request.add_superseded_session(existing.session().clone());
+            existing.cancel();
+            should_cancel_inner = true;
+        }
+
+        if let Ok(current_sz) = current_safe_zones.get(agent) {
+            if let Some(sz) = current_sz.as_ref() {
+                if &sz.id.plan_id.destination_session != request.session() {
+                    request.add_superseded_session(sz.id.plan_id.destination_session.clone());
+                    should_cancel_inner = true;
+                }
+            }
+        }
+
+        if let Ok(mut cancelled) = cancelled_sessions.get_mut(agent) {
+            for session in request.superseded_sessions() {
+                cancelled.insert(session.clone());
+            }
+        }
+
+        if let Ok(cancel) = request.cancel_receiver.try_recv() {
+            if let Ok(mut cancelled) = cancelled_sessions.get_mut(agent) {
+                cancelled.insert(request.session().clone());
+            }
+            cancel_inner_for_agent.write(cancel);
+            commands
+                .entity(agent)
+                .remove::<CurrentNavigationRequest>()
+                .remove::<CancellingInnerNavigation>();
+            continue;
+        }
+
+        if should_cancel_inner {
+            cancel_inner_for_agent.write(CancelInnerForAgent { agent });
+        }
+
+        commands
+            .request(
+                request.request.clone(),
+                navigation_services.publish_feedback,
+            )
+            .detach();
+        commands
+            .entity(agent)
+            .remove::<CancellingInnerNavigation>()
+            .insert(request);
     }
 }
 
@@ -181,12 +319,13 @@ impl NavigationServices {
 
 async fn nav_to_pose_action(
     handle: RequestedGoal<NavigateToPose>,
-    mut receiver: UnboundedReceiver<NavigateToPose_Feedback>,
+    session: RosUuid,
+    mut receiver: UnboundedReceiver<NavigationActionUpdate>,
     send_cancel: impl Fn() -> Result<(), SendError<CancelInnerForAgent>>,
     destination_publisher: Arc<RosPublisher<DestinationGoal>>,
 ) -> TerminatedGoal {
     let goal_order = &handle.goal().pose;
-    let destination_goal = pose_stamped_to_destination_goal(goal_order);
+    let destination_goal = pose_stamped_to_destination_goal(goal_order, session);
     let Ok(_) = destination_publisher.publish(destination_goal) else {
         return handle.reject();
     };
@@ -195,18 +334,26 @@ async fn nav_to_pose_action(
 
     let executing = match handle.accept().begin() {
         BeginAcceptedGoal::Execute(executing) => executing,
-        BeginAcceptedGoal::Cancel(cancelling) => return cancelling.cancelled_with(result),
+        BeginAcceptedGoal::Cancel(cancelling) => {
+            let _ = send_cancel();
+            return cancelling.cancelled_with(result);
+        }
     };
 
     let cancelling = loop {
         match executing.unless_cancel_requested(receiver.recv()).await {
-            Ok(Some(next)) => {
+            Ok(Some(NavigationActionUpdate::Feedback(next))) => {
                 executing.publish_feedback(next);
             }
-            Ok(None) => {
+            Ok(Some(NavigationActionUpdate::Completed)) => {
                 // Navigation for this PlanId completed
                 debug!("NavigationRequest completed!");
                 return executing.succeeded_with(result);
+            }
+            Ok(Some(NavigationActionUpdate::Cancelled)) | Ok(None) => {
+                // Navigation for this PlanId was cancelled/preempted
+                debug!("NavigationRequest preempted/cancelled!");
+                return executing.begin_cancelling().cancelled_with(result);
             }
             Err(_) => {
                 // Cancellation requested
@@ -219,10 +366,10 @@ async fn nav_to_pose_action(
 
     debug!("NavigationRequest cancelled!");
     let _ = send_cancel();
-    return cancelling.succeeded_with(result);
+    return cancelling.cancelled_with(result);
 }
 
-fn pose_stamped_to_destination_goal(pose: &PoseStamped) -> DestinationGoal {
+fn pose_stamped_to_destination_goal(pose: &PoseStamped, session: RosUuid) -> DestinationGoal {
     let (x, y, q) = (
         pose.pose.position.x as f32,
         pose.pose.position.y as f32,
@@ -256,7 +403,7 @@ fn pose_stamped_to_destination_goal(pose: &PoseStamped) -> DestinationGoal {
     DestinationGoal {
         one_of: vec![constraints],
         cost_bias: vec![],
-        session: new_uuid(),
+        session,
     }
 }
 
@@ -314,8 +461,51 @@ impl NavigationRequest {
 #[derive(Component)]
 pub struct CurrentNavigationRequest {
     request: NavigationRequest,
-    feedback_sender: UnboundedSender<NavigateToPose_Feedback>,
+    superseded_sessions: Vec<RosUuid>,
+    feedback_sender: UnboundedSender<NavigationActionUpdate>,
     cancel_receiver: UnboundedReceiver<CancelInnerForAgent>,
+}
+
+impl CurrentNavigationRequest {
+    pub fn plan_id(&self) -> &PlanId {
+        &self.request.plan_id
+    }
+
+    pub fn session(&self) -> &RosUuid {
+        &self.request.plan_id.destination_session
+    }
+
+    pub fn superseded_sessions(&self) -> &[RosUuid] {
+        &self.superseded_sessions
+    }
+
+    pub fn add_superseded_session(&mut self, session: RosUuid) {
+        if &session != self.session() && !self.superseded_sessions.contains(&session) {
+            self.superseded_sessions.push(session);
+        }
+    }
+
+    pub fn is_superseded_session(&self, session: &RosUuid) -> bool {
+        self.superseded_sessions.contains(session)
+    }
+
+    pub fn clear_superseded_sessions(&mut self) {
+        self.superseded_sessions.clear();
+    }
+
+    pub fn send_feedback(&self, feedback: NavigateToPose_Feedback) {
+        let _ = self
+            .feedback_sender
+            .send(NavigationActionUpdate::Feedback(feedback));
+    }
+
+    pub fn complete(&self) {
+        let _ = self.feedback_sender.send(NavigationActionUpdate::Completed);
+    }
+
+    pub fn cancel(&self) {
+        let _ = self.feedback_sender.send(NavigationActionUpdate::Cancelled);
+    }
 }
 
 #[derive(Clone, Debug, Component)]
@@ -328,6 +518,15 @@ impl AgentPose {
 
     pub fn pose_mut(&mut self) -> &mut PoseStamped {
         &mut self.0
+    }
+
+    pub fn xy_yaw(&self) -> (f32, f32, f32) {
+        let pos = &self.0.pose.position;
+        let q = &self.0.pose.orientation;
+        let siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+        let cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+        let yaw = siny_cosp.atan2(cosy_cosp) as f32;
+        (pos.x as f32, pos.y as f32, yaw)
     }
 }
 
@@ -382,12 +581,13 @@ fn monitor_inner_navigation_feedback(
 fn monitor_inner_navigation_clients(
     srv: ContinuousService<NavigationRequest, (), StreamOf<NavigationRequest>>,
     mut orders: ContinuousQuery<NavigationRequest, (), StreamOf<NavigationRequest>>,
+    mut commands: Commands,
     mut agents: Query<(
         &InnerNavigationClient,
-        &AgentPose,
+        Option<&AgentPose>,
         &mut CurrentNavigationRequest,
-        Option<&CancellingInnerNavigation>,
     )>,
+    mut cancelled_sessions: Query<&mut CancelledNavigationSessions>,
     mut cancel_inner_for_agent: EventWriter<CancelInnerForAgent>,
     mut nav_completed: EventWriter<NavigationCompleted>,
 ) {
@@ -399,13 +599,22 @@ fn monitor_inner_navigation_clients(
     }
 
     orders.for_each(|order| {
-        let request = order.request();
+        let request = order.request().clone();
         order.streams().send(request.clone());
 
-        if let Ok((client, pose, mut current_nav_request, cancelling_inner)) =
-            agents.get_mut(request.agent)
-        {
-            // If reached destination, complete order
+        let Ok((client, maybe_pose, mut current_nav_request)) = agents.get_mut(request.agent)
+        else {
+            order.respond(());
+            return;
+        };
+
+        if current_nav_request.request.plan_id != request.plan_id {
+            order.respond(());
+            return;
+        }
+
+        // If reached destination, complete order
+        if let Some(pose) = maybe_pose {
             if client.active_goal.is_none() && request.destination_reached(pose) {
                 info!(
                     "[{:?}] Destination reached, marking NavigationRequest as completed",
@@ -418,24 +627,27 @@ fn monitor_inner_navigation_clients(
                 order.respond(());
                 return;
             }
-            // If inner cancellation is complete, complete order
-            if cancelling_inner.is_some_and(|cancelling| cancelling.success) {
-                info!(
-                    "[{:?}] Inner navigation cancelled, marking NavigationRequest as completed",
-                    request.agent.index()
-                );
-                nav_completed.write(NavigationCompleted {
-                    agent: request.agent,
-                    plan_id: request.plan_id.clone(),
-                });
-                order.respond(());
-                return;
-            }
+        }
 
-            // If cancellation requested, write inner cancellation event
-            if let Ok(cancel) = current_nav_request.cancel_receiver.try_recv() {
-                cancel_inner_for_agent.write(cancel);
+        // If cancellation requested, write inner cancellation event and clean up
+        if let Ok(cancel) = current_nav_request.cancel_receiver.try_recv() {
+            info!(
+                "[{:?}] Client cancelled NavigationRequest, cancelling inner navigation",
+                request.agent.index()
+            );
+            if let Ok(mut cancelled) = cancelled_sessions.get_mut(request.agent) {
+                for session in current_nav_request.superseded_sessions() {
+                    cancelled.insert(session.clone());
+                }
+                cancelled.insert(current_nav_request.session().clone());
             }
+            cancel_inner_for_agent.write(cancel);
+            commands
+                .entity(request.agent)
+                .remove::<CurrentNavigationRequest>()
+                .remove::<CancellingInnerNavigation>();
+            order.respond(());
+            return;
         }
     });
 }
@@ -465,9 +677,7 @@ fn publish_navigation_feedback(
             .insert(AgentPose(feedback.feedback.current_pose.clone()));
 
         if let Ok(current_nav_request) = current_nav_request.get(feedback.agent) {
-            let _ = current_nav_request
-                .feedback_sender
-                .send(feedback.feedback.clone());
+            current_nav_request.send_feedback(feedback.feedback.clone());
         }
     }
 }
@@ -477,60 +687,67 @@ fn cleanup_navigation(
     mut nav_completed: EventReader<NavigationCompleted>,
     current_nav_requests: Query<&CurrentNavigationRequest>,
     mut safe_zones: Query<(
+        &Nav2Agent,
         &SafeZoneSubscription,
         &CurrentSafeZone,
         &ProgressPublisher,
         &mut LatestProgress,
         Option<&AmclPose>,
+        Option<&AgentPose>,
     )>,
 ) {
     for event in nav_completed.read() {
-        if current_nav_requests.get(event.agent).is_ok_and(|req| {
-            req.request.agent == event.agent && req.request.plan_id == event.plan_id
-        }) {
-            // Publish final Progress message to indicate path completion
-            if let Ok((
-                safe_zone_sub,
-                current_safe_zone,
-                progress_pub,
-                mut latest_progress,
-                amcl_pose,
-            )) = safe_zones.get_mut(event.agent)
-            {
-                if let Some(safe_zone) = safe_zone_sub
-                    .subscriber
-                    .data_callback()
-                    .or_else(|| current_safe_zone.0.clone())
+        if let Ok(req) = current_nav_requests.get(event.agent) {
+            if req.request.agent == event.agent && req.request.plan_id == event.plan_id {
+                req.complete();
+                // Publish final Progress message to indicate path completion
+                if let Ok((
+                    agent,
+                    safe_zone_sub,
+                    current_safe_zone,
+                    progress_pub,
+                    mut latest_progress,
+                    amcl_pose,
+                    agent_pose,
+                )) = safe_zones.get_mut(event.agent)
                 {
-                    let target_wp = safe_zone.target_waypoint.first().copied().unwrap_or(0);
-                    let pose = amcl_pose
-                        .map(|p| PoseStamped {
-                            header: p.0.header.clone(),
-                            pose: p.0.pose.pose.clone(),
-                        })
-                        .unwrap_or_default();
-                    let base_progress = Progress {
-                        progress: safe_zone.target_progress,
-                        reached_waypoint: target_wp,
-                        target_waypoint: target_wp,
-                        reached_keys: vec![],
-                        plan_id: safe_zone.id.plan_id.clone(),
-                        ..Default::default()
-                    };
-                    let final_progress = build_progress_status(
-                        pose,
-                        Progress::MODE_IDLE,
-                        Some(&base_progress),
-                        Some(&safe_zone.id),
-                    );
-                    let _ = progress_pub.publisher.publish(final_progress.clone());
-                    latest_progress.0 = Some(final_progress);
+                    if let Some(safe_zone) = safe_zone_sub
+                        .subscriber
+                        .data_callback()
+                        .or_else(|| current_safe_zone.0.clone())
+                    {
+                        let target_wp = safe_zone.target_waypoint.first().copied().unwrap_or(0);
+                        let pose = amcl_pose
+                            .filter(|_| agent.localized)
+                            .map(|p| PoseStamped {
+                                header: p.0.header.clone(),
+                                pose: p.0.pose.pose.clone(),
+                            })
+                            .or_else(|| agent_pose.map(|p| p.0.clone()))
+                            .unwrap_or_default();
+                        let base_progress = Progress {
+                            progress: safe_zone.target_progress,
+                            reached_waypoint: target_wp,
+                            target_waypoint: target_wp,
+                            reached_keys: vec![],
+                            plan_id: safe_zone.id.plan_id.clone(),
+                            ..Default::default()
+                        };
+                        let final_progress = build_progress_status(
+                            pose,
+                            Progress::MODE_IDLE,
+                            Some(&base_progress),
+                            Some(&safe_zone.id),
+                        );
+                        let _ = progress_pub.publisher.publish(final_progress.clone());
+                        latest_progress.0 = Some(final_progress);
+                    }
                 }
+                commands
+                    .entity(event.agent)
+                    .remove::<CurrentNavigationRequest>()
+                    .remove::<CancellingInnerNavigation>();
             }
-            commands
-                .entity(event.agent)
-                .remove::<CurrentNavigationRequest>()
-                .remove::<CancellingInnerNavigation>();
         }
     }
 }
