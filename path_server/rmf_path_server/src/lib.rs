@@ -11,22 +11,23 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use mapf_post::{na::Isometry2, MapfResult, SemanticPlan, SemanticWaypoint};
+use mapf_post::{na::Isometry2, MapfResult, SemanticPlan};
 use rclrs::{IntoPrimitiveOptions, Node};
 use ros_env::{
-    builtin_interfaces,
     nav_msgs::msg::OccupancyGrid,
     rmf_prototype_msgs::{
         self,
-        msg::{Destination, Plan, PlanError, PlanId, Progress, TrafficDependency, Waypoint},
+        msg::{Destination, Plan, PlanError, Progress},
     },
 };
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, HashMap, HashSet},
     sync::Arc,
 };
 
+pub mod plan_registry;
 pub mod planner;
+pub use plan_registry::PlanRegistry;
 pub use planner::{Map, MapfPlanner, MockPlanner, PibtPlanner};
 
 pub struct PlanSuccess {
@@ -36,6 +37,7 @@ pub struct PlanSuccess {
     pub goals: HashMap<String, Destination>,
     pub robot_ids: Vec<String>,
     pub active_plan: MapfResult,
+    pub plans: HashMap<String, Plan>,
 }
 
 pub enum PlanResult {
@@ -43,11 +45,97 @@ pub enum PlanResult {
     Failure { session_id: u64, error: String },
 }
 
+pub struct PlanningSnapshot<P: MapfPlanner> {
+    pub session_id: u64,
+    pub planner: Arc<P>,
+    pub starts: HashMap<String, Progress>,
+    pub goals: HashMap<String, Destination>,
+    pub robot_ids: Vec<String>,
+    pub footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
+    pub map: Map,
+    pub plan_registry: PlanRegistry,
+    pub cancellation: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<P: MapfPlanner> PlanningSnapshot<P> {
+    pub fn replan(self) -> Option<PlanResult> {
+        if self.cancellation.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+
+        let footprints_map: HashMap<String, Arc<dyn mapf_post::shape::Shape>> = {
+            let guard = self.footprints.lock();
+            let mut map: HashMap<String, Arc<dyn mapf_post::shape::Shape>> = match guard.as_ref() {
+                Ok(radii) => radii
+                    .iter()
+                    .map(|(id, &radius)| {
+                        (
+                            id.clone(),
+                            Arc::new(mapf_post::shape::Ball::new(radius))
+                                as Arc<dyn mapf_post::shape::Shape>,
+                        )
+                    })
+                    .collect(),
+                Err(_) => HashMap::new(),
+            };
+            for id in &self.robot_ids {
+                map.entry(id.clone())
+                    .or_insert_with(|| Arc::new(mapf_post::shape::Ball::new(0.49)));
+            }
+            map
+        };
+
+        let basic_plan = match self.planner.plan(
+            &self.starts,
+            &self.goals,
+            &footprints_map,
+            &self.robot_ids,
+            &self.map,
+            Arc::clone(&self.cancellation),
+        ) {
+            Ok(plan) => plan,
+            Err(err) => {
+                // TODO(arjoc): publish an error on the {robot}/destination/errors
+                return Some(PlanResult::Failure {
+                    session_id: self.session_id,
+                    error: format!("{:?}", err),
+                });
+            }
+        };
+
+        if self.cancellation.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+
+        let (plans, mapf_result, traffic_dependencies) = self.plan_registry.build_session_plans(
+            &basic_plan,
+            &self.goals,
+            &self.robot_ids,
+            &footprints_map,
+            1.0,
+        );
+
+        if self.cancellation.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+
+        Some(PlanResult::Success(PlanSuccess {
+            session_id: self.session_id,
+            basic_plan,
+            traffic_dependencies,
+            goals: self.goals,
+            robot_ids: self.robot_ids,
+            active_plan: mapf_result,
+            plans,
+        }))
+    }
+}
+
 pub struct PlanServer<P: MapfPlanner> {
     pub active_destinations: HashMap<String, Destination>,
     pub latest_progress: HashMap<String, Progress>,
     pub node: Node,
-    pub replan_queue: Vec<(String, Destination)>,
+    pub pending_replans: HashSet<String>,
     pub planner: Arc<P>,
     pub plan_publishers: HashMap<String, rclrs::Publisher<Plan>>,
     pub plan_receiver: std::sync::Mutex<std::sync::mpsc::Receiver<PlanResult>>,
@@ -57,7 +145,7 @@ pub struct PlanServer<P: MapfPlanner> {
     pub planning_session_id: u64,
     pub current_planning_session: Option<u64>,
     pub footprints: Arc<std::sync::Mutex<HashMap<String, f32>>>,
-    pub active_plan_ids: HashMap<String, PlanId>,
+    pub plan_registry: PlanRegistry,
     pub map: Arc<Map>,
 }
 
@@ -72,7 +160,7 @@ impl<P: MapfPlanner> PlanServer<P> {
             active_destinations: HashMap::new(),
             latest_progress: HashMap::new(),
             node,
-            replan_queue: Vec::new(),
+            pending_replans: HashSet::new(),
             planner: Arc::new(planner),
             plan_publishers: HashMap::new(),
             plan_sender,
@@ -82,9 +170,23 @@ impl<P: MapfPlanner> PlanServer<P> {
             planning_session_id: 0,
             current_planning_session: None,
             footprints,
-            active_plan_ids: HashMap::new(),
+            plan_registry: PlanRegistry::new(),
             map: Arc::new(Map::default()),
         }
+    }
+
+    pub fn is_executing_action(&self, robot_id: &str) -> bool {
+        let Some(progress) = self.latest_progress.get(robot_id) else {
+            return false;
+        };
+        self.plan_registry.is_executing_action(robot_id, progress)
+    }
+
+    pub fn occupied_path_of(&self, robot_id: &str) -> Vec<[f32; 2]> {
+        let Some(progress) = self.latest_progress.get(robot_id) else {
+            return Vec::new();
+        };
+        self.plan_registry.occupied_path_of(robot_id, progress)
     }
 
     pub fn handle_destination(&mut self, robot_id: &str, msg: Destination) {
@@ -106,13 +208,16 @@ impl<P: MapfPlanner> PlanServer<P> {
         };
 
         if is_new_session {
-            if let Some(cancellation) = &self.current_cancellation {
-                cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.active_destinations.insert(robot_id.to_owned(), msg);
+            self.pending_replans.insert(robot_id.to_owned());
+            if !self.is_executing_action(robot_id) {
+                if let Some(cancellation) = &self.current_cancellation {
+                    cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.is_planning = false;
+                self.current_planning_session = None;
+                self.current_cancellation = None;
             }
-            self.is_planning = false;
-            self.current_planning_session = None;
-            self.current_cancellation = None;
-            self.replan_queue.push((robot_id.to_owned(), msg));
         } else {
             rclrs::log_error!(self.node.logger(), "Duplicate session id received");
         }
@@ -137,203 +242,70 @@ impl<P: MapfPlanner> PlanServer<P> {
                 "Received CODE_PATH_BLOCKED for robot {}. Enqueuing replan...",
                 robot_id
             );
-            if let Some(dest) = self.active_destinations.get(robot_id).cloned() {
-                self.replan_queue.push((robot_id.to_string(), dest));
+            if self.active_destinations.contains_key(robot_id) {
+                self.pending_replans.insert(robot_id.to_string());
             }
         }
     }
 
-    pub fn replan(&mut self) {
-        // 1. Check if any planning results have arrived from the background thread
-        if let Ok(receiver) = self.plan_receiver.get_mut() {
-            while let Ok(result) = receiver.try_recv() {
-                match result {
-                    PlanResult::Success(success) => {
-                        if Some(success.session_id) != self.current_planning_session {
-                            // Stale planning task result, ignore
-                            continue;
-                        }
-                        self.is_planning = false;
-                        self.current_cancellation = None;
-                        self.current_planning_session = None;
-
-                        let PlanSuccess {
-                            basic_plan,
-                            traffic_dependencies,
-                            goals,
-                            robot_ids,
-                            ..
-                        } = success;
-
-                        // First update the active_plan_ids for each robot with their new PlanId
-                        for robot_id in &robot_ids {
-                            let dest = goals.get(robot_id).unwrap();
-                            let prev_plan_id = self.active_plan_ids.get(robot_id);
-                            let new_version = match prev_plan_id {
-                                Some(p_id)
-                                    if p_id.destination_session.uuid == dest.session.uuid =>
-                                {
-                                    p_id.plan_version + 1
-                                }
-                                _ => 0,
-                            };
-
-                            let plan_id = PlanId {
-                                destination_session: dest.session.clone(),
-                                plan_version: new_version,
-                            };
-
-                            self.active_plan_ids.insert(robot_id.clone(), plan_id);
-                        }
-
-                        // Use traffic_dependencies to populate Plan message for each agent
-                        let mut plans = HashMap::new();
-                        for (agent_idx, robot_id) in robot_ids.iter().enumerate() {
-                            let plan_id = self.active_plan_ids.get(robot_id).unwrap().clone();
-                            let Some(traj) = &basic_plan.get(agent_idx) else {
-                                rclrs::log_error!(
-                                    self.node.logger(),
-                                    "Missing plan trajectory for agent {}",
-                                    agent_idx
-                                );
-                                continue;
-                            };
-                            let mut plan = Self::to_plan_msg(
-                                agent_idx,
-                                traj,
-                                plan_id,
-                                &traffic_dependencies,
-                                &robot_ids,
-                                &self.active_plan_ids,
-                                1.0,
-                            );
-                            if let Some(dest) = goals.get(robot_id) {
-                                if let Some(last_wp) = plan.waypoints.last_mut() {
-                                    last_wp.arrival_constraints = dest.constraints.clone();
-                                }
-                            }
-                            plans.insert(robot_id.clone(), plan);
-                        }
-
-                        for (robot_id, plan) in &plans {
-                            let mut wp_strs = Vec::new();
-                            for (j, wp) in plan.waypoints.iter().enumerate() {
-                                let blockers: Vec<String> = wp
-                                    .departure_blockers
-                                    .iter()
-                                    .map(|b| {
-                                        format!("{} progress >= {}", b.name, b.required_progress)
-                                    })
-                                    .collect();
-                                wp_strs.push(format!(
-                                    "  wp {}: pos {:?}, progress {}, blockers: {:?}",
-                                    j, wp.position, wp.progress, blockers
-                                ));
-                            }
-                            rclrs::log!(
-                                self.node.logger(),
-                                "Generated plan with version {} and {} waypoints for robot {}:\n{}",
-                                plan.plan_id.plan_version,
-                                plan.waypoints.len(),
-                                robot_id,
-                                wp_strs.join("\n")
-                            );
-
-                            // Publish the plans
-                            let publisher = match self.plan_publishers.entry(robot_id.clone()) {
-                                Entry::Occupied(entry) => entry.into_mut(),
-                                Entry::Vacant(entry) => {
-                                    let topic = format!("{}/plan", robot_id);
-                                    match self.node.create_publisher::<Plan>(
-                                        topic.as_str().transient_local().reliable(),
-                                    ) {
-                                        Ok(pub_) => entry.insert(pub_),
-                                        Err(err) => {
-                                            rclrs::log_error!(
-                                                self.node.logger(),
-                                                "Failed to create plan publisher for {}: {:?}",
-                                                robot_id,
-                                                err
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                }
-                            };
-
-                            if let Err(err) = publisher.publish(plan) {
-                                rclrs::log_error!(
-                                    self.node.logger(),
-                                    "Failed to publish plan for {}: {:?}",
-                                    robot_id,
-                                    err
-                                );
-                            }
-                        }
-
-                        self.active_destinations = goals;
-                    }
-                    PlanResult::Failure { session_id, error } => {
-                        // TODO(arjoc): Publish error message
-                        if Some(session_id) != self.current_planning_session {
-                            continue;
-                        }
-                        self.is_planning = false;
-                        self.current_cancellation = None;
-                        self.current_planning_session = None;
-
-                        rclrs::log_error!(
-                            self.node.logger(),
-                            "Background planner failed: {}",
-                            error
-                        );
-                    }
-                }
-            }
-        }
-
-        // 2. If a planning task is currently running, do not spawn another one
+    pub fn take_snapshot(&mut self) -> Option<PlanningSnapshot<P>> {
+        // If a planning task is currently running, do not spawn another one
         if self.is_planning {
-            return;
+            return None;
         }
 
-        // 3. If there is nothing new in the replan queue, we don't need to schedule a new plan
-        if self.replan_queue.is_empty() {
-            return;
+        // If there is no actionable (non-committed) robot in pending_replans,
+        // wait until either a non-committed robot requests a replan or a committed
+        // robot finishes its action.
+        if !self
+            .pending_replans
+            .iter()
+            .any(|robot_id| !self.is_executing_action(robot_id))
+        {
+            return None;
         }
 
         rclrs::log!(self.node.logger(), "Need to trigger plan");
-        // Retrieve goals of all participants
-        let mut goals = self.active_destinations.clone();
-
-        for (robot_id, dest) in &self.replan_queue {
-            goals.insert(robot_id.clone(), dest.clone());
-        }
 
         let mut starts = HashMap::new();
-        for robot_id in goals.keys() {
+        let mut goals = HashMap::new();
+        let mut committed_robots = Vec::new();
+        for (robot_id, dest) in &self.active_destinations {
             // Make sure we have the latest progress for all robots.
             // Give up if progress for some robots is stale.
             if let Some(progress) = self.latest_progress.get(robot_id) {
-                starts.insert(robot_id.clone(), progress.clone());
+                if self.is_executing_action(robot_id) {
+                    rclrs::log!(
+                        self.node.logger(),
+                        "Robot {} is executing an action; excluding it from replanning and marking its occupied path",
+                        robot_id
+                    );
+                    committed_robots.push(robot_id.clone());
+                } else {
+                    starts.insert(robot_id.clone(), progress.clone());
+                    goals.insert(robot_id.clone(), dest.clone());
+                }
             } else {
                 rclrs::log!(
                     self.node.logger(),
                     "Progress for robot {} is missing or stale. Skipping plan.",
                     robot_id
                 );
-                return;
+                return None;
             }
         }
 
-        // We can now safely drain/clear the replan queue since we are proceeding with the planning.
-        self.replan_queue.clear();
-
-        // Perform MAPF plan in background thread
-        rclrs::log!(self.node.logger(), "Triggering new plan in background");
+        if goals.is_empty() {
+            return None;
+        }
 
         let mut robot_ids: Vec<String> = goals.keys().cloned().collect();
         robot_ids.sort();
+
+        let mut map = (*self.map).clone();
+        for committed_id in &committed_robots {
+            map.mark(&self.occupied_path_of(committed_id));
+        }
 
         self.planning_session_id += 1;
         let session_id = self.planning_session_id;
@@ -343,146 +315,143 @@ impl<P: MapfPlanner> PlanServer<P> {
         let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.current_cancellation = Some(Arc::clone(&cancellation));
 
-        let planner_clone = Arc::clone(&self.planner);
-        let footprints_clone = Arc::clone(&self.footprints);
-        let sender_clone = self.plan_sender.clone();
-        let map_clone = self.map.clone();
-
-        std::thread::spawn(move || {
-            if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-
-            let footprints_map: HashMap<String, Arc<dyn mapf_post::shape::Shape>> = {
-                let guard = footprints_clone.lock();
-                robot_ids
-                    .iter()
-                    .map(|id| {
-                        let radius = match guard.as_ref() {
-                            Ok(map) => *map.get(id).unwrap_or(&0.49),
-                            Err(_) => 0.49,
-                        };
-                        (
-                            id.clone(),
-                            Arc::new(mapf_post::shape::Ball::new(radius))
-                                as Arc<dyn mapf_post::shape::Shape>,
-                        )
-                    })
-                    .collect()
-            };
-
-            let basic_plan = match planner_clone.plan(
-                &starts,
-                &goals,
-                &footprints_map,
-                &robot_ids,
-                map_clone.as_ref(),
-                Arc::clone(&cancellation),
-            ) {
-                Ok(plan) => plan,
-                Err(err) => {
-                    // TODO(arjoc): publish an error on the {robot}/destination/errors
-                    let _ = sender_clone.send(PlanResult::Failure {
-                        session_id,
-                        error: format!("{:?}", err),
-                    });
-                    return;
-                }
-            };
-
-            if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-
-            let trajectories: Vec<mapf_post::Trajectory> = basic_plan
-                .iter()
-                .map(|poses| mapf_post::Trajectory {
-                    poses: poses.clone(),
-                })
-                .collect();
-
-            let footprints: Vec<Arc<dyn mapf_post::shape::Shape>> = robot_ids
-                .iter()
-                .map(|id| footprints_map.get(id).unwrap().clone())
-                .collect();
-
-            let mapf_result = mapf_post::MapfResult {
-                trajectories,
-                footprints,
-                discretization_timestep: 1.0,
-            };
-
-            let traffic_dependencies = mapf_post::mapf_post(&mapf_result);
-
-            if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-
-            let _ = sender_clone.send(PlanResult::Success(PlanSuccess {
-                session_id,
-                basic_plan,
-                traffic_dependencies,
-                goals,
-                robot_ids,
-                active_plan: mapf_result,
-            }));
-        });
+        Some(PlanningSnapshot {
+            session_id,
+            planner: Arc::clone(&self.planner),
+            starts,
+            goals,
+            robot_ids,
+            footprints: Arc::clone(&self.footprints),
+            map,
+            plan_registry: self.plan_registry.clone(),
+            cancellation,
+        })
     }
 
-    pub fn to_plan_msg(
-        agent_idx: usize,
-        traj: &[Isometry2<f32>],
-        plan_id: PlanId,
-        traffic_dependencies: &SemanticPlan,
-        robot_ids: &[String],
-        active_plan_ids: &HashMap<String, PlanId>,
-        timestep: f32,
-    ) -> Plan {
-        let mut waypoints = Vec::new();
-        for (i, pose) in traj.iter().enumerate() {
-            waypoints.push(Waypoint {
-                position: [pose.translation.x, pose.translation.y],
-                arrival_constraints: Default::default(),
-                progress: i as f32 * timestep,
-                maps: Vec::new(),
-                departure_blockers: Vec::new(),
-                departure_trajectory: Vec::new(),
-                departure_action: String::new(),
-                arrival_action: String::new(),
-            });
-        }
-
-        for i in 0..traj.len() {
-            if let Some(dep_ids) = traffic_dependencies.comes_before(&SemanticWaypoint {
-                agent: agent_idx,
-                trajectory_index: i,
-            }) {
-                for &dep_id in dep_ids {
-                    let dep_wp = &traffic_dependencies.waypoints[dep_id];
-                    if dep_wp.agent == agent_idx {
+    pub fn replan(&mut self) {
+        // 1. Check if any planning results have arrived from the background thread
+        let results: Vec<PlanResult> = self
+            .plan_receiver
+            .get_mut()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for result in results {
+            match result {
+                PlanResult::Success(success) => {
+                    if Some(success.session_id) != self.current_planning_session {
+                        // Stale planning task result, ignore
                         continue;
                     }
-                    if let Some(dep_robot_id) = robot_ids.get(dep_wp.agent) {
-                        if let Some(dep_plan_id) = active_plan_ids.get(dep_robot_id) {
-                            let req_progress = (dep_wp.trajectory_index + 1) as f32 * timestep;
-                            let blocker = TrafficDependency {
-                                name: dep_robot_id.clone(),
-                                plan_id: dep_plan_id.clone(),
-                                required_progress: req_progress,
-                            };
-                            waypoints[i].departure_blockers.push(blocker);
+                    self.is_planning = false;
+                    self.current_cancellation = None;
+                    self.current_planning_session = None;
+
+                    let PlanSuccess {
+                        session_id,
+                        goals,
+                        plans,
+                        ..
+                    } = success;
+
+                    self.plan_registry.record_session_plans(session_id, &plans);
+
+                    for (robot_id, plan) in &plans {
+                        let mut wp_strs = Vec::new();
+                        for (j, wp) in plan.waypoints.iter().enumerate() {
+                            let blockers: Vec<String> = wp
+                                .departure_blockers
+                                .iter()
+                                .map(|b| format!("{} progress >= {}", b.name, b.required_progress))
+                                .collect();
+                            wp_strs.push(format!(
+                                "  wp {}: pos {:?}, progress {}, blockers: {:?}",
+                                j, wp.position, wp.progress, blockers
+                            ));
+                        }
+                        rclrs::log!(
+                            self.node.logger(),
+                            "Generated plan with version {} and {} waypoints for robot {}:\n{}",
+                            plan.plan_id.plan_version,
+                            plan.waypoints.len(),
+                            robot_id,
+                            wp_strs.join("\n")
+                        );
+
+                        // Publish the plans
+                        let publisher = match self.plan_publishers.entry(robot_id.clone()) {
+                            Entry::Occupied(entry) => entry.into_mut(),
+                            Entry::Vacant(entry) => {
+                                let topic = format!("{}/plan", robot_id);
+                                match self.node.create_publisher::<Plan>(
+                                    topic.as_str().transient_local().reliable(),
+                                ) {
+                                    Ok(pub_) => entry.insert(pub_),
+                                    Err(err) => {
+                                        rclrs::log_error!(
+                                            self.node.logger(),
+                                            "Failed to create plan publisher for {}: {:?}",
+                                            robot_id,
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+
+                        if let Err(err) = publisher.publish(plan) {
+                            rclrs::log_error!(
+                                self.node.logger(),
+                                "Failed to publish plan for {}: {:?}",
+                                robot_id,
+                                err
+                            );
+                        }
+                    }
+
+                    for (robot_id, planned_dest) in &goals {
+                        if self
+                            .active_destinations
+                            .get(robot_id)
+                            .is_some_and(|active| active.session.uuid == planned_dest.session.uuid)
+                        {
+                            self.pending_replans.remove(robot_id);
                         }
                     }
                 }
+                PlanResult::Failure { session_id, error } => {
+                    // TODO(arjoc): Publish error message
+                    if Some(session_id) != self.current_planning_session {
+                        continue;
+                    }
+                    self.is_planning = false;
+                    self.current_cancellation = None;
+                    self.current_planning_session = None;
+                    let committed: HashSet<String> = self
+                        .pending_replans
+                        .iter()
+                        .filter(|robot_id| self.is_executing_action(robot_id))
+                        .cloned()
+                        .collect();
+                    self.pending_replans = committed;
+
+                    rclrs::log_error!(self.node.logger(), "Background planner failed: {}", error);
+                }
             }
         }
 
-        Plan {
-            waypoints,
-            start_time: builtin_interfaces::msg::Time { sec: 0, nanosec: 0 },
-            plan_id,
-            workflow: String::new(),
-        }
+        // 2. Take a planning snapshot if a replan is needed and spawn background planner
+        let Some(snapshot) = self.take_snapshot() else {
+            return;
+        };
+
+        rclrs::log!(self.node.logger(), "Triggering new plan in background");
+        let sender_clone = self.plan_sender.clone();
+        std::thread::spawn(move || {
+            if let Some(result) = snapshot.replan() {
+                let _ = sender_clone.send(result);
+            }
+        });
     }
 }
 
