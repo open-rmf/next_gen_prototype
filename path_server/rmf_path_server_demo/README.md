@@ -67,6 +67,38 @@ To also enable the reservation destination server (`rmf_reservation_destination_
 ros2 launch rmf_path_server_demo demo_docking.launch.py use_destination_server:=true
 ```
 
+### 5. Nav2 + Gazebo (`gz-sim`) Docking Corridor Mode
+This mode brings up the same 3x8 corridor + 6 protruding dock alcoves layout in Gazebo (`worlds/corridor_docks.sdf`) with multi-robot TurtleBot3 Nav2 stacks (`sp_demo_nav2_bringup`), Gazebo ground-truth localization (`urdf/gz_waffle_ground_truth.sdf.xacro` + `ground_truth_localizer`), a common `opennav_docking` dock database (`config/corridor_docks.yaml`), a 0.05m Nav2 static map (`maps/corridor_nav2.yaml`), the 1.0m RMF planning grid (`maps/corridor_grid.yaml`) on `/map`, `rmf_reservation_destination_server` loaded with `maps/corridor_docks.site.json`, `rmf_path_server`, `rmf_plan_executor`, and `rmf_nav2_traffic`.
+
+Run the launch file:
+```bash
+ros2 launch rmf_path_server_demo demo_corridor_nav2.launch.py
+```
+
+#### Automated Corridor & Docking Scenarios
+You can automatically dispatch multi-robot scenarios in Gazebo + Nav2 using the `scenario` launch argument (or via the `demo_corridor_swap.launch.py` wrapper, which defaults to `scenario:=swap` and `loop:=true`):
+
+```bash
+# Continuous two-robot corridor swap
+ros2 launch rmf_path_server_demo demo_corridor_swap.launch.py
+
+# Or select a specific scenario directly on demo_corridor_nav2.launch.py:
+ros2 launch rmf_path_server_demo demo_corridor_nav2.launch.py scenario:=dock_rotate_pass
+```
+
+Available `scenario` values:
+- `none`: Bring up the simulation and Nav2 stacks without auto-dispatching goals (default for `demo_corridor_nav2.launch.py`).
+- `swap`: Swap `robot0` from `(-2, 0)` to `(5, 0)` and `robot1` from `(5, 0)` to `(-2, 0)` across the corridor.
+- `swap_then_new_goals`: Perform the initial corridor swap, then immediately dispatch follow-up goals (`robot0 -> (-1, 1)`, `robot1 -> (4, 0)`).
+- `mid_swap_retarget`: Start a corridor swap and inject a new goal mid-swap redirecting `robot0` to `(3, -1)` once it crosses `x >= 0.0`.
+- `dock_pass`: Spawn `robot0` at `(-1, 1, pi/2)` and `robot1` at `(-2, 1, 0)` and dispatch both up-front so `robot0` docks into `dock_north_1` at `(-1, 2, pi/2)` while `robot1` passes to `(1, 1, 0)`.
+- `dock_rotate_pass`: Spawn `robot0` at `(0, 1, 0)` (facing East, wrong orientation for docking North) and `robot1` at `(-2, 1, 0)`, and dispatch both up-front so `robot0` translates to `(-1, 1, pi/2)`, rotates 90 degrees in place (gating final progress until `pi/2` is achieved), and docks into `(-1, 2, pi/2)` while traffic management routes `robot1` around to `(1, 1, 0)`.
+
+Additional launch arguments:
+- `loop:=true|false`: Continuously repeat the scenario rounds.
+- `second_robot_delay_sec:=<float>`: Optional delay in seconds before dispatching `robot1`'s initial goal.
+- `use_rviz:=true|false`: Launch RViz2 for each robot namespace alongside Gazebo.
+
 ## Reservation Config Visualization
 
 When the reservation destination server loads a configuration, it republishes

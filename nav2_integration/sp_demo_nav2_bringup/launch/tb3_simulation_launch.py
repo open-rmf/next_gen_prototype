@@ -209,7 +209,13 @@ def generate_launch_description():
     )
 
     bringup_cmd = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(os.path.join(launch_dir, 'bringup_launch.py')),
+        PythonLaunchDescriptionSource(
+            os.path.join(
+                prototype_bringup_dir,
+                'launch',
+                'bringup_launch.py',
+            )
+        ),
         condition=IfCondition(use_navigation),
         launch_arguments={
             'namespace': namespace,
