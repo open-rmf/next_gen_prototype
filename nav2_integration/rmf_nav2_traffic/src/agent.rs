@@ -161,7 +161,7 @@ fn update_amcl_pose(
         inner_nav_client,
     ) in agents.iter_mut()
     {
-        if let Some(amcl_pose_msg) = amcl_pose_sub.subscriber.take_data() {
+        while let Some(amcl_pose_msg) = amcl_pose_sub.subscriber.take_data() {
             amcl_pose.0 = amcl_pose_msg;
             agent.localized = true;
         }

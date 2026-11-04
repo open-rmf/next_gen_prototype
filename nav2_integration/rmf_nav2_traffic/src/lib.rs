@@ -49,9 +49,33 @@ impl Plugin for Nav2TrafficPlugin {
             ));
 
         // Spawn agents last
-        let agent_names = vec!["robot0".to_string(), "robot1".to_string()];
-        for name in agent_names {
+        for name in resolve_agent_names() {
             app.world_mut().spawn(Nav2Agent::new(name));
         }
     }
+}
+
+fn resolve_agent_names() -> Vec<String> {
+    if let Ok(env_agents) = std::env::var("RMF_NAV2_AGENTS") {
+        let names: Vec<String> = env_agents
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        if !names.is_empty() {
+            return names;
+        }
+    }
+
+    let cli_names: Vec<String> = std::env::args()
+        .skip(1)
+        .take_while(|arg| arg != "--ros-args")
+        .filter(|arg| !arg.starts_with('-') && !arg.starts_with('_') && !arg.contains(":="))
+        .collect();
+    if !cli_names.is_empty() {
+        return cli_names;
+    }
+
+    vec!["robot0".to_string(), "robot1".to_string()]
 }

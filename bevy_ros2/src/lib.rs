@@ -24,6 +24,7 @@ use rclrs::{
     Subscription, TerminatedGoal,
 };
 use std::{
+    collections::VecDeque,
     fmt::Debug,
     sync::{Arc, Mutex},
     thread,
@@ -63,23 +64,35 @@ impl Plugin for RclrsPlugin {
     }
 }
 
+pub const DEFAULT_SUBSCRIPTION_QUEUE_LEN: usize = 64;
+
 // Template for creating ROS 2 subscribers
 pub struct RosSubscription<T: MessageIDL + Debug> {
     _subscriber: Arc<Subscription<T>>,
-    data: Arc<Mutex<Option<T>>>,
+    data: Arc<Mutex<VecDeque<T>>>,
+    max_queue_len: usize,
 }
 
 impl<T: MessageIDL + Debug> RosSubscription<T> {
     pub fn new(node: &Arc<NodeState>, topic: String) -> Self {
-        let data = Arc::new(Mutex::new(None));
-        let data_clone: Arc<Mutex<Option<T>>> = Arc::clone(&data);
+        Self::with_capacity(node, topic, DEFAULT_SUBSCRIPTION_QUEUE_LEN)
+    }
+
+    pub fn with_capacity(node: &Arc<NodeState>, topic: String, max_queue_len: usize) -> Self {
+        let max_queue_len = max_queue_len.max(1);
+        let data = Arc::new(Mutex::new(VecDeque::with_capacity(max_queue_len)));
+        let data_clone: Arc<Mutex<VecDeque<T>>> = Arc::clone(&data);
 
         let subscriber = node
             .create_subscription(
                 topic.clone().reliable().transient_local().keep_last(10),
                 move |msg: T| {
                     debug!("Received a message on [{}]: {:?}", topic, msg);
-                    *data_clone.lock().unwrap() = Some(msg.clone());
+                    let mut queue = data_clone.lock().unwrap();
+                    while queue.len() >= max_queue_len {
+                        queue.pop_front();
+                    }
+                    queue.push_back(msg);
 
                     // TODO(@xiyuoh) allow customized qos
                 },
@@ -89,15 +102,20 @@ impl<T: MessageIDL + Debug> RosSubscription<T> {
         Self {
             _subscriber: Arc::new(subscriber),
             data,
+            max_queue_len,
         }
     }
 
+    pub fn max_queue_len(&self) -> usize {
+        self.max_queue_len
+    }
+
     pub fn data_callback(&self) -> Option<T> {
-        self.data.lock().unwrap().as_ref().cloned()
+        self.data.lock().unwrap().back().cloned()
     }
 
     pub fn take_data(&self) -> Option<T> {
-        self.data.lock().unwrap().take()
+        self.data.lock().unwrap().pop_front()
     }
 }
 

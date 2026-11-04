@@ -169,7 +169,7 @@ fn handle_navigation_cancellations(
     }
 }
 
-fn request_publish_feedback_service(
+pub(crate) fn request_publish_feedback_service(
     mut commands: Commands,
     mut navigation_servers: Query<&NavigateToPoseServer>,
     current_nav_requests: Query<&CurrentNavigationRequest>,
@@ -682,7 +682,7 @@ fn publish_navigation_feedback(
     }
 }
 
-fn cleanup_navigation(
+pub(crate) fn cleanup_navigation(
     mut commands: Commands,
     mut nav_completed: EventReader<NavigationCompleted>,
     current_nav_requests: Query<&CurrentNavigationRequest>,

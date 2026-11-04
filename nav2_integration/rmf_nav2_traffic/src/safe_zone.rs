@@ -13,10 +13,11 @@ use ros_env::{
     builtin_interfaces::msg::Time as RosTime,
     geometry_msgs::msg::PoseStamped,
     nav2_msgs::msg::Costmap,
-    rmf_prototype_msgs::msg::{Plan, PlanError, Progress, Region, SafeZone, SafeZoneId},
+    rmf_prototype_msgs::msg::{Plan, PlanError, PlanId, Progress, Region, SafeZone, SafeZoneId},
     std_msgs::msg::{Empty as RosEmpty, Header},
 };
 use std::{
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -31,8 +32,52 @@ pub struct PlanSubscription {
     pub subscriber: Arc<RosSubscription<Plan>>,
 }
 
+const MAX_CACHED_PLANS: usize = 16;
+type PlanRegistryKey = ([u8; 16], u64);
+
 #[derive(Component, Debug, Clone, Default, Deref)]
-pub struct CurrentPlan(pub Option<Plan>);
+pub struct LocalPlanRegistry {
+    plans: HashMap<PlanRegistryKey, Plan>,
+    order: VecDeque<PlanRegistryKey>,
+    #[deref]
+    pub latest_plan: Option<Plan>,
+}
+
+impl LocalPlanRegistry {
+    fn key(plan_id: &PlanId) -> PlanRegistryKey {
+        (plan_id.destination_session.uuid, plan_id.plan_version)
+    }
+
+    pub fn insert(&mut self, plan: Plan) {
+        let key = Self::key(&plan.plan_id);
+        if !self.plans.contains_key(&key) {
+            if self.order.len() >= MAX_CACHED_PLANS {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.plans.remove(&oldest);
+                }
+            }
+            self.order.push_back(key);
+        }
+        self.plans.insert(key, plan.clone());
+        let update_latest = self.latest_plan.as_ref().is_none_or(|curr| {
+            curr.plan_id.destination_session.uuid != plan.plan_id.destination_session.uuid
+                || plan.plan_id.plan_version >= curr.plan_id.plan_version
+        });
+        if update_latest {
+            self.latest_plan = Some(plan);
+        }
+    }
+
+    pub fn get(&self, plan_id: &PlanId) -> Option<&Plan> {
+        self.plans.get(&Self::key(plan_id))
+    }
+
+    pub fn latest(&self) -> Option<&Plan> {
+        self.latest_plan.as_ref()
+    }
+}
+
+pub type CurrentPlan = LocalPlanRegistry;
 
 #[derive(Component)]
 pub struct GateReleaseSubscription {
@@ -148,6 +193,17 @@ pub struct CostmapHandshakeState {
     pub next_seq: u64,
     pub acked_seq: u64,
     pub pending_target: Option<PendingNavigationTarget>,
+    pub last_published_costmap: Option<Costmap>,
+}
+
+pub fn costmap_content_eq(a: &Costmap, b: &Costmap) -> bool {
+    a.header.frame_id == b.header.frame_id
+        && a.metadata.layer == b.metadata.layer
+        && a.metadata.resolution.to_bits() == b.metadata.resolution.to_bits()
+        && a.metadata.size_x == b.metadata.size_x
+        && a.metadata.size_y == b.metadata.size_y
+        && a.metadata.origin == b.metadata.origin
+        && a.data == b.data
 }
 
 pub fn seq_to_stamp(seq: u64) -> RosTime {
@@ -1014,8 +1070,32 @@ pub(crate) fn update_incremental_target(
     ) in subscriptions.iter_mut()
     {
         while let Some(plan) = plan_sub.subscriber.take_data() {
+            let prev_action = progress_tracker.active_action.clone();
             progress_tracker.set_plan(&plan, current_safe_zone.0.as_ref());
-            current_plan.0 = Some(plan);
+            let new_action = progress_tracker.active_action.clone();
+            if prev_action != new_action {
+                if let Some(sz) = current_safe_zone
+                    .0
+                    .as_ref()
+                    .filter(|sz| sz.id.plan_id == plan.plan_id)
+                {
+                    if let Some(pending) = handshake.pending_target.as_mut() {
+                        if pending.target.safe_zone_id.plan_id == plan.plan_id {
+                            pending.target.action = new_action;
+                        }
+                    } else if let Some((tx, ty, tyaw)) = next_target(sz) {
+                        nav_target.write(InnerNavigationTarget::with_action(
+                            e,
+                            sz.id.clone(),
+                            tx as f64,
+                            ty as f64,
+                            tyaw as f64,
+                            new_action,
+                        ));
+                    }
+                }
+            }
+            current_plan.insert(plan);
         }
 
         let mut gate_released = false;
@@ -1025,9 +1105,7 @@ pub(crate) fn update_incremental_target(
         if gate_released {
             progress_tracker.release_gate();
             if progress_tracker.plan_id.is_some() {
-                let current_pose = amcl_pose
-                    .filter(|_| agent.localized)
-                    .map(|p| p.xy_yaw());
+                let current_pose = amcl_pose.filter(|_| agent.localized).map(|p| p.xy_yaw());
                 let updated_prog =
                     progress_tracker.compute_progress(current_pose, latest_progress.0.as_ref());
                 let pose = amcl_pose
@@ -1106,24 +1184,34 @@ pub(crate) fn update_incremental_target(
                         }
                     }
 
-                    handshake.next_seq += 1;
-                    let seq = handshake.next_seq;
-                    let mut costmap = safe_zone.costmap.clone();
-                    costmap.header.stamp = seq_to_stamp(seq);
+                    let should_update = current_safe_zone.should_update_target(&safe_zone);
+                    let costmap_changed = handshake
+                        .last_published_costmap
+                        .as_ref()
+                        .is_none_or(|prev| !costmap_content_eq(prev, &safe_zone.costmap));
 
-                    // Publish stamped costmap and wait for global_costmap ack before dispatching target
-                    if costmap_pub.publisher.publish(costmap.clone()).is_err() {
-                        error!("Failed to publish costmap for agent [{}]", agent.name);
-                        continue;
+                    let mut published_costmap = None;
+                    if should_update || costmap_changed {
+                        handshake.next_seq += 1;
+                        let seq = handshake.next_seq;
+                        let mut costmap = safe_zone.costmap.clone();
+                        costmap.header.stamp = seq_to_stamp(seq);
+
+                        // Publish stamped costmap and wait for global_costmap ack before dispatching target
+                        if costmap_pub.publisher.publish(costmap.clone()).is_err() {
+                            error!("Failed to publish costmap for agent [{}]", agent.name);
+                            continue;
+                        }
+                        handshake.last_published_costmap = Some(costmap.clone());
+                        published_costmap = Some((seq, costmap));
                     }
 
-                    let current_pose = amcl_pose
-                        .filter(|_| agent.localized)
-                        .map(|p| p.xy_yaw());
+                    let current_pose = amcl_pose.filter(|_| agent.localized).map(|p| p.xy_yaw());
 
+                    let matching_plan = current_plan.get(&safe_zone.id.plan_id);
                     let base_progress = progress_tracker.on_safe_zone_with_plan(
                         &safe_zone,
-                        current_plan.0.as_ref(),
+                        matching_plan,
                         current_pose,
                         latest_progress.0.as_ref(),
                     );
@@ -1145,13 +1233,24 @@ pub(crate) fn update_incremental_target(
                         Some(&base_progress),
                         Some(&safe_zone.id),
                     );
-                    let progress_changed = latest_progress.0.as_ref() != Some(&progress_msg);
+                    let meaningful_progress_changed = match latest_progress.0.as_ref() {
+                        None => true,
+                        Some(prev) => {
+                            prev.plan_id != progress_msg.plan_id
+                                || prev.mode != progress_msg.mode
+                                || prev.reached_waypoint != progress_msg.reached_waypoint
+                                || prev.target_waypoint != progress_msg.target_waypoint
+                                || (prev.progress - progress_msg.progress).abs() > 1e-4
+                        }
+                    };
 
-                    if !current_safe_zone.should_update_target(&safe_zone) {
-                        if let Some(pending) = handshake.pending_target.as_mut() {
+                    if !should_update {
+                        if let (Some(pending), Some((_, costmap))) =
+                            (handshake.pending_target.as_mut(), published_costmap)
+                        {
                             pending.costmap = costmap;
                         }
-                        if progress_changed {
+                        if meaningful_progress_changed {
                             let Ok(_) = progress_pub.publisher.publish(progress_msg.clone()) else {
                                 error!("Failed to publish progress for agent [{}]", agent.name);
                                 continue;
@@ -1159,6 +1258,12 @@ pub(crate) fn update_incremental_target(
                             latest_progress.0 = Some(progress_msg);
                         }
                     } else {
+                        let (seq, costmap) = published_costmap.unwrap_or_else(|| {
+                            let seq = handshake.next_seq;
+                            let mut cm = safe_zone.costmap.clone();
+                            cm.header.stamp = seq_to_stamp(seq);
+                            (seq, cm)
+                        });
                         let action = progress_tracker.active_action.clone();
                         info!(
                             "[{:?}] Queuing SafeZone target (waiting for costmap seq={}, action={:?}): ({:.2}, {:.2}, {:.2})",
@@ -1736,5 +1841,85 @@ mod tests {
             tracker.compute_progress(Some((3.0, 1.0, std::f32::consts::PI)), Some(&p_turn));
         assert_eq!(p_upper.reached_waypoint, 5);
         assert!((p_upper.progress - 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn local_plan_registry_matches_exact_plan_id_and_upgrades_late_plan() {
+        use ros_env::rmf_prototype_msgs::msg::Waypoint;
+
+        let mut registry = LocalPlanRegistry::default();
+        let mut plan_v1 = Plan::default();
+        plan_v1.plan_id.destination_session.uuid[0] = 42;
+        plan_v1.plan_id.plan_version = 1;
+        let mut wp0 = Waypoint::default();
+        wp0.position = [0.0, 0.0];
+        let mut wp1 = Waypoint::default();
+        wp1.position = [2.0, 0.0];
+        wp1.arrival_action = "dock:dock_north_1".to_string();
+        plan_v1.waypoints = vec![wp0.clone(), wp1];
+
+        let mut plan_v2 = Plan::default();
+        plan_v2.plan_id.destination_session.uuid[0] = 42;
+        plan_v2.plan_id.plan_version = 2;
+        let mut wp1_v2 = Waypoint::default();
+        wp1_v2.position = [4.0, 0.0];
+        plan_v2.waypoints = vec![wp0, wp1_v2];
+
+        registry.insert(plan_v1.clone());
+        registry.insert(plan_v2.clone());
+
+        assert_eq!(
+            registry.get(&plan_v1.plan_id).unwrap().waypoints[1].position,
+            [2.0, 0.0]
+        );
+        assert_eq!(
+            registry.get(&plan_v2.plan_id).unwrap().waypoints[1].position,
+            [4.0, 0.0]
+        );
+        assert_eq!(registry.latest().unwrap().plan_id, plan_v2.plan_id);
+
+        // If a SafeZone for v1 arrives before Plan v1 is registered, and Plan v1 arrives later:
+        let mut sz_v1 = safe_zone(42, 1, 1, 2.0, 0.0);
+        sz_v1.last_waypoint = 0;
+        sz_v1.target_waypoint = vec![1].try_into().unwrap();
+        sz_v1.target_progress = 1.0;
+
+        let mut tracker = ProgressTracker::default();
+        let _ = tracker.on_safe_zone_with_plan(&sz_v1, None, Some((0.0, 0.0, 0.0)), None);
+        assert_eq!(tracker.active_action, InnerNavigationAction::NavigateToPose);
+
+        tracker.set_plan(&plan_v1, Some(&sz_v1));
+        assert_eq!(
+            tracker.active_action,
+            InnerNavigationAction::DockRobot {
+                use_dock_id: true,
+                dock_id: "dock_north_1".to_string(),
+                dock_type: "simple_charging_dock".to_string(),
+                navigate_to_staging_pose: false,
+            }
+        );
+    }
+
+    #[test]
+    fn costmap_content_equality_ignores_timestamps() {
+        let mut cm1 = Costmap::default();
+        cm1.header.frame_id = "map".to_string();
+        cm1.header.stamp.sec = 10;
+        cm1.metadata.layer = "safe_zone".to_string();
+        cm1.metadata.map_load_time.sec = 10;
+        cm1.metadata.update_time.sec = 10;
+        cm1.metadata.resolution = 0.25;
+        cm1.metadata.size_x = 4;
+        cm1.metadata.size_y = 4;
+        cm1.data = vec![0; 16];
+
+        let mut cm2 = cm1.clone();
+        cm2.header.stamp.sec = 99;
+        cm2.metadata.map_load_time.sec = 99;
+        cm2.metadata.update_time.sec = 99;
+        assert!(costmap_content_eq(&cm1, &cm2));
+
+        cm2.data[5] = 254;
+        assert!(!costmap_content_eq(&cm1, &cm2));
     }
 }
