@@ -15,7 +15,7 @@ on discourse.
 
 ## Pre-requisites
 
-* ROS 2 jazzy
+* ROS 2 [Jazzy Jalisco](https://docs.ros.org/en/jazzy/Releases/Release-Jazzy-Jalisco.html)
 * The latest Rust compiler.
 * Cargo extensions for colcon
 
@@ -63,7 +63,7 @@ on discourse.
 
 > If you prefer to build the base Docker image from scratch. Please use the following command:
 > ```bash
-> docker build --load -t ros2_rust_base:jazzy -f docker/Dockerfile.base .
+> docker compose -f docker/docker-compose.yml build
 > ```
 </details>
 
