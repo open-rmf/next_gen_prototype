@@ -344,8 +344,8 @@ fn on_inner_navigation_feedback(
 ) {
     let event = trigger.event();
     if let Ok(inner_nav_client) = inner_nav_clients.get(event.agent) {
-        if let Some(active_goal) = inner_nav_client.goal() {
-            if active_goal.id() != &event.safe_zone_id {
+        if let Some(active_id) = inner_nav_client.active_safe_zone_id() {
+            if &active_id != &event.safe_zone_id {
                 return;
             }
         }
@@ -406,7 +406,7 @@ fn monitor_inner_navigation_clients(
             agents.get_mut(request.agent)
         {
             // If reached destination, complete order
-            if client.active_goal.is_none() && request.destination_reached(pose) {
+            if !client.has_active_goal() && request.destination_reached(pose) {
                 info!(
                     "[{:?}] Destination reached, marking NavigationRequest as completed",
                     request.agent.index()

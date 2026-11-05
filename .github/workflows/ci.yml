@@ -2,9 +2,9 @@ name: Next-Gen Prototype CI
 
 on:
   push:
-    branches: [ main, epic/next-gen-base ]
+    branches: [ main, epic/next-gen-base, arjoc/refactor/nav_action_strategy, arjoc/feat/nav2_docking_strategy ]
   pull_request:
-    branches: [ main, epic/next-gen-base ]
+    branches: [ main, epic/next-gen-base, arjoc/feat/corridor_nav2_gz_demo, arjoc/refactor/nav_action_strategy ]
   workflow_dispatch:
 
 jobs:
