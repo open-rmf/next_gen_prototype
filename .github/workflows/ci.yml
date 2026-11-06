@@ -2,9 +2,9 @@ name: Next-Gen Prototype CI
 
 on:
   push:
-    branches: [ main, epic/next-gen-base ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, epic/next-gen-base ]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
