@@ -1,5 +1,6 @@
 use crate::{
     agent::AmclPose,
+    navigation_server::{AgentPose, CancelledNavigationSessions, CurrentNavigationRequest},
     safe_zone::{
         build_progress_status, CurrentSafeZone, LatestProgress, PlanErrorPublisher,
         ProgressPublisher, ProgressTracker,
@@ -15,7 +16,10 @@ use rclrs::*;
 use ros_env::{
     builtin_interfaces::msg::Time as RosTime,
     geometry_msgs::msg::{Point, Pose, PoseStamped, Quaternion},
-    nav2_msgs::action::{NavigateToPose, NavigateToPose_Feedback, NavigateToPose_Goal},
+    nav2_msgs::action::{
+        DockRobot, DockRobot_Goal, NavigateToPose, NavigateToPose_Feedback, NavigateToPose_Goal,
+        UndockRobot, UndockRobot_Goal,
+    },
     rmf_prototype_msgs::msg::{Error as RmfError, PlanError, SafeZoneId},
     std_msgs::msg::Header,
 };
@@ -50,6 +54,16 @@ impl<A: ActionIDL> NavActionStrategy for GoalClient<A> {
 pub enum InnerNavigationAction {
     #[default]
     NavigateToPose,
+    DockRobot {
+        navigate_to_staging_pose: bool,
+    },
+    UndockRobot,
+}
+
+impl InnerNavigationAction {
+    pub fn holds_pre_waypoint_progress(&self) -> bool {
+        matches!(self, Self::DockRobot { .. } | Self::UndockRobot)
+    }
 }
 
 #[derive(Clone, Debug, Event)]
@@ -127,13 +141,21 @@ pub struct AgentGoalState {
 #[derive(Component, Clone)]
 pub struct InnerNavigationClient {
     pub action_client: Arc<RosActionClient<NavigateToPose>>,
+    pub dock_client: Arc<RosActionClient<DockRobot>>,
+    pub undock_client: Arc<RosActionClient<UndockRobot>>,
     pub state: Arc<Mutex<AgentGoalState>>,
 }
 
 impl InnerNavigationClient {
-    pub fn new(action_client: Arc<RosActionClient<NavigateToPose>>) -> Self {
+    pub fn new(
+        action_client: Arc<RosActionClient<NavigateToPose>>,
+        dock_client: Arc<RosActionClient<DockRobot>>,
+        undock_client: Arc<RosActionClient<UndockRobot>>,
+    ) -> Self {
         Self {
             action_client,
+            dock_client,
+            undock_client,
             state: Arc::new(Mutex::new(AgentGoalState::default())),
         }
     }
@@ -150,6 +172,14 @@ impl InnerNavigationClient {
             .lock()
             .ok()
             .and_then(|s| s.active_goal.as_ref().map(|g| g.safe_zone_id.clone()))
+    }
+
+    pub fn matches_active_goal_id(&self, id: &SafeZoneId) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|s| s.active_goal.as_ref().map(|g| &g.safe_zone_id == id))
+            .unwrap_or(true)
     }
 
     pub fn mark_active_goal_superseded(&self) {
@@ -199,6 +229,8 @@ pub enum GoalOutcomeStatus {
     Succeeded,
     Cancelled,
     Aborted,
+    DockingFailed { error_code: u16, msg: String },
+    UndockingFailed { error_code: u16, msg: String },
 }
 
 #[derive(Clone)]
@@ -217,11 +249,16 @@ pub struct InnerNavigationServices {
 impl InnerNavigationServices {
     pub fn from_app(app: &mut App) -> Self {
         let preempt_and_prepare_service = app.spawn_service(preempt_and_prepare_goal);
+        let execute_dock_service = app.spawn_service(execute_dock_robot);
+        let execute_undock_service = app.spawn_service(execute_undock_robot);
         let execute_nav_service = app.spawn_service(execute_navigate_to_pose);
         let reconcile_outcome_service = app.spawn_service(reconcile_goal_outcome);
 
-        // One-shot Crossflow workflow for goal dispatch:
-        //   preempt_and_prepare_goal -> execute_navigate_to_pose -> reconcile_goal_outcome
+        // One-shot branching Crossflow workflow:
+        //   preempt_and_prepare_goal
+        //     ├── [Dock]     -> execute_dock_robot     ──┐
+        //     ├── [Undock]   -> execute_undock_robot   ──┼──> reconcile_goal_outcome
+        //     └── [Navigate] -> execute_navigate_to_pose ┘
         let dispatch_target = app.world_mut().spawn_io_workflow(|scope, builder| {
             let reconcile = builder.create_node(reconcile_outcome_service);
 
@@ -229,8 +266,25 @@ impl InnerNavigationServices {
                 .chain(scope.start)
                 .then(preempt_and_prepare_service)
                 .dispose_on_none()
-                .then(execute_nav_service)
-                .connect(reconcile.input);
+                .fork_result(
+                    |dock_chain| {
+                        dock_chain
+                            .then(execute_dock_service)
+                            .connect(reconcile.input);
+                    },
+                    |rest_chain| {
+                        rest_chain.fork_result(
+                            |undock_chain| {
+                                undock_chain
+                                    .then(execute_undock_service)
+                                    .connect(reconcile.input);
+                            },
+                            |nav_chain| {
+                                nav_chain.then(execute_nav_service).connect(reconcile.input);
+                            },
+                        );
+                    },
+                );
 
             builder.chain(reconcile.output).connect(scope.terminate);
         });
@@ -256,6 +310,27 @@ impl InnerNavigationServices {
     }
 }
 
+#[derive(Component, Clone, Default)]
+pub struct LatestInnerFeedbackPose(pub Option<PoseStamped>);
+
+fn record_inner_navigation_feedback(
+    trigger: Trigger<InnerNavigationFeedback>,
+    mut commands: Commands,
+    inner_nav_clients: Query<&InnerNavigationClient>,
+) {
+    let event = trigger.event();
+    if let Ok(inner_nav_client) = inner_nav_clients.get(event.agent) {
+        if !inner_nav_client.matches_active_goal_id(&event.safe_zone_id) {
+            return;
+        }
+    }
+    commands
+        .entity(event.agent)
+        .insert(LatestInnerFeedbackPose(Some(
+            event.feedback.current_pose.clone(),
+        )));
+}
+
 #[derive(Default)]
 pub struct InnerNavigationClientPlugin {}
 
@@ -265,7 +340,8 @@ impl Plugin for InnerNavigationClientPlugin {
             .add_event::<InnerNavigationFeedback>()
             .add_event::<CancelInnerForAgent>()
             .add_systems(Update, dispatch_external_cancellations)
-            .add_observer(create_inner_navigation_client);
+            .add_observer(create_inner_navigation_client)
+            .add_observer(record_inner_navigation_feedback);
 
         let navigation_services = InnerNavigationServices::from_app(app);
         app.insert_resource(navigation_services);
@@ -282,12 +358,15 @@ fn create_inner_navigation_client(
     let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
         return;
     };
-    let action_name = agent_name + "/inner/navigate_to_pose";
-    let inner_action_client = RosActionClient::<NavigateToPose>::new(&node, action_name);
+    let nav_action = format!("{}/inner/navigate_to_pose", agent_name);
+    let dock_action = format!("{}/inner/dock_robot", agent_name);
+    let undock_action = format!("{}/inner/undock_robot", agent_name);
 
-    commands
-        .entity(e)
-        .insert(InnerNavigationClient::new(Arc::new(inner_action_client)));
+    commands.entity(e).insert(InnerNavigationClient::new(
+        Arc::new(RosActionClient::<NavigateToPose>::new(&node, nav_action)),
+        Arc::new(RosActionClient::<DockRobot>::new(&node, dock_action)),
+        Arc::new(RosActionClient::<UndockRobot>::new(&node, undock_action)),
+    ));
 }
 
 fn dispatch_external_cancellations(
@@ -320,15 +399,23 @@ fn prepare_external_cancellation(
     let mut state = client.state.lock().ok()?;
     state.cancelled_up_to_seq = state.next_seq;
 
-    let Some(active) = state.active_goal.as_mut() else {
-        return None;
-    };
-    active.superseded = true;
-    let prior_to_cancel = active.goal_client.take();
-    let cancel_all_nav = if prior_to_cancel.is_none() {
-        Some(Arc::clone(&client.action_client))
+    let (prior_to_cancel, cancel_all_nav) = if let Some(active) = state.active_goal.as_mut() {
+        active.superseded = true;
+        let prior = active.goal_client.take();
+        let cancel_nav =
+            if prior.is_none() && matches!(active.action, InnerNavigationAction::NavigateToPose) {
+                Some(Arc::clone(&client.action_client))
+            } else {
+                None
+            };
+        (prior, cancel_nav)
+    } else if matches!(
+        state.last_action,
+        Some(InnerNavigationAction::NavigateToPose)
+    ) {
+        (None, Some(Arc::clone(&client.action_client)))
     } else {
-        None
+        return None;
     };
 
     commands
@@ -393,11 +480,27 @@ struct PreparedGoalContext {
 }
 
 #[derive(Clone)]
+struct PreparedDockGoal {
+    ctx: PreparedGoalContext,
+    client: Arc<RosActionClient<DockRobot>>,
+    goal: DockRobot_Goal,
+}
+
+#[derive(Clone)]
+struct PreparedUndockGoal {
+    ctx: PreparedGoalContext,
+    client: Arc<RosActionClient<UndockRobot>>,
+    goal: UndockRobot_Goal,
+}
+
+#[derive(Clone)]
 struct PreparedNavGoal {
     ctx: PreparedGoalContext,
     client: Arc<RosActionClient<NavigateToPose>>,
     goal: NavigateToPose_Goal,
 }
+
+type PreparedBranch = Result<PreparedDockGoal, Result<PreparedUndockGoal, PreparedNavGoal>>;
 
 fn target_to_pose_stamped(x: f64, y: f64, yaw: f64) -> PoseStamped {
     let quat = UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
@@ -439,13 +542,22 @@ pub fn should_preempt_goal(
         || (candidate_id == current_id && candidate_action != current_action)
 }
 
-/// Step 1 (Blocking): Preempts any older active goal and prepares the navigation target.
+/// Step 1 (Blocking): Preempts any older active goal and routes the target into
+/// the Dock, Undock, or NavigateToPose branch.
 fn preempt_and_prepare_goal(
     Blocking {
         request: target, ..
     }: Blocking<InnerNavigationTarget>,
     clients: Query<&InnerNavigationClient>,
-) -> Option<PreparedNavGoal> {
+    cancelled_sessions: Query<&CancelledNavigationSessions>,
+) -> Option<PreparedBranch> {
+    if cancelled_sessions
+        .get(target.agent)
+        .is_ok_and(|cancelled| cancelled.contains(&target.safe_zone_id.plan_id.destination_session))
+    {
+        return None;
+    }
+
     let Ok(client) = clients.get(target.agent) else {
         return None;
     };
@@ -470,7 +582,7 @@ fn preempt_and_prepare_goal(
         let next_is_nav = matches!(target.action, InnerNavigationAction::NavigateToPose);
 
         // Consecutive NavigateToPose goals preempt seamlessly inside Nav2's bt_navigator;
-        // switching between different action types cancels the previous action first.
+        // switching between Dock/Undock/Navigate requires cancelling the previous action first.
         if !(existing_is_nav && next_is_nav) {
             mark_cancelled_up_to = true;
             prior_to_cancel = active.goal_client.take();
@@ -510,14 +622,47 @@ fn preempt_and_prepare_goal(
         cancel_all_nav,
     };
 
-    Some(PreparedNavGoal {
-        ctx,
-        client: Arc::clone(&client.action_client),
-        goal: NavigateToPose_Goal {
-            pose,
-            behavior_tree: String::new(),
-        },
-    })
+    match &target.action {
+        InnerNavigationAction::DockRobot {
+            navigate_to_staging_pose,
+        } => {
+            let goal = DockRobot_Goal {
+                use_dock_id: false,
+                dock_id: String::new(),
+                dock_pose: pose,
+                dock_type: String::new(),
+                max_staging_time: 1000.0,
+                navigate_to_staging_pose: *navigate_to_staging_pose,
+            };
+            Some(Ok(PreparedDockGoal {
+                ctx,
+                client: Arc::clone(&client.dock_client),
+                goal,
+            }))
+        }
+        InnerNavigationAction::UndockRobot => {
+            let goal = UndockRobot_Goal {
+                dock_type: String::new(),
+                max_undocking_time: 30.0,
+            };
+            Some(Err(Ok(PreparedUndockGoal {
+                ctx,
+                client: Arc::clone(&client.undock_client),
+                goal,
+            })))
+        }
+        InnerNavigationAction::NavigateToPose => {
+            let goal = NavigateToPose_Goal {
+                pose,
+                behavior_tree: String::new(),
+            };
+            Some(Err(Err(PreparedNavGoal {
+                ctx,
+                client: Arc::clone(&client.action_client),
+                goal,
+            })))
+        }
+    }
 }
 
 async fn cancel_prior_if_needed(ctx: &PreparedGoalContext) {
@@ -549,7 +694,135 @@ fn register_or_cancel_handle(
     None
 }
 
-/// Step 2 (Async): Executes `NavigateToPose` on `/<robot>/inner/navigate_to_pose`.
+/// Branch A (Async): Executes `DockRobot` on `/<robot>/inner/dock_robot`.
+fn execute_dock_robot(
+    Async {
+        request: prepared, ..
+    }: Async<PreparedDockGoal>,
+    executor_commands: Res<RclrsExecutorCommands>,
+) -> impl Future<Output = GoalExecutionOutcome> {
+    let fallback_seq = prepared.ctx.seq;
+    let fallback_target = prepared.ctx.target.clone();
+    executor_commands
+        .run(async move {
+            let PreparedDockGoal { ctx, client, goal } = prepared;
+            cancel_prior_if_needed(&ctx).await;
+
+            let Some(goal_client) = client.request_goal(goal).await else {
+                return GoalExecutionOutcome {
+                    seq: ctx.seq,
+                    target: ctx.target,
+                    status: GoalOutcomeStatus::DockingFailed {
+                        error_code: 0,
+                        msg: "Failed to request DockRobot goal".to_string(),
+                    },
+                };
+            };
+
+            let strategy_handle: Arc<dyn NavActionStrategy> = Arc::new(goal_client.clone());
+            if let Some(to_cancel) = register_or_cancel_handle(&ctx.state, ctx.seq, strategy_handle)
+            {
+                let _ = to_cancel.is_cancellation_accepted().await;
+                return GoalExecutionOutcome {
+                    seq: ctx.seq,
+                    target: ctx.target,
+                    status: GoalOutcomeStatus::Cancelled,
+                };
+            }
+
+            let (status, response) = goal_client.result.await;
+            let outcome_status = match status {
+                GoalStatusCode::Succeeded if response.success => GoalOutcomeStatus::Succeeded,
+                GoalStatusCode::Cancelled => GoalOutcomeStatus::Cancelled,
+                _ => GoalOutcomeStatus::DockingFailed {
+                    error_code: response.error_code,
+                    msg: response.error_msg,
+                },
+            };
+
+            GoalExecutionOutcome {
+                seq: ctx.seq,
+                target: ctx.target,
+                status: outcome_status,
+            }
+        })
+        .map(move |res| {
+            res.unwrap_or(GoalExecutionOutcome {
+                seq: fallback_seq,
+                target: fallback_target,
+                status: GoalOutcomeStatus::DockingFailed {
+                    error_code: 0,
+                    msg: "Executor cancelled DockRobot future".to_string(),
+                },
+            })
+        })
+}
+
+/// Branch B (Async): Executes `UndockRobot` on `/<robot>/inner/undock_robot`.
+fn execute_undock_robot(
+    Async {
+        request: prepared, ..
+    }: Async<PreparedUndockGoal>,
+    executor_commands: Res<RclrsExecutorCommands>,
+) -> impl Future<Output = GoalExecutionOutcome> {
+    let fallback_seq = prepared.ctx.seq;
+    let fallback_target = prepared.ctx.target.clone();
+    executor_commands
+        .run(async move {
+            let PreparedUndockGoal { ctx, client, goal } = prepared;
+            cancel_prior_if_needed(&ctx).await;
+
+            let Some(goal_client) = client.request_goal(goal).await else {
+                return GoalExecutionOutcome {
+                    seq: ctx.seq,
+                    target: ctx.target,
+                    status: GoalOutcomeStatus::UndockingFailed {
+                        error_code: 0,
+                        msg: "Failed to request UndockRobot goal".to_string(),
+                    },
+                };
+            };
+
+            let strategy_handle: Arc<dyn NavActionStrategy> = Arc::new(goal_client.clone());
+            if let Some(to_cancel) = register_or_cancel_handle(&ctx.state, ctx.seq, strategy_handle)
+            {
+                let _ = to_cancel.is_cancellation_accepted().await;
+                return GoalExecutionOutcome {
+                    seq: ctx.seq,
+                    target: ctx.target,
+                    status: GoalOutcomeStatus::Cancelled,
+                };
+            }
+
+            let (status, response) = goal_client.result.await;
+            let outcome_status = match status {
+                GoalStatusCode::Succeeded if response.success => GoalOutcomeStatus::Succeeded,
+                GoalStatusCode::Cancelled => GoalOutcomeStatus::Cancelled,
+                _ => GoalOutcomeStatus::UndockingFailed {
+                    error_code: response.error_code,
+                    msg: response.error_msg,
+                },
+            };
+
+            GoalExecutionOutcome {
+                seq: ctx.seq,
+                target: ctx.target,
+                status: outcome_status,
+            }
+        })
+        .map(move |res| {
+            res.unwrap_or(GoalExecutionOutcome {
+                seq: fallback_seq,
+                target: fallback_target,
+                status: GoalOutcomeStatus::UndockingFailed {
+                    error_code: 0,
+                    msg: "Executor cancelled UndockRobot future".to_string(),
+                },
+            })
+        })
+}
+
+/// Branch C (Async): Executes `NavigateToPose` on `/<robot>/inner/navigate_to_pose`.
 fn execute_navigate_to_pose(
     Async {
         request: prepared,
@@ -625,7 +898,8 @@ fn execute_navigate_to_pose(
 }
 
 /// Step 3 (Blocking): Reconciles the finished goal outcome with `ProgressTracker`,
-/// re-dispatching if orientation is not yet satisfied or publishing `PlanError` on abort.
+/// re-dispatching if orientation is not yet satisfied or releasing holds and
+/// publishing `PlanError` on abort / docking failure.
 fn reconcile_goal_outcome(
     Blocking {
         request: outcome, ..
@@ -634,13 +908,18 @@ fn reconcile_goal_outcome(
     nav_services: Res<InnerNavigationServices>,
     clients: Query<&InnerNavigationClient>,
     mut cancelling_inner: Query<&mut CancellingInnerNavigation>,
+    current_nav_requests: Query<&CurrentNavigationRequest>,
+    mut cancelled_sessions: Query<&mut CancelledNavigationSessions>,
     error_publishers: Query<&PlanErrorPublisher>,
     mut progress_query: Query<(
-        &ProgressTracker,
+        &Nav2Agent,
+        &mut ProgressTracker,
         &ProgressPublisher,
         &mut LatestProgress,
         Option<&CurrentSafeZone>,
         Option<&AmclPose>,
+        Option<&AgentPose>,
+        Option<&LatestInnerFeedbackPose>,
     )>,
 ) {
     let agent = outcome.target.agent;
@@ -674,8 +953,16 @@ fn reconcile_goal_outcome(
 
     match outcome.status {
         GoalOutcomeStatus::Succeeded => {
-            if let Ok((tracker, progress_pub, mut latest_progress, current_safe_zone, amcl_pose)) =
-                progress_query.get_mut(agent)
+            if let Ok((
+                agent_comp,
+                mut tracker,
+                progress_pub,
+                mut latest_progress,
+                current_safe_zone,
+                amcl_pose,
+                agent_pose,
+                latest_fb_pose,
+            )) = progress_query.get_mut(agent)
             {
                 let matches_sz = current_safe_zone
                     .and_then(|csz| csz.0.as_ref())
@@ -684,7 +971,15 @@ fn reconcile_goal_outcome(
                 if matches_sz
                     && tracker.plan_id.as_ref() == Some(&outcome.target.safe_zone_id.plan_id)
                 {
-                    let current_pose = amcl_pose.map(|p| p.xy_yaw());
+                    if outcome.target.action.holds_pre_waypoint_progress() {
+                        tracker.mark_action_completed();
+                    }
+                    let fb_pose = latest_fb_pose.and_then(|p| p.0.as_ref());
+                    let current_pose = amcl_pose
+                        .filter(|_| agent_comp.localized)
+                        .map(|p| p.xy_yaw())
+                        .or_else(|| fb_pose.map(|p| AgentPose(p.clone()).xy_yaw()))
+                        .or_else(|| agent_pose.map(|p| p.xy_yaw()));
                     if !tracker.is_target_pose_satisfied(current_pose) {
                         warn!(
                             "[{:?}] Nav2 reported goal succeeded before target pose was satisfied (current={:?}); retrying goal {:?}.",
@@ -701,10 +996,13 @@ fn reconcile_goal_outcome(
                         tracker.mark_target_reached(latest_progress.0.as_ref())
                     {
                         let pose = amcl_pose
+                            .filter(|_| agent_comp.localized)
                             .map(|p| PoseStamped {
                                 header: p.0.header.clone(),
                                 pose: p.0.pose.pose.clone(),
                             })
+                            .or_else(|| fb_pose.cloned())
+                            .or_else(|| agent_pose.map(|p| p.0.clone()))
                             .unwrap_or_default();
                         let sz_id = current_safe_zone
                             .and_then(|csz| csz.0.as_ref().map(|sz| &sz.id))
@@ -717,6 +1015,94 @@ fn reconcile_goal_outcome(
                             latest_progress.0 = Some(progress_msg);
                         }
                     }
+                }
+            }
+        }
+        GoalOutcomeStatus::DockingFailed { error_code, msg }
+        | GoalOutcomeStatus::UndockingFailed { error_code, msg } => {
+            if let Ok((
+                agent_comp,
+                mut tracker,
+                progress_pub,
+                mut latest_progress,
+                current_safe_zone,
+                amcl_pose,
+                agent_pose,
+                latest_fb_pose,
+            )) = progress_query.get_mut(agent)
+            {
+                tracker.force_release_holds();
+                if tracker.plan_id.is_some() {
+                    let fb_pose = latest_fb_pose.and_then(|p| p.0.as_ref());
+                    let current_pose = amcl_pose
+                        .filter(|_| agent_comp.localized)
+                        .map(|p| p.xy_yaw())
+                        .or_else(|| fb_pose.map(|p| AgentPose(p.clone()).xy_yaw()))
+                        .or_else(|| agent_pose.map(|p| p.xy_yaw()));
+                    let updated_prog =
+                        tracker.compute_progress(current_pose, latest_progress.0.as_ref());
+                    let pose = amcl_pose
+                        .filter(|_| agent_comp.localized)
+                        .map(|p| PoseStamped {
+                            header: p.0.header.clone(),
+                            pose: p.0.pose.pose.clone(),
+                        })
+                        .or_else(|| fb_pose.cloned())
+                        .or_else(|| agent_pose.map(|p| p.0.clone()))
+                        .unwrap_or_default();
+                    let sz_id = current_safe_zone
+                        .and_then(|csz| csz.0.as_ref().map(|sz| &sz.id))
+                        .or(Some(&outcome.target.safe_zone_id));
+                    let mode = tracker.execution_mode(false);
+                    let progress_msg =
+                        build_progress_status(pose, mode, Some(&updated_prog), sz_id);
+                    let _ = progress_pub.publisher.publish(progress_msg.clone());
+                    latest_progress.0 = Some(progress_msg);
+                }
+            }
+
+            if let Ok(current_nav_req) = current_nav_requests.get(agent) {
+                if current_nav_req.session()
+                    == &outcome.target.safe_zone_id.plan_id.destination_session
+                {
+                    if let Ok(mut cancelled) = cancelled_sessions.get_mut(agent) {
+                        for session in current_nav_req.superseded_sessions() {
+                            cancelled.insert(session.clone());
+                        }
+                        cancelled.insert(current_nav_req.session().clone());
+                    }
+                    current_nav_req.cancel();
+                    commands.entity(agent).remove::<CurrentNavigationRequest>();
+                }
+            }
+
+            if let Ok(publisher) = error_publishers.get(agent) {
+                let plan_error = PlanError {
+                    error: RmfError {
+                        code: RmfError::CODE_UNSPECIFIED_ERROR,
+                        message: format!(
+                            "Docking/undocking action failed for agent {:?} (code={}): {}",
+                            agent.index(),
+                            error_code,
+                            msg
+                        ),
+                        parameters: String::new(),
+                    },
+                    plan_id: outcome.target.safe_zone_id.plan_id.clone(),
+                };
+                if let Err(e) = publisher.publisher.publish(plan_error) {
+                    error!(
+                        "Failed to publish PlanError for agent {:?}: {:?}",
+                        agent.index(),
+                        e
+                    );
+                } else {
+                    warn!(
+                        "[{:?}] Docking action failed (code={}, msg='{}'); gave up and published PlanError (CODE_UNSPECIFIED_ERROR).",
+                        agent.index(),
+                        error_code,
+                        msg
+                    );
                 }
             }
         }
@@ -833,5 +1219,17 @@ mod tests {
         assert!(!is_safe_zone_newer(&sz_v1, &sz_v2));
         assert!(is_safe_zone_newer(&sz_next_plan, &sz_v2));
         assert!(is_safe_zone_newer(&sz_new_session, &sz_next_plan));
+    }
+
+    #[test]
+    fn preemption_triggers_on_action_upgrade_for_same_safe_zone() {
+        let sz = safe_zone_id(1, 2, 3);
+        let nav = InnerNavigationAction::NavigateToPose;
+        let dock = InnerNavigationAction::DockRobot {
+            navigate_to_staging_pose: false,
+        };
+
+        assert!(!should_preempt_goal(&sz, &nav, &sz, &nav));
+        assert!(should_preempt_goal(&sz, &dock, &sz, &nav));
     }
 }

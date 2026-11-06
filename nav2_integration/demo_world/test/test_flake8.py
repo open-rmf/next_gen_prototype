@@ -13,13 +13,15 @@
 # limitations under the License.
 
 from ament_flake8.main import main_with_errors
+import flake8.checker
 import pytest
 
 
 @pytest.mark.flake8
 @pytest.mark.linter
-def test_flake8():
-    rc, errors = main_with_errors(argv=[])
+def test_flake8(monkeypatch):
+    monkeypatch.setattr(flake8.checker, '_try_initialize_processpool', lambda *args: None)
+    rc, errors = main_with_errors(argv=['test'])
     assert rc == 0, \
         'Found %d code style errors / warnings:\n' % len(errors) + \
         '\n'.join(errors)
