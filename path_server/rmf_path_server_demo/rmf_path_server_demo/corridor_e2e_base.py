@@ -258,6 +258,9 @@ class CorridorNav2E2ETestBase(unittest.TestCase):
                 if r not in self.statuses:
                     all_reached = False
                     break
+                if self.statuses[r].mode == Progress.MODE_ACTION:
+                    all_reached = False
+                    break
                 tx, ty = target[0], target[1]
                 rx, ry = self._robot_pos(r)
                 if math.hypot(rx - tx, ry - ty) >= tolerance:
@@ -272,7 +275,11 @@ class CorridorNav2E2ETestBase(unittest.TestCase):
                 return
 
         current_poses = {
-            r: (self._robot_pos(r), self._robot_yaw(r))
+            r: (
+                self._robot_pos(r),
+                self._robot_yaw(r),
+                self.statuses[r].mode,
+            )
             if r in self.statuses
             else None
             for r in targets
