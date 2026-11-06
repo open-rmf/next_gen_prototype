@@ -1,10 +1,14 @@
 use crate::{
     agent::AmclPose,
-    inner_navigation_client::{CancellingInnerNavigation, InnerNavigationTarget},
+    inner_navigation_client::{
+        CancellingInnerNavigation, InnerNavigationClient, InnerNavigationServices,
+        InnerNavigationTarget,
+    },
     Nav2Agent,
 };
 use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
+use crossflow::prelude::*;
 use ros_env::{
     builtin_interfaces::msg::Time as RosTime,
     geometry_msgs::msg::PoseStamped,
@@ -278,6 +282,14 @@ impl ProgressTracker {
             ..Default::default()
         })
     }
+
+    pub fn execution_mode(&self, is_actively_navigating: bool) -> u8 {
+        if is_actively_navigating {
+            Progress::MODE_NAVIGATING
+        } else {
+            Progress::MODE_IDLE
+        }
+    }
 }
 
 pub fn build_progress_status(
@@ -503,7 +515,9 @@ fn create_plan_error_publisher(
 }
 
 fn update_incremental_target(
-    mut nav_target: EventWriter<InnerNavigationTarget>,
+    mut commands: Commands,
+    nav_services: Res<InnerNavigationServices>,
+    inner_nav_clients: Query<&InnerNavigationClient>,
     mut subscriptions: Query<
         (
             Entity,
@@ -574,9 +588,10 @@ fn update_incremental_target(
                             pose: p.0.pose.pose.clone(),
                         })
                         .unwrap_or_default();
+                    let mode = progress_tracker.execution_mode(true);
                     let progress_msg = build_progress_status(
                         pose,
-                        Progress::MODE_NAVIGATING,
+                        mode,
                         Some(&base_progress),
                         Some(&safe_zone.id),
                     );
@@ -604,6 +619,10 @@ fn update_incremental_target(
                             continue;
                         };
                         latest_progress.0 = Some(progress_msg);
+
+                        if let Ok(client) = inner_nav_clients.get(e) {
+                            client.mark_active_goal_superseded();
+                        }
 
                         *current_safe_zone = CurrentSafeZone(Some(safe_zone.clone()));
 
@@ -637,7 +656,9 @@ fn update_incremental_target(
                 "[{:?}] Costmap (seq={}) applied, dispatching SafeZone target: ({:.2}, {:.2}, {:.2})",
                 agent.name, pending.required_seq, tx, ty, tyaw
             );
-            nav_target.write(pending.target);
+            let _ = commands
+                .request(pending.target, nav_services.dispatch_target.clone())
+                .detach();
         } else if let Some(pending) = handshake.pending_target.as_mut() {
             if pending.last_published.elapsed() >= Duration::from_millis(500) {
                 let _ = costmap_pub.publisher.publish(pending.costmap.clone());
