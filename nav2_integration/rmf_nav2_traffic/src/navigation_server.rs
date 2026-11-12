@@ -1,10 +1,14 @@
 use crate::{
+    agent::AmclPose,
     destination::DestinationGoalPublisher,
     inner_navigation_client::{
         CancelInnerForAgent, CancellingInnerNavigation, InnerNavigationClient,
         InnerNavigationFeedback,
     },
-    safe_zone::{CurrentSafeZone, ProgressPublisher, SafeZoneSubscription},
+    safe_zone::{
+        build_progress_status, CurrentSafeZone, LatestProgress, ProgressPublisher,
+        SafeZoneSubscription,
+    },
     Nav2Agent,
 };
 use bevy::prelude::*;
@@ -472,15 +476,26 @@ fn cleanup_navigation(
     mut commands: Commands,
     mut nav_completed: EventReader<NavigationCompleted>,
     current_nav_requests: Query<&CurrentNavigationRequest>,
-    safe_zones: Query<(&SafeZoneSubscription, &CurrentSafeZone, &ProgressPublisher)>,
+    mut safe_zones: Query<(
+        &SafeZoneSubscription,
+        &CurrentSafeZone,
+        &ProgressPublisher,
+        &mut LatestProgress,
+        Option<&AmclPose>,
+    )>,
 ) {
     for event in nav_completed.read() {
         if current_nav_requests.get(event.agent).is_ok_and(|req| {
             req.request.agent == event.agent && req.request.plan_id == event.plan_id
         }) {
             // Publish final Progress message to indicate path completion
-            if let Ok((safe_zone_sub, current_safe_zone, progress_pub)) =
-                safe_zones.get(event.agent)
+            if let Ok((
+                safe_zone_sub,
+                current_safe_zone,
+                progress_pub,
+                mut latest_progress,
+                amcl_pose,
+            )) = safe_zones.get_mut(event.agent)
             {
                 if let Some(safe_zone) = safe_zone_sub
                     .subscriber
@@ -488,13 +503,28 @@ fn cleanup_navigation(
                     .or_else(|| current_safe_zone.0.clone())
                 {
                     let target_wp = safe_zone.target_waypoint.first().copied().unwrap_or(0);
-                    let _ = progress_pub.publisher.publish(Progress {
+                    let pose = amcl_pose
+                        .map(|p| PoseStamped {
+                            header: p.0.header.clone(),
+                            pose: p.0.pose.pose.clone(),
+                        })
+                        .unwrap_or_default();
+                    let base_progress = Progress {
                         progress: safe_zone.target_progress,
                         reached_waypoint: target_wp,
                         target_waypoint: target_wp,
                         reached_keys: vec![],
                         plan_id: safe_zone.id.plan_id.clone(),
-                    });
+                        ..Default::default()
+                    };
+                    let final_progress = build_progress_status(
+                        pose,
+                        Progress::MODE_IDLE,
+                        Some(&base_progress),
+                        Some(&safe_zone.id),
+                    );
+                    let _ = progress_pub.publisher.publish(final_progress.clone());
+                    latest_progress.0 = Some(final_progress);
                 }
             }
             commands

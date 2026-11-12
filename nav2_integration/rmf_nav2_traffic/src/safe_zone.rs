@@ -1,12 +1,13 @@
 use crate::{
-    inner_navigation_client::InnerNavigationTarget, navigation_server::CurrentNavigationRequest,
-    Nav2Agent,
+    agent::AmclPose, inner_navigation_client::InnerNavigationTarget,
+    navigation_server::CurrentNavigationRequest, Nav2Agent,
 };
 use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
 use ros_env::{
+    geometry_msgs::msg::PoseStamped,
     nav2_msgs::msg::Costmap,
-    rmf_prototype_msgs::msg::{PlanError, Progress, Region, SafeZone},
+    rmf_prototype_msgs::msg::{PlanError, Progress, Region, SafeZone, SafeZoneId},
 };
 use std::sync::Arc;
 
@@ -23,6 +24,31 @@ pub struct CostmapPublisher {
 #[derive(Component)]
 pub struct ProgressPublisher {
     pub publisher: Arc<RosPublisher<Progress>>,
+}
+
+#[derive(Component, Debug, Clone, Default, Deref)]
+pub struct LatestProgress(pub Option<Progress>);
+
+pub fn build_progress_status(
+    pose: PoseStamped,
+    mode: u8,
+    progress: Option<&Progress>,
+    safe_zone_id: Option<&SafeZoneId>,
+) -> Progress {
+    let mut msg = progress.cloned().unwrap_or_default();
+    msg.pose = pose;
+    msg.mode = mode;
+    msg.safe_zone_id = match safe_zone_id {
+        Some(sz_id) => {
+            let rmw_sz = <SafeZoneId as rosidl_runtime_rs::Message>::into_rmw_message(
+                std::borrow::Cow::Borrowed(sz_id),
+            )
+            .into_owned();
+            vec![rmw_sz].try_into().unwrap()
+        }
+        None => vec![].try_into().unwrap(),
+    };
+    msg
 }
 
 #[derive(Component)]
@@ -191,9 +217,12 @@ fn create_progress_publisher(
     };
     let topic = agent_name + "/plan/progress";
     let publisher = Arc::new(RosPublisher::<Progress>::new_transient_local(&node, topic));
-    commands.entity(e).insert(ProgressPublisher {
-        publisher: Arc::clone(&publisher),
-    });
+    commands.entity(e).insert((
+        ProgressPublisher {
+            publisher: Arc::clone(&publisher),
+        },
+        LatestProgress::default(),
+    ));
 }
 
 fn create_plan_error_publisher(
@@ -221,7 +250,9 @@ fn update_incremental_target(
             &SafeZoneSubscription,
             &CostmapPublisher,
             &ProgressPublisher,
+            &mut LatestProgress,
             &mut CurrentSafeZone,
+            Option<&AmclPose>,
             &Nav2Agent,
         ),
         // Only respond to a SafeZone message if there is an active NavigationRequest
@@ -229,8 +260,16 @@ fn update_incremental_target(
         With<CurrentNavigationRequest>,
     >,
 ) {
-    for (e, safe_zone_sub, costmap_pub, progress_pub, mut current_safe_zone, agent) in
-        subscriptions.iter_mut()
+    for (
+        e,
+        safe_zone_sub,
+        costmap_pub,
+        progress_pub,
+        mut latest_progress,
+        mut current_safe_zone,
+        amcl_pose,
+        agent,
+    ) in subscriptions.iter_mut()
     {
         let Some(safe_zone) = safe_zone_sub.subscriber.data_callback() else {
             continue;
@@ -255,16 +294,31 @@ fn update_incremental_target(
         };
 
         // Publish progress
-        let Ok(_) = progress_pub.publisher.publish(Progress {
+        let pose = amcl_pose
+            .map(|p| PoseStamped {
+                header: p.0.header.clone(),
+                pose: p.0.pose.pose.clone(),
+            })
+            .unwrap_or_default();
+        let base_progress = Progress {
             progress: safe_zone.last_waypoint as f32,
             reached_waypoint: safe_zone.last_waypoint,
             target_waypoint: safe_zone.target_waypoint[0], // TODO(@xiyuoh) review
             reached_keys: vec![],                          // TODO(@xiyuoh)
             plan_id: safe_zone.id.plan_id.clone(),
-        }) else {
+            ..Default::default()
+        };
+        let progress_msg = build_progress_status(
+            pose,
+            Progress::MODE_NAVIGATING,
+            Some(&base_progress),
+            Some(&safe_zone.id),
+        );
+        let Ok(_) = progress_pub.publisher.publish(progress_msg.clone()) else {
             error!("Failed to publish progress for agent [{}]", agent.name);
             continue;
         };
+        latest_progress.0 = Some(progress_msg);
 
         if !current_safe_zone.should_update_target(&safe_zone) {
             continue;
@@ -458,5 +512,34 @@ mod tests {
             .push(ori2);
 
         assert!(current.should_update_target(&next_sz));
+    }
+
+    #[test]
+    fn build_progress_status_populates_optional_fields() {
+        let mut pose = PoseStamped::default();
+        pose.pose.position.x = 2.5;
+        pose.pose.position.y = -1.5;
+
+        let idle_status = build_progress_status(pose.clone(), Progress::MODE_IDLE, None, None);
+        assert_eq!(idle_status.mode, Progress::MODE_IDLE);
+        assert_eq!(idle_status.progress, 0.0);
+        assert!(idle_status.safe_zone_id.is_empty());
+
+        let sz = safe_zone(7, 2, 5, 3.0, 4.0);
+        let prog = Progress {
+            progress: 1.5,
+            reached_waypoint: 1,
+            target_waypoint: 2,
+            reached_keys: vec![],
+            plan_id: sz.id.plan_id.clone(),
+            ..Default::default()
+        };
+        let nav_status =
+            build_progress_status(pose, Progress::MODE_NAVIGATING, Some(&prog), Some(&sz.id));
+        assert_eq!(nav_status.mode, Progress::MODE_NAVIGATING);
+        assert_eq!(nav_status.reached_waypoint, 1);
+        assert_eq!(nav_status.target_waypoint, 2);
+        assert_eq!(nav_status.safe_zone_id.len(), 1);
+        assert_eq!(nav_status.safe_zone_id[0].safe_zone_version, 5);
     }
 }
