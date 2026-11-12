@@ -2,6 +2,7 @@
 
 from math import cos, sin
 import sys
+import time
 
 from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
@@ -30,7 +31,11 @@ class StagedNav2Init(Node):
         self.yaw = yaw
         self.done = Future()
         self.stage = 'waiting_for_robot'
+        self.stage_entered_at = time.monotonic()
         self.pending = False
+        self.pending_since = None
+        self.pending_timeout = 5.0
+        self.pending_timeout_stage = None
         self.odom_received = False
 
         self.tf_buffer = Buffer()
@@ -60,13 +65,31 @@ class StagedNav2Init(Node):
         """Check whether a transform is available."""
         return self.tf_buffer.can_transform(target, source, Time())
 
+    def _set_stage(self, next_stage):
+        self.stage = next_stage
+        self.stage_entered_at = time.monotonic()
+
+    def _set_pending(self, timeout_sec, timeout_stage=None):
+        self.pending = True
+        self.pending_since = time.monotonic()
+        self.pending_timeout = timeout_sec
+        self.pending_timeout_stage = timeout_stage
+
+    def _clear_pending(self):
+        self.pending = False
+        self.pending_since = None
+        self.pending_timeout_stage = None
+
     def start_manager(self, client, next_stage, label):
         """Request lifecycle startup."""
         if not client.service_is_ready():
             return
         request = ManageLifecycleNodes.Request()
         request.command = ManageLifecycleNodes.Request.STARTUP
-        self.pending = True
+        # If the service response is dropped by DDS after lifecycle_manager
+        # activates its nodes, transition to next_stage on timeout so we verify
+        # node state directly via GetState.
+        self._set_pending(8.0, timeout_stage=next_stage)
         future = client.call_async(request)
         future.add_done_callback(
             lambda result: self.manager_started(
@@ -78,7 +101,7 @@ class StagedNav2Init(Node):
 
     def manager_started(self, future, next_stage, label):
         """Handle a lifecycle startup response."""
-        self.pending = False
+        self._clear_pending()
         try:
             response = future.result()
         except Exception as error:
@@ -87,13 +110,13 @@ class StagedNav2Init(Node):
         if not response.success:
             self.get_logger().warning(f'{label} startup failed; retrying')
             return
-        self.stage = next_stage
+        self._set_stage(next_stage)
 
     def wait_for_active(self, client, next_stage):
         """Poll a lifecycle node until it is active."""
         if not client.service_is_ready():
             return
-        self.pending = True
+        self._set_pending(3.0)
         future = client.call_async(GetState.Request())
         future.add_done_callback(
             lambda result: self.state_received(result, next_stage)
@@ -101,14 +124,14 @@ class StagedNav2Init(Node):
 
     def state_received(self, future, next_stage):
         """Handle a lifecycle state response."""
-        self.pending = False
+        self._clear_pending()
         try:
             state = future.result().current_state
         except Exception as error:
             self.get_logger().warning(f'Cannot read lifecycle state: {error}')
             return
         if state.id == State.PRIMARY_STATE_ACTIVE:
-            self.stage = next_stage
+            self._set_stage(next_stage)
 
     def send_pose(self):
         """Send the robot's initial pose."""
@@ -122,24 +145,42 @@ class StagedNav2Init(Node):
         request.pose.pose.pose.orientation.z = sin(self.yaw / 2.0)
         request.pose.pose.pose.orientation.w = cos(self.yaw / 2.0)
         request.pose.pose.covariance = [0.1] * 36
-        self.pending = True
+        self._set_pending(3.0)
         future = self.pose_client.call_async(request)
         future.add_done_callback(self.pose_sent)
 
     def pose_sent(self, future):
         """Continue after setting the initial pose."""
-        self.pending = False
+        self._clear_pending()
         try:
             future.result()
         except Exception as error:
             self.get_logger().warning(f'Cannot set initial pose: {error}')
             return
-        self.stage = 'waiting_for_map_transform'
+        self._set_stage('waiting_for_map_transform')
 
     def tick(self):
         """Advance the startup sequence."""
+        now = time.monotonic()
         if self.pending:
-            return
+            if (
+                self.pending_since is not None
+                and now - self.pending_since >= self.pending_timeout
+            ):
+                timeout_stage = self.pending_timeout_stage
+                self._clear_pending()
+                if timeout_stage is not None:
+                    self.get_logger().warning(
+                        f'Service response timed out in {self.stage}; '
+                        f'advancing to {timeout_stage} to verify state'
+                    )
+                    self._set_stage(timeout_stage)
+                else:
+                    self.get_logger().warning(
+                        f'Service call timed out in {self.stage}; retrying'
+                    )
+            else:
+                return
 
         if self.stage == 'waiting_for_robot':
             if (
@@ -149,7 +190,7 @@ class StagedNav2Init(Node):
                 self.get_logger().info(
                     'Robot transforms are ready; starting localization'
                 )
-                self.stage = 'starting_localization'
+                self._set_stage('starting_localization')
             return
 
         if self.stage == 'starting_localization':
@@ -161,6 +202,9 @@ class StagedNav2Init(Node):
             return
 
         if self.stage == 'waiting_for_amcl':
+            if now - self.stage_entered_at > 15.0:
+                self._set_stage('starting_localization')
+                return
             self.wait_for_active(self.amcl_state, 'setting_pose')
             return
 
@@ -173,7 +217,7 @@ class StagedNav2Init(Node):
                 self.get_logger().info(
                     'Localization is ready; starting navigation'
                 )
-                self.stage = 'starting_navigation'
+                self._set_stage('starting_navigation')
             return
 
         if self.stage == 'starting_navigation':
@@ -185,6 +229,9 @@ class StagedNav2Init(Node):
             return
 
         if self.stage == 'waiting_for_navigation':
+            if now - self.stage_entered_at > 20.0:
+                self._set_stage('starting_navigation')
+                return
             self.wait_for_active(self.bt_state, 'ready')
             return
 

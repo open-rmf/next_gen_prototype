@@ -11,7 +11,46 @@ struct RobotConnections {
     _safe_zone_sub: rclrs::WorkerSubscription<SafeZone, VisualizerServer>,
 }
 
-struct VisualizerServer {}
+struct VisualizerServer {
+    node: rclrs::Node,
+    publishers: HashMap<String, rclrs::Publisher<MarkerArray>>,
+}
+
+impl VisualizerServer {
+    fn new(node: rclrs::Node) -> Self {
+        Self {
+            node,
+            publishers: HashMap::new(),
+        }
+    }
+
+    fn get_or_create_publisher(
+        &mut self,
+        robot_id: &str,
+    ) -> Option<&rclrs::Publisher<MarkerArray>> {
+        if !self.publishers.contains_key(robot_id) {
+            let marker_topic = format!("{}/path_markers", robot_id);
+            match self
+                .node
+                .create_publisher::<MarkerArray>(marker_topic.as_str().transient_local().reliable())
+            {
+                Ok(publ) => {
+                    self.publishers.insert(robot_id.to_string(), publ);
+                }
+                Err(err) => {
+                    rclrs::log_error!(
+                        self.node.logger(),
+                        "Failed to create publisher for {}: {:?}",
+                        robot_id,
+                        err
+                    );
+                    return None;
+                }
+            }
+        }
+        self.publishers.get(robot_id)
+    }
+}
 
 struct VisualizerDiscoveryServer {
     node: rclrs::Node,
@@ -34,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut executor = context.create_basic_executor();
     let node = executor.create_node("rmf_path_visualizer")?;
 
-    let visualizer_worker = node.create_worker(VisualizerServer {});
+    let visualizer_worker = node.create_worker(VisualizerServer::new(node.clone()));
     let discovery_worker = node.create_worker(VisualizerDiscoveryServer::new(
         node.clone(),
         visualizer_worker.clone(),
@@ -56,27 +95,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let topic_name = format!("{}/plan", robot_id);
                 let safe_zone_topic = format!("{}/plan/safe_zone", robot_id);
-                let marker_topic = format!("{}/path_markers", robot_id);
 
-                let publisher = match server.node.create_publisher::<MarkerArray>(
-                    marker_topic.as_str().transient_local().reliable(),
-                ) {
-                    Ok(publ) => publ,
-                    Err(err) => {
-                        rclrs::log_error!(
-                            server.node.logger(),
-                            "Failed to create publisher for {}: {:?}",
-                            robot_id,
-                            err
-                        );
-                        return;
-                    }
-                };
-
-                let publisher_plan = publisher.clone();
                 let plan_sub = match server.visualizer_worker.create_subscription::<Plan, _>(
                     topic_name.as_str().transient_local().reliable(),
-                    move |_vs: &mut VisualizerServer, msg: Plan| {
+                    move |vs: &mut VisualizerServer, msg: Plan| {
                         let mut marker_array = MarkerArray { markers: vec![] };
                         let mut marker = Marker::default();
                         marker.header.frame_id = "map".to_string();
@@ -102,7 +124,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         marker_array.markers.push(marker);
-                        let _ = publisher_plan.publish(&marker_array);
+                        if let Some(publisher_plan) = vs.get_or_create_publisher(&robot_id_clone) {
+                            let _ = publisher_plan.publish(&marker_array);
+                        }
                     },
                 ) {
                     Ok(sub) => sub,
@@ -117,11 +141,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                let publisher_sz = publisher.clone();
                 let safe_zone_sub =
                     match server.visualizer_worker.create_subscription::<SafeZone, _>(
                         safe_zone_topic.as_str().transient_local().reliable(),
-                        move |_vs: &mut VisualizerServer, msg: SafeZone| {
+                        move |vs: &mut VisualizerServer, msg: SafeZone| {
                             if msg.incremental_target.regions.is_empty() {
                                 return;
                             }
@@ -156,7 +179,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 marker.pose.orientation.w = 1.0; // valid quaternion
 
                                 marker_array.markers.push(marker);
-                                let _ = publisher_sz.publish(&marker_array);
+                                if let Some(publisher_sz) =
+                                    vs.get_or_create_publisher(&robot_id_clone2)
+                                {
+                                    let _ = publisher_sz.publish(&marker_array);
+                                }
                             }
                         },
                     ) {
