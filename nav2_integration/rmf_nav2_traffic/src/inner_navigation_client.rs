@@ -9,26 +9,57 @@ use crate::{
 use bevy::prelude::*;
 use bevy_ros2::{RclrsExecutorCommands, RclrsNode, RosActionClient};
 use crossflow::{prelude::*, service::Service};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use nalgebra::UnitQuaternion;
 use rclrs::*;
 use ros_env::{
     builtin_interfaces::msg::Time as RosTime,
     geometry_msgs::msg::{Point, Pose, PoseStamped, Quaternion},
     nav2_msgs::action::{NavigateToPose, NavigateToPose_Feedback, NavigateToPose_Goal},
-    rmf_prototype_msgs::msg::{Progress, SafeZoneId},
+    rmf_prototype_msgs::msg::{Error as RmfError, PlanError, SafeZoneId},
     std_msgs::msg::Header,
 };
-use std::{future::Future, sync::Arc};
-use thiserror::Error;
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
+
+/// Action-agnostic cancellation strategy for any active ROS 2 inner goal handle.
+///
+/// Implementing this trait for `GoalClient<A>` decouples `ActiveInnerGoal` and
+/// the core traffic manager from concrete action types (such as `NavigateToPose`,
+/// `DockRobot`, `UndockRobot`, etc.).
+pub trait NavActionStrategy: Send + Sync {
+    fn is_cancellation_accepted<'a>(&'a self) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+}
+
+impl<A: ActionIDL> NavActionStrategy for GoalClient<A> {
+    fn is_cancellation_accepted<'a>(&'a self) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let accepted = self.cancellation.cancel().await.is_accepted();
+            if accepted {
+                let _ = self.result.clone().await;
+            }
+            accepted
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum InnerNavigationAction {
+    #[default]
+    NavigateToPose,
+}
 
 #[derive(Clone, Debug, Event)]
 pub struct InnerNavigationTarget {
-    agent: Entity,
-    safe_zone_id: SafeZoneId,
-    x: f64,
-    y: f64,
-    yaw: f64,
+    pub agent: Entity,
+    pub safe_zone_id: SafeZoneId,
+    pub x: f64,
+    pub y: f64,
+    pub yaw: f64,
+    pub action: InnerNavigationAction,
 }
 
 impl InnerNavigationTarget {
@@ -39,34 +70,39 @@ impl InnerNavigationTarget {
             x,
             y,
             yaw,
+            action: InnerNavigationAction::NavigateToPose,
+        }
+    }
+
+    pub fn with_action(
+        agent: Entity,
+        safe_zone_id: SafeZoneId,
+        x: f64,
+        y: f64,
+        yaw: f64,
+        action: InnerNavigationAction,
+    ) -> Self {
+        Self {
+            agent,
+            safe_zone_id,
+            x,
+            y,
+            yaw,
+            action,
         }
     }
 }
 
 #[derive(Clone)]
 pub struct ActiveInnerGoal {
-    pub goal_client: GoalClient<NavigateToPose>,
+    pub seq: u64,
     pub safe_zone_id: SafeZoneId,
-    superseded: bool,
+    pub action: InnerNavigationAction,
+    pub superseded: bool,
+    pub goal_client: Option<Arc<dyn NavActionStrategy>>,
 }
 
 impl ActiveInnerGoal {
-    pub fn new(goal_client: GoalClient<NavigateToPose>, safe_zone_id: SafeZoneId) -> Self {
-        Self {
-            goal_client,
-            safe_zone_id,
-            superseded: false,
-        }
-    }
-
-    pub fn client(&self) -> &GoalClient<NavigateToPose> {
-        &self.goal_client
-    }
-
-    pub fn client_mut(&mut self) -> &mut GoalClient<NavigateToPose> {
-        &mut self.goal_client
-    }
-
     pub fn id(&self) -> &SafeZoneId {
         &self.safe_zone_id
     }
@@ -80,124 +116,55 @@ impl ActiveInnerGoal {
     }
 }
 
+#[derive(Default)]
+pub struct AgentGoalState {
+    pub next_seq: u64,
+    pub cancelled_up_to_seq: u64,
+    pub last_action: Option<InnerNavigationAction>,
+    pub active_goal: Option<ActiveInnerGoal>,
+}
+
 #[derive(Component, Clone)]
 pub struct InnerNavigationClient {
-    // Stores the action client object
     pub action_client: Arc<RosActionClient<NavigateToPose>>,
-    // The ongoing action goal (if any)
-    pub active_goal: Option<ActiveInnerGoal>,
+    pub state: Arc<Mutex<AgentGoalState>>,
 }
 
 impl InnerNavigationClient {
     pub fn new(action_client: Arc<RosActionClient<NavigateToPose>>) -> Self {
         Self {
             action_client,
-            active_goal: None,
+            state: Arc::new(Mutex::new(AgentGoalState::default())),
         }
     }
 
-    pub fn goal(&self) -> &Option<ActiveInnerGoal> {
-        &self.active_goal
+    pub fn has_active_goal(&self) -> bool {
+        self.state
+            .lock()
+            .map(|s| s.active_goal.is_some())
+            .unwrap_or(false)
     }
 
-    pub fn goal_mut(&mut self) -> &mut Option<ActiveInnerGoal> {
-        &mut self.active_goal
+    pub fn active_safe_zone_id(&self) -> Option<SafeZoneId> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|s| s.active_goal.as_ref().map(|g| g.safe_zone_id.clone()))
     }
 
-    pub fn reset_goal(&mut self) {
-        self.active_goal = None;
+    pub fn mark_active_goal_superseded(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(active) = state.active_goal.as_mut() {
+                active.superseded = true;
+            }
+        }
     }
-}
 
-#[derive(Default)]
-pub struct InnerNavigationClientPlugin {}
-
-impl Plugin for InnerNavigationClientPlugin {
-    fn build(&self, app: &mut App) {
-        app.add_event::<InnerNavigationTarget>()
-            .add_event::<InnerNavigationFeedback>()
-            .add_event::<CancelInnerForAgent>()
-            .add_observer(create_inner_navigation_client);
-
-        // Initialize Navigation services
-        let navigation_services = InnerNavigationServices::from_app(app);
-        app.insert_resource(navigation_services);
-        let await_and_send_goal = app
-            .world()
-            .resource::<InnerNavigationServices>()
-            .await_and_send_goal
-            .clone();
-
-        app.world_mut().command(|commands| {
-            let _ = commands.request((), await_and_send_goal).detach();
-        });
+    pub fn reset_goal(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active_goal = None;
+        }
     }
-}
-
-fn create_inner_navigation_client(
-    trigger: Trigger<OnAdd, Nav2Agent>,
-    mut commands: Commands,
-    agents: Query<&Nav2Agent>,
-    node: Res<RclrsNode>,
-) {
-    let e = trigger.target();
-    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
-        return;
-    };
-    let action_name = agent_name + "/inner/navigate_to_pose";
-    // Set up client for the inner Nav2 action
-    let inner_action_client = RosActionClient::<NavigateToPose>::new(&node, action_name);
-
-    commands
-        .entity(e)
-        .insert(InnerNavigationClient::new(Arc::new(inner_action_client)));
-}
-
-#[derive(Clone)]
-struct InnerNavigationRequest {
-    agent: Entity,
-    safe_zone_id: SafeZoneId,
-    target_pose: PoseStamped,
-}
-
-#[derive(Clone)]
-struct CurrentInnerNavigationGoal {
-    request: InnerNavigationRequest,
-    goal_client: GoalClient<NavigateToPose>,
-}
-
-#[derive(Clone)]
-struct CancelInnerNavigation {
-    agent: Entity,
-    new_request: Option<InnerNavigationRequest>,
-    cancel_client: GoalClient<NavigateToPose>,
-}
-
-#[derive(Clone)]
-struct InnerNavigationSuccess {
-    pub handle: CurrentInnerNavigationGoal,
-}
-
-#[derive(Clone)]
-struct InnerNavigationError {
-    pub handle: Option<CurrentInnerNavigationGoal>,
-    pub kind: InnerNavigationErrorKind,
-}
-
-#[derive(Clone, Debug, Error)]
-enum InnerNavigationErrorKind {
-    #[error("Failed to cancel current goal!")]
-    CancelGoalError,
-    #[error("Failed to request new goal!")]
-    RequestGoalError,
-    #[error("Goal was aborted!")]
-    GoalAbortedError,
-    #[error("Goal was cancelled!")]
-    GoalCancelledError,
-    #[error("Incoming request has an older plan or safe zone version!")]
-    DuplicateOrOutdatedRequestError,
-    #[error("Unknown error!")]
-    UnknownError,
 }
 
 #[derive(Clone, Debug, Event)]
@@ -205,469 +172,9 @@ pub struct CancelInnerForAgent {
     pub agent: Entity,
 }
 
-type InnerNavigationResult = Result<InnerNavigationSuccess, InnerNavigationError>;
-
-#[derive(Resource)]
-pub struct InnerNavigationServices {
-    await_and_send_goal: Service<(), (), ()>,
-}
-
-impl InnerNavigationServices {
-    pub fn from_app(app: &mut App) -> Self {
-        let await_new_requests_service = app.spawn_continuous_service(Update, await_new_requests);
-        let await_external_cancellation_service =
-            app.spawn_continuous_service(Update, await_external_cancellation);
-        let check_existing_goal_service = app.spawn_service(check_existing_goal);
-        let handle_existing_goal_result_service = app.spawn_service(handle_existing_goal_result);
-        let async_cancel_goal_service = app.spawn_service(async_cancel_goal);
-        let async_request_new_goal_service = app.spawn_service(async_request_new_goal);
-        let update_goal_client_service = app.spawn_service(update_goal_client);
-        let async_monitor_ongoing_navigation_service =
-            app.spawn_service(async_monitor_ongoing_navigation);
-        let process_navigation_result_service = app.spawn_service(process_navigation_result);
-        let cleanup_goal_client_service = app.spawn_service(cleanup_goal_client);
-        let log_error_service = app.spawn_service(log_inner_navigation_error);
-
-        let await_and_send_goal = app.world_mut().spawn_workflow(|scope, builder| {
-            let fork_input = scope.start.fork_clone(builder);
-            let await_requests = fork_input
-                .clone_chain(builder)
-                .then_node(await_new_requests_service);
-            let await_external_cancellation = fork_input
-                .clone_chain(builder)
-                .then_node(await_external_cancellation_service);
-
-            // Create nodes
-            let check_existing_goal = builder.create_node(check_existing_goal_service);
-            let handle_existing_goal_result =
-                builder.create_node(handle_existing_goal_result_service);
-            let async_cancel_goal = builder.create_node(async_cancel_goal_service);
-            let async_request_new_goal = builder.create_node(async_request_new_goal_service);
-            let update_goal_client = builder.create_node(update_goal_client_service);
-            let async_monitor_new_navigation_request =
-                builder.create_node(async_monitor_ongoing_navigation_service);
-            let post_nav_processing = builder.create_node(process_navigation_result_service);
-            let cleanup_goal_client = builder.create_node(cleanup_goal_client_service);
-            let log_error = builder.create_node(log_error_service);
-
-            // Stream out new requests to downstream nodes
-            builder.connect(await_requests.streams, check_existing_goal.input);
-
-            // Stream out external cancellation requests to downstream nodes
-            builder.connect(await_external_cancellation.streams, async_cancel_goal.input);
-
-            // Check if there is an existing goal client, and compare whether the new
-            // request is duplicate or outdated. If so, discard (err branch).
-            let (check_existing_fork_result_input, check_existing_fork_result) =
-                builder.create_fork_result();
-            builder.connect(check_existing_goal.output, check_existing_fork_result_input);
-            builder.connect(
-                check_existing_fork_result.ok,
-                handle_existing_goal_result.input,
-            );
-
-            // After discarding invalid new requests, check if there is an existing
-            // goal client; if so, connect to cancellation node, else request new goal
-            let (handle_existing_fork_result_input, handle_existing_fork_result) =
-                builder.create_fork_result();
-            builder.connect(
-                handle_existing_goal_result.output,
-                handle_existing_fork_result_input,
-            );
-            builder.connect(handle_existing_fork_result.ok, async_cancel_goal.input);
-            builder.connect(
-                handle_existing_fork_result.err,
-                async_request_new_goal.input,
-            );
-
-            // Handles incoming inner/navigate_to_pose requests - cancels ongoing
-            // action goals and sends new action goal.
-            let (cancel_goal_fork_result_input, cancel_goal_fork_result) =
-                builder.create_fork_result();
-            builder.connect(async_cancel_goal.output, cancel_goal_fork_result_input);
-
-            builder.connect(cancel_goal_fork_result.ok, async_request_new_goal.input);
-            let (new_goal_fork_result_input, new_goal_fork_result) = builder.create_fork_result();
-            builder.connect(async_request_new_goal.output, new_goal_fork_result_input);
-
-            // Handles and monitors ongoing inner/navigate_to_pose request
-            builder.connect(new_goal_fork_result.ok, update_goal_client.input);
-            builder.connect(
-                update_goal_client.output,
-                async_monitor_new_navigation_request.input,
-            );
-
-            // On completed navigation request, check goal status code and process accordingly
-            // Aborted -> retry, Cancelled -> publish cancellation to outer workflow, Succeeded -> do nothing
-            // Then connect to cleanup existing goal client data
-            builder.connect(
-                async_monitor_new_navigation_request.output,
-                post_nav_processing.input,
-            );
-            let (post_nav_fork_result_input, post_nav_fork_result) = builder.create_fork_result();
-            builder.connect(post_nav_processing.output, post_nav_fork_result_input);
-            // If goal was aborted, retry navigation by requesting new goal
-            // Goal client will be updated in a downstream node
-            builder.connect(post_nav_fork_result.ok, async_request_new_goal.input);
-            // Otherwise, cleanup goal client
-            builder.connect(post_nav_fork_result.err, cleanup_goal_client.input);
-
-            // Connect errors to logging node
-            builder.connect(cancel_goal_fork_result.err, log_error.input);
-            builder.connect(new_goal_fork_result.err, log_error.input);
-
-            // Connect only await_requests output to terminate
-            builder.connect(await_requests.output, scope.terminate);
-        });
-
-        Self {
-            await_and_send_goal,
-        }
-    }
-}
-
-/// This continuous service listens for incoming InnerNavigationTarget via
-/// events, converts them into PoseStamped, and streams them out as navigation
-/// requests to downstream nodes.
-fn await_new_requests(
-    srv: ContinuousService<(), (), StreamOf<InnerNavigationRequest>>,
-    mut orders: ContinuousQuery<(), (), StreamOf<InnerNavigationRequest>>,
-    mut nav_target: EventReader<InnerNavigationTarget>,
-    node: Res<RclrsNode>,
-) {
-    let Some(mut orders) = orders.get_mut(&srv.key) else {
-        return;
-    };
-    if orders.is_empty() {
-        return;
-    }
-    if nav_target.is_empty() {
-        return;
-    }
-
-    for target in nav_target.read() {
-        let now = node.get_clock().now();
-        let quat = UnitQuaternion::from_euler_angles(0.0, 0.0, target.yaw);
-
-        let goal_pose = PoseStamped {
-            header: Header {
-                stamp: RosTime {
-                    sec: (now.nsec / 1_000_000_000) as i32,
-                    nanosec: (now.nsec % 1_000_000_000) as u32,
-                },
-                frame_id: "map".to_string(),
-            },
-            pose: Pose {
-                position: Point {
-                    x: target.x,
-                    y: target.y,
-                    z: 0.0,
-                },
-                orientation: Quaternion {
-                    x: quat.coords.x,
-                    y: quat.coords.y,
-                    z: quat.coords.z,
-                    w: quat.coords.w,
-                },
-            },
-        };
-        let pending_request = InnerNavigationRequest {
-            agent: target.agent,
-            safe_zone_id: target.safe_zone_id.clone(),
-            target_pose: goal_pose.clone(),
-        };
-        info!(
-            "[{:?}] Requesting new pending goal to pose [{}, {}]",
-            target.agent.index(),
-            goal_pose.pose.position.x,
-            goal_pose.pose.position.y
-        );
-
-        orders.for_each(|order| order.streams().send(pending_request.clone()));
-    }
-}
-
-/// This continuous services listens for external navigation cancellation requests
-/// and creates corresponding requests to cancel the relevant inner navigation
-/// action.
-fn await_external_cancellation(
-    srv: ContinuousService<(), (), StreamOf<CancelInnerNavigation>>,
-    mut orders: ContinuousQuery<(), (), StreamOf<CancelInnerNavigation>>,
-    mut cancel_requests: EventReader<CancelInnerForAgent>,
-    mut inner_nav_clients: Query<&mut InnerNavigationClient>,
-) {
-    let Some(mut orders) = orders.get_mut(&srv.key) else {
-        return;
-    };
-    if orders.is_empty() {
-        return;
-    }
-
-    for request in cancel_requests.read() {
-        info!(
-            "Received external cancellation request for agent {:?}",
-            request.agent.index()
-        );
-        let Ok(mut inner_client) = inner_nav_clients.get_mut(request.agent) else {
-            continue;
-        };
-        let Some(existing_goal) = inner_client.goal_mut().as_mut() else {
-            continue;
-        };
-        existing_goal.mark_superseded();
-        let client = existing_goal.client().clone();
-        orders.for_each(|order| {
-            order.streams().send(CancelInnerNavigation {
-                agent: request.agent,
-                new_request: None,
-                cancel_client: client.clone(),
-            })
-        });
-    }
-}
-
-#[allow(dead_code)]
-enum CheckExistingGoalResult {
-    ReplanAndCancel(CancelInnerNavigation),
-    NoExistingGoal(InnerNavigationRequest),
-}
-
-/// Checks if there is an existing goal for the requested agent.
-/// If yes, check if the existing goal is outdated, i.e. it has a lower plan or
-/// safe zone version than the new request. If so, cancel the existing goal and
-/// request a new goal. If the new request is duplicate or outdated, return
-/// Err(None) to indicate that no new goal should be requested.
-/// If there isn't an existing goal, return Err(Some(request)) so that the
-/// workflow can proceed to request a new goal without cancellation.
-fn check_existing_goal(
-    Blocking { request, .. }: Blocking<InnerNavigationRequest>,
-    mut inner_nav_clients: Query<&mut InnerNavigationClient>,
-) -> Result<CheckExistingGoalResult, InnerNavigationError> {
-    // TODO(@xiyuoh) Create a replan mechanism instead of cancelling goal on every
-    // new request
-    let mut replan_and_cancel = false;
-    let Ok(mut inner_client) = inner_nav_clients.get_mut(request.agent) else {
-        return Ok(CheckExistingGoalResult::NoExistingGoal(request));
-    };
-    let Some(existing_goal) = inner_client.goal_mut().as_mut() else {
-        // No existing goal, proceed to request for new goal
-        return Ok(CheckExistingGoalResult::NoExistingGoal(request));
-    };
-
-    // If plan or safe zone version is later, then replan/cancel
-    let curr_safe_zone_id = existing_goal.id();
-    let next_safe_zone_id = &request.safe_zone_id;
-
-    if next_safe_zone_id.plan_id.destination_session.uuid
-        != curr_safe_zone_id.plan_id.destination_session.uuid
-    {
-        replan_and_cancel = true;
-    } else if next_safe_zone_id.plan_id.plan_version > curr_safe_zone_id.plan_id.plan_version {
-        replan_and_cancel = true;
-    } else if next_safe_zone_id.plan_id.plan_version == curr_safe_zone_id.plan_id.plan_version
-        && next_safe_zone_id.safe_zone_version > curr_safe_zone_id.safe_zone_version
-    {
-        replan_and_cancel = true;
-    }
-
-    if replan_and_cancel {
-        // Do not treat preemption of this goal as a new blockage.
-        // Send the new goal directly so Nav2's SimpleActionServer smoothly
-        // preempts the active goal in accept_pending_goal() without calling
-        // terminate_all() (which would abort a pending new goal if cancel() is
-        // still in flight).
-        existing_goal.mark_superseded();
-        return Ok(CheckExistingGoalResult::NoExistingGoal(request));
-    }
-
-    // There is an existing goal but the new request is duplicate or outdated,
-    // so do not request a new goal
-    return Err(InnerNavigationError {
-        handle: None,
-        kind: InnerNavigationErrorKind::DuplicateOrOutdatedRequestError,
-    });
-}
-
-/// Routes CheckExistingGoalResult members into Result to facilitate workflow
-/// branching
-fn handle_existing_goal_result(
-    Blocking {
-        request: result, ..
-    }: Blocking<CheckExistingGoalResult>,
-) -> Result<CancelInnerNavigation, InnerNavigationRequest> {
-    match result {
-        CheckExistingGoalResult::ReplanAndCancel(cancel_request) => Ok(cancel_request),
-        CheckExistingGoalResult::NoExistingGoal(new_request) => Err(new_request),
-    }
-}
-
 #[derive(Clone, Debug, Component)]
 pub struct CancellingInnerNavigation {
     pub success: bool,
-}
-
-/// Executes the cancellation of an ongoing inner navigation goal asynchronously
-/// Persists until the cancellation is accepted. If there is a pending new request,
-/// output the new request to downstream nodes via Ok, otherwise discard via Err.
-fn async_cancel_goal(
-    Async { request, .. }: Async<CancelInnerNavigation>,
-    mut commands: Commands,
-    executor_commands: Res<RclrsExecutorCommands>,
-) -> impl Future<Output = Result<InnerNavigationRequest, InnerNavigationError>> {
-    if request.new_request.is_none() {
-        commands
-            .entity(request.agent)
-            .insert(CancellingInnerNavigation { success: false });
-    }
-    executor_commands
-        .run(async move {
-            let cancellation = request.cancel_client.cancellation.cancel().await;
-            if !cancellation.is_accepted() {
-                warn!(
-                    "[{}] Cancellation request rejected for inner navigation, it may have already completed.",
-                    request.agent.index()
-                );
-            }
-            if let Some(new_request) = request.new_request {
-                info!(
-                    "[{}] Cancellation logic finished for inner navigation, requesting new goal",
-                    request.agent.index()
-                );
-                // If this a replan attempt with a new navigation request,
-                // regardless of whether cancellation was successful, mark as Ok()
-                return Ok(new_request);
-            } else {
-                info!(
-                    "[{}] Cancellation request finished for inner navigation",
-                    request.agent.index()
-                );
-                return Err(InnerNavigationError {
-                    handle: None,
-                    kind: InnerNavigationErrorKind::CancelGoalError,
-                });
-            }
-        })
-        .then(|res| async move {
-            res.unwrap_or(Err(InnerNavigationError {
-                handle: None,
-                kind: InnerNavigationErrorKind::CancelGoalError,
-            }))
-        })
-}
-
-/// Submits a new NavigateToPose goal asynchronously to the Nav2 action server
-/// and returns a handle containing the goal client.
-fn async_request_new_goal(
-    Async { request, .. }: Async<InnerNavigationRequest>,
-    mut inner_nav_clients: Query<&mut InnerNavigationClient>,
-    current_safe_zones: Query<&CurrentSafeZone>,
-    executor_commands: Res<RclrsExecutorCommands>,
-) -> impl Future<Output = Result<CurrentInnerNavigationGoal, InnerNavigationError>> {
-    let is_stale = current_safe_zones
-        .get(request.agent)
-        .ok()
-        .and_then(|csz| csz.0.as_ref())
-        .is_some_and(|sz| sz.id != request.safe_zone_id);
-    if is_stale {
-        return std::future::ready(Err(InnerNavigationError {
-            handle: None,
-            kind: InnerNavigationErrorKind::DuplicateOrOutdatedRequestError,
-        }))
-        .left_future();
-    }
-    let inner_nav_client_result = inner_nav_clients.get_mut(request.agent);
-    if inner_nav_client_result.is_err() {
-        return std::future::ready(Err(InnerNavigationError {
-            handle: None,
-            kind: InnerNavigationErrorKind::RequestGoalError,
-        }))
-        .left_future();
-    }
-    let mut inner_nav_client = inner_nav_client_result.unwrap();
-
-    // Reset goal client before submitting new request
-    inner_nav_client.reset_goal();
-
-    let mut pose = request.target_pose.clone();
-    debug!(
-        "[{:?}] Requesting new navigation goal to pose [{}, {}]",
-        request.agent.index(),
-        pose.pose.position.x,
-        pose.pose.position.y
-    );
-    pose.header.frame_id = "map".to_string();
-    let nav_request = inner_nav_client
-        .action_client
-        .request_goal(NavigateToPose_Goal { pose, ..default() });
-
-    executor_commands
-        .run(async move {
-            match nav_request.await {
-                Some(handle) => Ok(CurrentInnerNavigationGoal {
-                    request,
-                    goal_client: handle,
-                }),
-                None => Err(InnerNavigationError {
-                    handle: None,
-                    kind: InnerNavigationErrorKind::RequestGoalError,
-                }),
-            }
-        })
-        .then(|res| async move {
-            res.unwrap_or(Err(InnerNavigationError {
-                handle: None,
-                kind: InnerNavigationErrorKind::RequestGoalError,
-            }))
-        })
-        .right_future()
-}
-
-/// Updates the stored goal client with the newly accepted navigation goal.
-fn update_goal_client(
-    Blocking {
-        request: handle, ..
-    }: Blocking<CurrentInnerNavigationGoal>,
-    mut inner_nav_clients: Query<&mut InnerNavigationClient>,
-    current_safe_zones: Query<&CurrentSafeZone>,
-) -> CurrentInnerNavigationGoal {
-    let is_stale = current_safe_zones
-        .get(handle.request.agent)
-        .ok()
-        .and_then(|csz| csz.0.as_ref())
-        .is_some_and(|sz| sz.id != handle.request.safe_zone_id);
-    if is_stale {
-        return handle;
-    }
-    if let Ok(mut inner_nav_client) = inner_nav_clients.get_mut(handle.request.agent) {
-        if let Some(existing) = inner_nav_client.goal() {
-            if existing.id().plan_id.destination_session.uuid
-                != handle.request.safe_zone_id.plan_id.destination_session.uuid
-                || existing.id().plan_id.plan_version
-                    > handle.request.safe_zone_id.plan_id.plan_version
-                || (existing.id().plan_id.plan_version
-                    == handle.request.safe_zone_id.plan_id.plan_version
-                    && existing.id().safe_zone_version
-                        > handle.request.safe_zone_id.safe_zone_version)
-            {
-                return handle;
-            }
-        }
-        *inner_nav_client.goal_mut() = Some(ActiveInnerGoal::new(
-            handle.goal_client.clone(),
-            handle.request.safe_zone_id.clone(),
-        ));
-    } else {
-        warn!(
-            "[{:?}] InnerNavigationClient not found!",
-            handle.request.agent.index()
-        );
-    }
-    handle
-}
-
-/// Logs any errors that occur during the inner navigation workflow.
-fn log_inner_navigation_error(Blocking { request: err, .. }: Blocking<InnerNavigationError>) {
-    error!("InnerNavigationError occurred: {}", err.kind);
 }
 
 #[derive(Clone, Event)]
@@ -687,95 +194,447 @@ impl InnerNavigationFeedback {
     }
 }
 
-/// Monitors the feedback of an ongoing navigation goal, and publish it back
-/// to the external navigation request. When the goal is completed (success,
-/// aborted or cancelled), output the navigation result to downstream nodes for
-/// processing.
-fn async_monitor_ongoing_navigation(
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoalOutcomeStatus {
+    Succeeded,
+    Cancelled,
+    Aborted,
+}
+
+#[derive(Clone)]
+pub struct GoalExecutionOutcome {
+    pub seq: u64,
+    pub target: InnerNavigationTarget,
+    pub status: GoalOutcomeStatus,
+}
+
+#[derive(Resource, Clone)]
+pub struct InnerNavigationServices {
+    pub dispatch_target: Service<InnerNavigationTarget, ()>,
+    pub cancel_agent: Service<Entity, ()>,
+}
+
+impl InnerNavigationServices {
+    pub fn from_app(app: &mut App) -> Self {
+        let preempt_and_prepare_service = app.spawn_service(preempt_and_prepare_goal);
+        let execute_nav_service = app.spawn_service(execute_navigate_to_pose);
+        let reconcile_outcome_service = app.spawn_service(reconcile_goal_outcome);
+
+        // One-shot Crossflow workflow for goal dispatch:
+        //   preempt_and_prepare_goal -> execute_navigate_to_pose -> reconcile_goal_outcome
+        let dispatch_target = app.world_mut().spawn_io_workflow(|scope, builder| {
+            let reconcile = builder.create_node(reconcile_outcome_service);
+
+            builder
+                .chain(scope.start)
+                .then(preempt_and_prepare_service)
+                .dispose_on_none()
+                .then(execute_nav_service)
+                .connect(reconcile.input);
+
+            builder.chain(reconcile.output).connect(scope.terminate);
+        });
+
+        let prepare_cancel_service = app.spawn_service(prepare_external_cancellation);
+        let execute_cancel_service = app.spawn_service(execute_external_cancellation);
+        let finish_cancel_service = app.spawn_service(finish_external_cancellation);
+
+        let cancel_agent = app.world_mut().spawn_io_workflow(|scope, builder| {
+            builder
+                .chain(scope.start)
+                .then(prepare_cancel_service)
+                .dispose_on_none()
+                .then(execute_cancel_service)
+                .then(finish_cancel_service)
+                .connect(scope.terminate);
+        });
+
+        Self {
+            dispatch_target,
+            cancel_agent,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct InnerNavigationClientPlugin {}
+
+impl Plugin for InnerNavigationClientPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_event::<InnerNavigationTarget>()
+            .add_event::<InnerNavigationFeedback>()
+            .add_event::<CancelInnerForAgent>()
+            .add_systems(Update, dispatch_external_cancellations)
+            .add_observer(create_inner_navigation_client);
+
+        let navigation_services = InnerNavigationServices::from_app(app);
+        app.insert_resource(navigation_services);
+    }
+}
+
+fn create_inner_navigation_client(
+    trigger: Trigger<OnAdd, Nav2Agent>,
+    mut commands: Commands,
+    agents: Query<&Nav2Agent>,
+    node: Res<RclrsNode>,
+) {
+    let e = trigger.target();
+    let Ok(agent_name) = agents.get(e).map(|agent| agent.name.clone()) else {
+        return;
+    };
+    let action_name = agent_name + "/inner/navigate_to_pose";
+    let inner_action_client = RosActionClient::<NavigateToPose>::new(&node, action_name);
+
+    commands
+        .entity(e)
+        .insert(InnerNavigationClient::new(Arc::new(inner_action_client)));
+}
+
+fn dispatch_external_cancellations(
+    mut commands: Commands,
+    mut cancel_requests: EventReader<CancelInnerForAgent>,
+    nav_services: Res<InnerNavigationServices>,
+) {
+    for request in cancel_requests.read() {
+        let _ = commands
+            .request(request.agent, nav_services.cancel_agent.clone())
+            .detach();
+    }
+}
+
+#[derive(Clone)]
+struct PreparedCancelContext {
+    agent: Entity,
+    prior_to_cancel: Option<Arc<dyn NavActionStrategy>>,
+    cancel_all_nav: Option<Arc<RosActionClient<NavigateToPose>>>,
+}
+
+fn prepare_external_cancellation(
+    Blocking { request: agent, .. }: Blocking<Entity>,
+    mut commands: Commands,
+    clients: Query<&InnerNavigationClient>,
+) -> Option<PreparedCancelContext> {
+    let Ok(client) = clients.get(agent) else {
+        return None;
+    };
+    let mut state = client.state.lock().ok()?;
+    state.cancelled_up_to_seq = state.next_seq;
+
+    let Some(active) = state.active_goal.as_mut() else {
+        return None;
+    };
+    active.superseded = true;
+    let prior_to_cancel = active.goal_client.take();
+    let cancel_all_nav = if prior_to_cancel.is_none() {
+        Some(Arc::clone(&client.action_client))
+    } else {
+        None
+    };
+
+    commands
+        .entity(agent)
+        .insert(CancellingInnerNavigation { success: false });
+
+    Some(PreparedCancelContext {
+        agent,
+        prior_to_cancel,
+        cancel_all_nav,
+    })
+}
+
+fn execute_external_cancellation(
     Async {
-        request: handle,
-        channel,
-        ..
-    }: Async<CurrentInnerNavigationGoal>,
+        request: prepared, ..
+    }: Async<PreparedCancelContext>,
     executor_commands: Res<RclrsExecutorCommands>,
-) -> impl Future<Output = InnerNavigationResult> {
-    let nav_handle = handle.clone();
+) -> impl Future<Output = Entity> {
+    let agent = prepared.agent;
     executor_commands
         .run(async move {
-            let mut goal_client_stream = handle.goal_client.clone().stream();
-            let agent = handle.request.agent.clone();
-            // TODO(@xiyuoh) this gets stuck sometimes, find out why
-            while let Some(event) = goal_client_stream.next().await {
+            if let Some(prior) = prepared.prior_to_cancel {
+                let _ = prior.is_cancellation_accepted().await;
+            } else if let Some(nav_client) = prepared.cancel_all_nav {
+                let mut cancel_req = nav_client.cancel_all_goals();
+                let _ = (&mut *cancel_req).await;
+            }
+            agent
+        })
+        .map(move |res| res.unwrap_or(agent))
+}
+
+fn finish_external_cancellation(
+    Blocking { request: agent, .. }: Blocking<Entity>,
+    clients: Query<&InnerNavigationClient>,
+    mut cancelling_inner: Query<&mut CancellingInnerNavigation>,
+) {
+    if let Ok(client) = clients.get(agent) {
+        if let Ok(mut state) = client.state.lock() {
+            if state
+                .active_goal
+                .as_ref()
+                .is_some_and(|g| g.seq <= state.cancelled_up_to_seq)
+            {
+                state.active_goal = None;
+            }
+        }
+    }
+    if let Ok(mut cancelling) = cancelling_inner.get_mut(agent) {
+        cancelling.success = true;
+    }
+}
+
+#[derive(Clone)]
+struct PreparedGoalContext {
+    seq: u64,
+    target: InnerNavigationTarget,
+    state: Arc<Mutex<AgentGoalState>>,
+    prior_to_cancel: Option<Arc<dyn NavActionStrategy>>,
+    cancel_all_nav: Option<Arc<RosActionClient<NavigateToPose>>>,
+}
+
+#[derive(Clone)]
+struct PreparedNavGoal {
+    ctx: PreparedGoalContext,
+    client: Arc<RosActionClient<NavigateToPose>>,
+    goal: NavigateToPose_Goal,
+}
+
+fn target_to_pose_stamped(x: f64, y: f64, yaw: f64) -> PoseStamped {
+    let quat = UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
+    let [qx, qy, qz, qw] = quat.coords.into();
+    PoseStamped {
+        header: Header {
+            stamp: RosTime { sec: 0, nanosec: 0 },
+            frame_id: "map".to_string(),
+        },
+        pose: Pose {
+            position: Point { x, y, z: 0.0 },
+            orientation: Quaternion {
+                x: qx,
+                y: qy,
+                z: qz,
+                w: qw,
+            },
+        },
+    }
+}
+
+pub fn is_safe_zone_newer(candidate: &SafeZoneId, current: &SafeZoneId) -> bool {
+    if candidate.plan_id.destination_session.uuid != current.plan_id.destination_session.uuid {
+        return true;
+    }
+    if candidate.plan_id.plan_version != current.plan_id.plan_version {
+        return candidate.plan_id.plan_version > current.plan_id.plan_version;
+    }
+    candidate.safe_zone_version > current.safe_zone_version
+}
+
+pub fn should_preempt_goal(
+    candidate_id: &SafeZoneId,
+    candidate_action: &InnerNavigationAction,
+    current_id: &SafeZoneId,
+    current_action: &InnerNavigationAction,
+) -> bool {
+    is_safe_zone_newer(candidate_id, current_id)
+        || (candidate_id == current_id && candidate_action != current_action)
+}
+
+/// Step 1 (Blocking): Preempts any older active goal and prepares the navigation target.
+fn preempt_and_prepare_goal(
+    Blocking {
+        request: target, ..
+    }: Blocking<InnerNavigationTarget>,
+    clients: Query<&InnerNavigationClient>,
+) -> Option<PreparedNavGoal> {
+    let Ok(client) = clients.get(target.agent) else {
+        return None;
+    };
+    let mut state = client.state.lock().ok()?;
+
+    let mut prior_to_cancel: Option<Arc<dyn NavActionStrategy>> = None;
+    let mut cancel_all_nav: Option<Arc<RosActionClient<NavigateToPose>>> = None;
+    let current_seq = state.next_seq;
+    let mut mark_cancelled_up_to = false;
+
+    if let Some(active) = state.active_goal.as_mut() {
+        if !should_preempt_goal(
+            &target.safe_zone_id,
+            &target.action,
+            &active.safe_zone_id,
+            &active.action,
+        ) {
+            return None;
+        }
+        active.superseded = true;
+        let existing_is_nav = matches!(active.action, InnerNavigationAction::NavigateToPose);
+        let next_is_nav = matches!(target.action, InnerNavigationAction::NavigateToPose);
+
+        // Consecutive NavigateToPose goals preempt seamlessly inside Nav2's bt_navigator;
+        // switching between different action types cancels the previous action first.
+        if !(existing_is_nav && next_is_nav) {
+            mark_cancelled_up_to = true;
+            prior_to_cancel = active.goal_client.take();
+            if prior_to_cancel.is_none() && existing_is_nav {
+                cancel_all_nav = Some(Arc::clone(&client.action_client));
+            }
+        }
+    } else if state
+        .last_action
+        .as_ref()
+        .is_some_and(|last| last != &target.action)
+    {
+        mark_cancelled_up_to = true;
+    }
+
+    if mark_cancelled_up_to {
+        state.cancelled_up_to_seq = current_seq;
+    }
+
+    state.next_seq = current_seq + 1;
+    let seq = state.next_seq;
+    state.last_action = Some(target.action.clone());
+    state.active_goal = Some(ActiveInnerGoal {
+        seq,
+        safe_zone_id: target.safe_zone_id.clone(),
+        action: target.action.clone(),
+        superseded: false,
+        goal_client: None,
+    });
+
+    let pose = target_to_pose_stamped(target.x, target.y, target.yaw);
+    let ctx = PreparedGoalContext {
+        seq,
+        target: target.clone(),
+        state: Arc::clone(&client.state),
+        prior_to_cancel,
+        cancel_all_nav,
+    };
+
+    Some(PreparedNavGoal {
+        ctx,
+        client: Arc::clone(&client.action_client),
+        goal: NavigateToPose_Goal {
+            pose,
+            behavior_tree: String::new(),
+        },
+    })
+}
+
+async fn cancel_prior_if_needed(ctx: &PreparedGoalContext) {
+    if let Some(prior) = &ctx.prior_to_cancel {
+        let _ = prior.is_cancellation_accepted().await;
+    } else if let Some(nav_client) = &ctx.cancel_all_nav {
+        let mut cancel_req = nav_client.cancel_all_goals();
+        let _ = (&mut *cancel_req).await;
+    }
+}
+
+fn register_or_cancel_handle(
+    state_arc: &Arc<Mutex<AgentGoalState>>,
+    seq: u64,
+    handle: Arc<dyn NavActionStrategy>,
+) -> Option<Arc<dyn NavActionStrategy>> {
+    let Ok(mut state) = state_arc.lock() else {
+        return Some(handle);
+    };
+    if seq <= state.cancelled_up_to_seq {
+        return Some(handle);
+    }
+    if let Some(active) = state.active_goal.as_mut() {
+        if active.seq == seq {
+            active.goal_client = Some(handle);
+            return None;
+        }
+    }
+    None
+}
+
+/// Step 2 (Async): Executes `NavigateToPose` on `/<robot>/inner/navigate_to_pose`.
+fn execute_navigate_to_pose(
+    Async {
+        request: prepared,
+        channel,
+        ..
+    }: Async<PreparedNavGoal>,
+    executor_commands: Res<RclrsExecutorCommands>,
+) -> impl Future<Output = GoalExecutionOutcome> {
+    let fallback_seq = prepared.ctx.seq;
+    let fallback_target = prepared.ctx.target.clone();
+    executor_commands
+        .run(async move {
+            let PreparedNavGoal { ctx, client, goal } = prepared;
+            cancel_prior_if_needed(&ctx).await;
+
+            let Some(goal_client) = client.request_goal(goal).await else {
+                return GoalExecutionOutcome {
+                    seq: ctx.seq,
+                    target: ctx.target,
+                    status: GoalOutcomeStatus::Aborted,
+                };
+            };
+
+            let strategy_handle: Arc<dyn NavActionStrategy> = Arc::new(goal_client.clone());
+            if let Some(to_cancel) = register_or_cancel_handle(&ctx.state, ctx.seq, strategy_handle)
+            {
+                let _ = to_cancel.is_cancellation_accepted().await;
+                return GoalExecutionOutcome {
+                    seq: ctx.seq,
+                    target: ctx.target,
+                    status: GoalOutcomeStatus::Cancelled,
+                };
+            }
+
+            let agent = ctx.target.agent;
+            let safe_zone_id = ctx.target.safe_zone_id.clone();
+            let mut stream = goal_client.stream();
+            let mut final_status = GoalOutcomeStatus::Aborted;
+
+            while let Some(event) = stream.next().await {
                 match event {
-                    GoalEvent::Feedback(feedback) => {
-                        let safe_zone_id = handle.request.safe_zone_id.clone();
-                        // Publish feedback via observer triggers
-                        channel.commands(move |cmds| {
-                            cmds.trigger(InnerNavigationFeedback::new(
-                                agent,
-                                safe_zone_id.clone(),
-                                feedback.clone(),
-                            ));
+                    GoalEvent::Feedback(fb) => {
+                        let sz_id = safe_zone_id.clone();
+                        channel.commands(move |commands| {
+                            commands.trigger(InnerNavigationFeedback::new(agent, sz_id, fb));
                         });
                     }
-                    GoalEvent::Status(s) => {
-                        debug!(
-                            "[{:?}] [inner nav2pose] Status: {:?}",
-                            handle.request.agent.index(),
-                            s.code
-                        );
-                    }
-                    GoalEvent::Result((status, result)) => {
-                        debug!(
-                            "[{:?}] [inner nav2pose] Result: {:?}",
-                            handle.request.agent.index(),
-                            result
-                        );
-                        match status {
-                            GoalStatusCode::Succeeded => {
-                                return Ok(InnerNavigationSuccess { handle })
-                            }
-                            GoalStatusCode::Aborted => {
-                                return Err(InnerNavigationError {
-                                    handle: Some(handle.clone()),
-                                    kind: InnerNavigationErrorKind::GoalAbortedError,
-                                })
-                            }
-                            GoalStatusCode::Cancelled => {
-                                return Err(InnerNavigationError {
-                                    handle: Some(handle.clone()),
-                                    kind: InnerNavigationErrorKind::GoalCancelledError,
-                                });
-                            }
-                            _ => {}
-                        }
+                    GoalEvent::Status(_) => {}
+                    GoalEvent::Result((status, _)) => {
+                        final_status = match status {
+                            GoalStatusCode::Succeeded => GoalOutcomeStatus::Succeeded,
+                            GoalStatusCode::Cancelled => GoalOutcomeStatus::Cancelled,
+                            _ => GoalOutcomeStatus::Aborted,
+                        };
+                        break;
                     }
                 }
             }
-            Err(InnerNavigationError {
-                handle: Some(handle.clone()),
-                kind: InnerNavigationErrorKind::UnknownError,
-            })
+
+            GoalExecutionOutcome {
+                seq: ctx.seq,
+                target: ctx.target,
+                status: final_status,
+            }
         })
-        .then(|res| async move {
-            res.unwrap_or(Err(InnerNavigationError {
-                handle: Some(nav_handle.clone()),
-                kind: InnerNavigationErrorKind::UnknownError,
-            }))
+        .map(move |res| {
+            res.unwrap_or(GoalExecutionOutcome {
+                seq: fallback_seq,
+                target: fallback_target,
+                status: GoalOutcomeStatus::Aborted,
+            })
         })
 }
 
-/// Evaluates the outcome of a completed or failed navigation goal.
-/// If a goal is aborted (and is not stale), it retries the goal.
-/// If a goal is cancelled via external request, it marks the cancellation as
-/// successful and publish to external navigation workflow.
-fn process_navigation_result(
+/// Step 3 (Blocking): Reconciles the finished goal outcome with `ProgressTracker`,
+/// re-dispatching if orientation is not yet satisfied or publishing `PlanError` on abort.
+fn reconcile_goal_outcome(
     Blocking {
-        request: result, ..
-    }: Blocking<InnerNavigationResult>,
+        request: outcome, ..
+    }: Blocking<GoalExecutionOutcome>,
+    mut commands: Commands,
+    nav_services: Res<InnerNavigationServices>,
+    clients: Query<&InnerNavigationClient>,
     mut cancelling_inner: Query<&mut CancellingInnerNavigation>,
-    inner_nav_clients: Query<&InnerNavigationClient>,
-    plan_error_publishers: Query<&PlanErrorPublisher>,
+    error_publishers: Query<&PlanErrorPublisher>,
     mut progress_query: Query<(
         &ProgressTracker,
         &ProgressPublisher,
@@ -783,140 +642,116 @@ fn process_navigation_result(
         Option<&CurrentSafeZone>,
         Option<&AmclPose>,
     )>,
-) -> Result<InnerNavigationRequest, InnerNavigationResult> {
-    match result {
-        Ok(ref success) => {
-            let target = &success.handle.request;
-            let is_current = inner_nav_clients
-                .get(target.agent)
-                .ok()
-                .and_then(|c| c.goal().as_ref())
-                .is_some_and(|goal| goal.id() == &target.safe_zone_id && !goal.is_superseded());
-            if is_current {
-                if let Ok((
-                    tracker,
-                    progress_pub,
-                    mut latest_progress,
-                    current_safe_zone,
-                    amcl_pose,
-                )) = progress_query.get_mut(target.agent)
-                {
-                    let matches_current_sz = current_safe_zone
-                        .and_then(|csz| csz.0.as_ref())
-                        .map(|sz| sz.id == target.safe_zone_id)
-                        .unwrap_or(true);
-                    if matches_current_sz
-                        && tracker.plan_id.as_ref() == Some(&target.safe_zone_id.plan_id)
-                    {
-                        let current_pose = amcl_pose.map(|p| p.xy_yaw());
-                        if !tracker.is_target_pose_satisfied(current_pose) {
-                            warn!(
-                                "[{:?}] Nav2 reported goal succeeded before target pose was satisfied (current={:?}); retrying goal {:?}.",
-                                target.agent.index(),
-                                current_pose,
-                                target.safe_zone_id,
-                            );
-                            return Ok(target.clone());
-                        }
-                        if let Some(reached_prog) =
-                            tracker.mark_target_reached(latest_progress.0.as_ref())
-                        {
-                            let pose = amcl_pose
-                                .map(|p| PoseStamped {
-                                    header: p.0.header.clone(),
-                                    pose: p.0.pose.pose.clone(),
-                                })
-                                .unwrap_or_default();
-                            let sz_id = current_safe_zone
-                                .and_then(|csz| csz.0.as_ref().map(|sz| &sz.id))
-                                .or(Some(&target.safe_zone_id));
-                            let progress_msg = build_progress_status(
-                                pose,
-                                Progress::MODE_NAVIGATING,
-                                Some(&reached_prog),
-                                sz_id,
-                            );
-                            if latest_progress.0.as_ref() != Some(&progress_msg) {
-                                let _ = progress_pub.publisher.publish(progress_msg.clone());
-                                latest_progress.0 = Some(progress_msg);
-                            }
-                        }
-                    }
+) {
+    let agent = outcome.target.agent;
+    let mut was_superseded = true;
+
+    if let Ok(client) = clients.get(agent) {
+        if let Ok(mut state) = client.state.lock() {
+            if let Some(active) = state.active_goal.as_ref() {
+                if active.seq == outcome.seq {
+                    was_superseded = active.superseded;
+                    state.active_goal = None;
                 }
             }
-            return Err(result);
         }
-        Err(ref err) => match err.kind {
-            InnerNavigationErrorKind::GoalAbortedError => {
-                let Some(ref handle) = err.handle else {
-                    return Err(result);
-                };
-                let target = &handle.request;
-                let active_goal = inner_nav_clients
-                    .get(target.agent)
-                    .ok()
-                    .and_then(|inner_client| inner_client.goal().as_ref());
-
-                if !should_publish_path_blocked(
-                    &target.safe_zone_id,
-                    active_goal.map(|goal| (goal.id(), goal.is_superseded())),
-                ) {
-                    info!(
-                        "[{:?}] Ignoring stale Nav2 abort {:?}",
-                        target.agent.index(),
-                        target.safe_zone_id,
-                    );
-                    return Err(result);
-                }
-
-                if let Ok(publisher) = plan_error_publishers.get(target.agent) {
-                    let plan_error = ros_env::rmf_prototype_msgs::msg::PlanError {
-                        error: ros_env::rmf_prototype_msgs::msg::Error {
-                            code: ros_env::rmf_prototype_msgs::msg::PlanError::CODE_PATH_BLOCKED,
-                            message: format!(
-                                "Nav2 goal aborted for agent {:?}: path blocked within safe zone",
-                                target.agent.index()
-                            ),
-                            parameters: String::new(),
-                        },
-                        plan_id: handle.request.safe_zone_id.plan_id.clone(),
-                    };
-                    if let Err(e) = publisher.publisher.publish(plan_error) {
-                        error!(
-                            "Failed to publish PlanError for agent {:?}: {:?}",
-                            target.agent.index(),
-                            e
-                        );
-                    } else {
-                        warn!(
-                            "[{:?}] Goal aborted by Nav2! Published PlanError CODE_PATH_BLOCKED to ~/plan/error.",
-                            target.agent.index()
-                        );
-                    }
-                }
-
-                return Err(result);
-            }
-            InnerNavigationErrorKind::GoalCancelledError => {
-                // Only mark cancellation success for external cancellation
-                // and not for replan attempts
-                if let Some(agent) = err.handle.as_ref().map(|h| h.request.agent) {
-                    if let Ok(mut cancelling) = cancelling_inner.get_mut(agent) {
-                        info!(
-                            "[{:?}] Goal cancelled. Marking cancellation as success.",
-                            agent.index()
-                        );
-                        cancelling.success = true;
-                    }
-                }
-            }
-            _ => {}
-        },
     }
-    return Err(result);
+
+    if outcome.status == GoalOutcomeStatus::Cancelled {
+        if let Ok(mut cancelling) = cancelling_inner.get_mut(agent) {
+            info!(
+                "[{:?}] Goal cancelled. Marking cancellation as success.",
+                agent.index()
+            );
+            cancelling.success = true;
+        }
+        return;
+    }
+
+    if was_superseded {
+        return;
+    }
+
+    match outcome.status {
+        GoalOutcomeStatus::Succeeded => {
+            if let Ok((tracker, progress_pub, mut latest_progress, current_safe_zone, amcl_pose)) =
+                progress_query.get_mut(agent)
+            {
+                let matches_sz = current_safe_zone
+                    .and_then(|csz| csz.0.as_ref())
+                    .map(|sz| sz.id == outcome.target.safe_zone_id)
+                    .unwrap_or(true);
+                if matches_sz
+                    && tracker.plan_id.as_ref() == Some(&outcome.target.safe_zone_id.plan_id)
+                {
+                    let current_pose = amcl_pose.map(|p| p.xy_yaw());
+                    if !tracker.is_target_pose_satisfied(current_pose) {
+                        warn!(
+                            "[{:?}] Nav2 reported goal succeeded before target pose was satisfied (current={:?}); retrying goal {:?}.",
+                            agent.index(),
+                            current_pose,
+                            outcome.target.safe_zone_id,
+                        );
+                        let _ = commands
+                            .request(outcome.target, nav_services.dispatch_target.clone())
+                            .detach();
+                        return;
+                    }
+                    if let Some(reached_prog) =
+                        tracker.mark_target_reached(latest_progress.0.as_ref())
+                    {
+                        let pose = amcl_pose
+                            .map(|p| PoseStamped {
+                                header: p.0.header.clone(),
+                                pose: p.0.pose.pose.clone(),
+                            })
+                            .unwrap_or_default();
+                        let sz_id = current_safe_zone
+                            .and_then(|csz| csz.0.as_ref().map(|sz| &sz.id))
+                            .or(Some(&outcome.target.safe_zone_id));
+                        let mode = tracker.execution_mode(true);
+                        let progress_msg =
+                            build_progress_status(pose, mode, Some(&reached_prog), sz_id);
+                        if latest_progress.0.as_ref() != Some(&progress_msg) {
+                            let _ = progress_pub.publisher.publish(progress_msg.clone());
+                            latest_progress.0 = Some(progress_msg);
+                        }
+                    }
+                }
+            }
+        }
+        GoalOutcomeStatus::Aborted => {
+            if let Ok(publisher) = error_publishers.get(agent) {
+                let plan_error = PlanError {
+                    error: RmfError {
+                        code: PlanError::CODE_PATH_BLOCKED,
+                        message: format!(
+                            "Nav2 goal aborted for agent {:?}: path blocked within safe zone",
+                            agent.index()
+                        ),
+                        parameters: String::new(),
+                    },
+                    plan_id: outcome.target.safe_zone_id.plan_id.clone(),
+                };
+                if let Err(e) = publisher.publisher.publish(plan_error) {
+                    error!(
+                        "Failed to publish PlanError for agent {:?}: {:?}",
+                        agent.index(),
+                        e
+                    );
+                } else {
+                    warn!(
+                        "[{:?}] Goal aborted by Nav2! Published PlanError CODE_PATH_BLOCKED to ~/plan/error.",
+                        agent.index()
+                    );
+                }
+            }
+        }
+        GoalOutcomeStatus::Cancelled => {}
+    }
 }
 
-fn should_publish_path_blocked(
+pub fn should_publish_path_blocked(
     completed_goal_id: &SafeZoneId,
     active_goal: Option<(&SafeZoneId, bool)>,
 ) -> bool {
@@ -924,49 +759,6 @@ fn should_publish_path_blocked(
         active_goal,
         Some((active_goal_id, false)) if active_goal_id == completed_goal_id
     )
-}
-
-/// Clears existing goal clients for this agent after verifying that the
-/// completed goal matches the currently tracked active goal, to avoid
-/// accidentally clearing a newly requested goal.
-fn cleanup_goal_client(
-    Blocking {
-        request: result, ..
-    }: Blocking<InnerNavigationResult>,
-    mut inner_nav_clients: Query<&mut InnerNavigationClient>,
-) {
-    let handle = match result {
-        Ok(res) => res.handle,
-        Err(err) => {
-            let Some(req) = err.handle else {
-                return;
-            };
-            req
-        }
-    };
-
-    // Clear inner goal client
-    if let Ok(mut inner_nav_client) = inner_nav_clients.get_mut(handle.request.agent) {
-        let is_current = if let Some(active_goal) = inner_nav_client.goal() {
-            active_goal.id() == &handle.request.safe_zone_id
-        } else {
-            false
-        };
-        if is_current {
-            inner_nav_client.reset_goal();
-        } else {
-            debug!(
-                "[{:?}] Ignoring stale Nav2 goal cleanup {:?}",
-                handle.request.agent.index(),
-                handle.request.safe_zone_id,
-            );
-        }
-    } else {
-        warn!(
-            "[{:?}] InnerNavigationClient not found!",
-            handle.request.agent.index()
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1028,5 +820,18 @@ mod tests {
         let completed = safe_zone_id(1, 3, 7);
 
         assert!(!should_publish_path_blocked(&completed, None));
+    }
+
+    #[test]
+    fn newer_safe_zone_detection_orders_sessions_plans_and_versions() {
+        let sz_v1 = safe_zone_id(1, 2, 3);
+        let sz_v2 = safe_zone_id(1, 2, 4);
+        let sz_next_plan = safe_zone_id(1, 3, 0);
+        let sz_new_session = safe_zone_id(2, 0, 0);
+
+        assert!(is_safe_zone_newer(&sz_v2, &sz_v1));
+        assert!(!is_safe_zone_newer(&sz_v1, &sz_v2));
+        assert!(is_safe_zone_newer(&sz_next_plan, &sz_v2));
+        assert!(is_safe_zone_newer(&sz_new_session, &sz_next_plan));
     }
 }
