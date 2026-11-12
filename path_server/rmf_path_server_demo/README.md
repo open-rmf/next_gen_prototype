@@ -55,6 +55,18 @@ ros2 launch rmf_path_server_demo demo_map.launch.py
 - The canvas will automatically fit to the 20x20 grid map.
 - You can add robots and set goals as in the default mode, and see the map obstacles (a box in the center) drawn on the canvas.
 
+### 4. Docking Corridor Mode (3x8 Corridor with Protruding Docks)
+In this mode, the launch file loads a 3x8 central corridor `OccupancyGrid` (`corridor_grid.yaml`) with 6 small protruding 1x1 dock alcoves (`dock_north_1..3` at `y=2` and `dock_south_1..3` at `y=-2` for `x in {-1, 1, 3}`) alongside a matching RMF site file (`corridor_docks.site.json`). Each spawned `rmf_mock_robot_sim` loads `corridor_docks.site.json` and randomly varies the transition time when entering or leaving a dock.
+
+Run the launch file:
+```bash
+ros2 launch rmf_path_server_demo demo_docking.launch.py
+```
+To also enable the reservation destination server (`rmf_reservation_destination_server`) with `corridor_docks.site.json`:
+```bash
+ros2 launch rmf_path_server_demo demo_docking.launch.py use_destination_server:=true
+```
+
 ## Reservation Config Visualization
 
 When the reservation destination server loads a configuration, it republishes

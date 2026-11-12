@@ -33,11 +33,13 @@ from rmf_prototype_msgs.msg import (
     DestinationConstraints,
     DestinationError,
     DestinationGoal,
+    GraphElementKey,
     Participant,
     ParticipantList,
     Plan,
     Progress,
     Region,
+    TargetNode,
     TargetRegion,
 )
 
@@ -98,9 +100,19 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
             name = query.get('name', [''])[0]
             x = float(query.get('x', [0.0])[0])
             y = float(query.get('y', [0.0])[0])
+            min_scale_str = query.get('min_action_scale', [None])[0]
+            max_scale_str = query.get('max_action_scale', [None])[0]
+            min_action_scale = float(min_scale_str) if min_scale_str is not None else None
+            max_action_scale = float(max_scale_str) if max_scale_str is not None else None
 
             if spawner_node and name:
-                spawner_node.spawn_robot(name, x, y)
+                spawner_node.spawn_robot(
+                    name,
+                    x,
+                    y,
+                    min_action_scale=min_action_scale,
+                    max_action_scale=max_action_scale,
+                )
                 self.send_ok_response({'status': 'spawned', 'name': name, 'radius': 0.49})
             else:
                 self.send_error_response('Missing name or spawner node inactive')
@@ -117,7 +129,16 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
             return
         elif self.path.startswith('/config'):
             use_dest = spawner_node.use_destination_server if spawner_node else False
-            self.send_ok_response({'default_radius': 0.49, 'use_destination_server': use_dest})
+            site_file = spawner_node.site_file if spawner_node else ''
+            docks = spawner_node.site_docks if spawner_node else []
+            lanes = spawner_node.site_lanes if spawner_node else []
+            self.send_ok_response({
+                'default_radius': 0.49,
+                'use_destination_server': use_dest,
+                'site_file': site_file,
+                'docks': docks,
+                'lanes': lanes,
+            })
             return
 
         elif self.path.startswith('/destination'):
@@ -179,6 +200,9 @@ class RobotSpawnerNode(Node):
         self.use_destination_server = self.get_parameter('use_destination_server').value
         self.declare_parameter('port', 8080)
         self.port = int(self.get_parameter('port').value)
+        self.declare_parameter('site_file', '')
+        self.site_file = str(self.get_parameter('site_file').value)
+        self.site_docks, self.site_lanes = self._load_site_docks(self.site_file)
 
         self.current_map = None
         self.active_processes = {}
@@ -348,8 +372,101 @@ class RobotSpawnerNode(Node):
         self.current_map = map_dict
         self.broadcast(json.dumps(map_dict))
 
+    def _load_site_docks(self, site_file_path):
+        if not site_file_path or not os.path.exists(site_file_path):
+            return [], []
+        try:
+            with open(site_file_path, 'r', encoding='utf-8') as f:
+                site_data = json.load(f)
+        except Exception as e:
+            self.get_logger().error(f"Failed to read site_file '{site_file_path}': {e}")
+            return [], []
+
+        def extract_anchor_xy(pose):
+            if isinstance(pose, list) and len(pose) >= 2:
+                return (float(pose[0]), float(pose[1]))
+            if isinstance(pose, dict):
+                t2d = pose.get('Translate2D')
+                if isinstance(t2d, list) and len(t2d) >= 2:
+                    return (float(t2d[0]), float(t2d[1]))
+            return None
+
+        anchors = {}
+        for anchor_id, pose in site_data.get('anchors', {}).items():
+            xy = extract_anchor_xy(pose)
+            if xy is not None:
+                anchors[str(anchor_id)] = xy
+        for level_data in site_data.get('levels', {}).values():
+            if not isinstance(level_data, dict):
+                continue
+            for anchor_id, pose in level_data.get('anchors', {}).items():
+                xy = extract_anchor_xy(pose)
+                if xy is not None:
+                    anchors[str(anchor_id)] = xy
+
+        docks = []
+        nav_lanes = []
+        neighbors = {}
+        guided = site_data.get('navigation', {}).get('guided', {})
+        lanes = guided.get('lanes', {})
+        for lane_id, lane_data in lanes.items():
+            if not isinstance(lane_data, dict):
+                continue
+            lane_anchors = lane_data.get('anchors')
+            if isinstance(lane_anchors, list) and len(lane_anchors) >= 2:
+                left_id = str(lane_anchors[0])
+                right_id = str(lane_anchors[1])
+            else:
+                left_id = str(lane_data.get('left', ''))
+                right_id = str(lane_data.get('right', ''))
+            if left_id not in anchors or right_id not in anchors:
+                continue
+            lx, ly = anchors[left_id]
+            rx, ry = anchors[right_id]
+            neighbors.setdefault(left_id, []).append((rx, ry))
+            neighbors.setdefault(right_id, []).append((lx, ly))
+            forward = lane_data.get('forward', {})
+            is_dock = isinstance(forward, dict) and isinstance(forward.get('dock'), dict)
+            nav_lanes.append({
+                'x1': lx,
+                'y1': ly,
+                'x2': rx,
+                'y2': ry,
+                'is_dock': is_dock,
+            })
+
+        locations = guided.get('locations', {})
+        for loc_id, loc_data in locations.items():
+            if not isinstance(loc_data, dict):
+                continue
+            anchor_id = str(loc_data.get('anchor', ''))
+            if anchor_id not in anchors:
+                continue
+            tags = loc_data.get('tags', [])
+            if isinstance(tags, list) and any(
+                t == 'ParkingSpot' or (isinstance(t, dict) and 'ParkingSpot' in t)
+                for t in tags
+            ):
+                continue
+            anchor_neighbors = neighbors.get(anchor_id, [])
+            if len(anchor_neighbors) != 1:
+                continue
+            rx, ry = anchors[anchor_id]
+            lx, ly = anchor_neighbors[0]
+            dock_name = str(loc_data.get('name', f'location_{loc_id}'))
+            duration = float(loc_data.get('dock_duration', 3.0))
+            docks.append({
+                'name': dock_name,
+                'entry_x': lx,
+                'entry_y': ly,
+                'x': rx,
+                'y': ry,
+                'duration': duration,
+            })
+        return docks, nav_lanes
+
     # Spawns a mock simulator node
-    def spawn_robot(self, name, x, y):
+    def spawn_robot(self, name, x, y, min_action_scale=None, max_action_scale=None):
         if name in self.active_processes:
             poll = self.active_processes[name].poll()
             if poll is None:
@@ -366,6 +483,12 @@ class RobotSpawnerNode(Node):
             '-p', f'initial_y:={y}',
             '-p', 'publish_discovery:=false'
         ]
+        if self.site_file:
+            cmd.extend(['-p', f'site_file:={self.site_file}'])
+        if min_action_scale is not None:
+            cmd.extend(['-p', f'action_time_min_scale:={float(min_action_scale)}'])
+        if max_action_scale is not None:
+            cmd.extend(['-p', f'action_time_max_scale:={float(max_action_scale)}'])
 
         try:
             os.makedirs('mock_sim_logs', exist_ok=True)
@@ -440,6 +563,7 @@ class RobotSpawnerNode(Node):
             data = json.dumps({
                 'type': 'plan',
                 'name': r_name,
+                'plan_version': int(msg.plan_id.plan_version),
                 'waypoints': wps
             })
             self.broadcast(data)
@@ -562,6 +686,12 @@ class RobotSpawnerNode(Node):
             topic = f'{name}/destination'
         return self.count_subscribers(topic) >= 1
 
+    def _find_dock_node_name(self, gx, gy):
+        for dock in self.site_docks:
+            if abs(dock['x'] - float(gx)) < 0.35 and abs(dock['y'] - float(gy)) < 0.35:
+                return dock['name']
+        return None
+
     def publish_destination(self, name):
         import uuid
         goals = self.robot_goals.get(name, [])
@@ -585,6 +715,11 @@ class RobotSpawnerNode(Node):
                     float(gy + 1.0)
                 ]
                 constraint.regions.append(target_region)
+                dock_name = self._find_dock_node_name(gx, gy)
+                if dock_name:
+                    target_node = TargetNode()
+                    target_node.key = GraphElementKey(name=[str(dock_name)])
+                    constraint.nodes.append(target_node)
                 goal_msg.one_of.append(constraint)
 
             goal_msg.cost_bias = [0.0] * len(goals)
@@ -610,6 +745,11 @@ class RobotSpawnerNode(Node):
                 float(gy + 1.0)
             ]
             constraint.regions.append(target_region)
+            dock_name = self._find_dock_node_name(gx, gy)
+            if dock_name:
+                target_node = TargetNode()
+                target_node.key = GraphElementKey(name=[str(dock_name)])
+                constraint.nodes.append(target_node)
             dest_msg.constraints = constraint
 
             self.dest_publishers[name].publish(dest_msg)
