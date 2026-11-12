@@ -23,7 +23,7 @@ use ros_env::rmf_next_gen_reservation_msgs::msg::{
 };
 use ros_env::rmf_prototype_msgs::msg::{
     Destination, DestinationConstraints, DestinationError, DestinationGoal, Error, Region,
-    TargetRegion,
+    TargetNode, TargetOrientation, TargetRegion,
 };
 use ros_env::unique_identifier_msgs::msg::UUID;
 use std::collections::HashMap;
@@ -89,6 +89,7 @@ impl DomainRegion {
 struct DomainTargetRegion {
     pub tolerance: f32,
     pub region: DomainRegion,
+    pub orientations: Vec<TargetOrientation>,
 }
 
 impl DomainTargetRegion {
@@ -96,6 +97,7 @@ impl DomainTargetRegion {
         Self {
             tolerance: ros.tolerance,
             region: DomainRegion::from_ros(&ros.region),
+            orientations: ros.orientations.clone(),
         }
     }
 
@@ -103,7 +105,7 @@ impl DomainTargetRegion {
         TargetRegion {
             tolerance: self.tolerance,
             region: self.region.to_ros(),
-            ..Default::default()
+            orientations: self.orientations.clone(),
         }
     }
 }
@@ -111,6 +113,7 @@ impl DomainTargetRegion {
 #[derive(Clone, Debug, PartialEq)]
 struct DomainDestinationConstraints {
     pub regions: Vec<DomainTargetRegion>,
+    pub nodes: Vec<TargetNode>,
 }
 
 impl DomainDestinationConstraints {
@@ -121,13 +124,14 @@ impl DomainDestinationConstraints {
                 .iter()
                 .map(DomainTargetRegion::from_ros)
                 .collect(),
+            nodes: ros.nodes.clone(),
         }
     }
 
     fn to_ros(&self) -> DestinationConstraints {
         DestinationConstraints {
             regions: self.regions.iter().map(|r| r.to_ros()).collect(),
-            ..Default::default()
+            nodes: self.nodes.clone(),
         }
     }
 }
@@ -763,7 +767,9 @@ mod tests {
                         hint: DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE,
                         points: vec![0.0, 0.0, 1.0, 1.0],
                     },
+                    orientations: Vec::new(),
                 }],
+                nodes: Vec::new(),
             },
             DomainDestinationConstraints {
                 regions: vec![DomainTargetRegion {
@@ -772,7 +778,9 @@ mod tests {
                         hint: DomainRegion::HINT_AXIS_ALIGNED_RECTANGLE,
                         points: vec![5.0, 5.0, 6.0, 6.0],
                     },
+                    orientations: Vec::new(),
                 }],
+                nodes: Vec::new(),
             },
         ];
 
@@ -798,5 +806,48 @@ mod tests {
             .unwrap());
 
         assert!(od.first_free_option(&only_second).is_none());
+    }
+
+    #[test]
+    fn test_domain_target_region_preserves_orientations() {
+        let ros_region = TargetRegion {
+            tolerance: 0.25,
+            region: Region {
+                points: vec![1.0, 2.0],
+                hint: Region::HINT_POINT,
+            },
+            orientations: vec![TargetOrientation {
+                orientation_radians: -std::f32::consts::FRAC_PI_2,
+                spread_radians: 0.1,
+                tolerance_radians: 0.05,
+            }],
+        };
+
+        let domain = DomainTargetRegion::from_ros(&ros_region);
+        let roundtrip = domain.to_ros();
+        assert_eq!(roundtrip.orientations, ros_region.orientations);
+        assert_eq!(roundtrip.tolerance, ros_region.tolerance);
+    }
+
+    #[test]
+    fn test_domain_destination_constraints_preserves_nodes() {
+        use ros_env::rmf_prototype_msgs::msg::GraphElementKey;
+        let mut key = GraphElementKey::default();
+        key.key = vec![42i64].try_into().unwrap();
+        let ros_constraints = DestinationConstraints {
+            regions: vec![],
+            nodes: vec![TargetNode {
+                key,
+                orientations: vec![TargetOrientation {
+                    orientation_radians: 1.57,
+                    spread_radians: 0.0,
+                    tolerance_radians: 0.1,
+                }],
+            }],
+        };
+
+        let domain = DomainDestinationConstraints::from_ros(&ros_constraints);
+        let roundtrip = domain.to_ros();
+        assert_eq!(roundtrip.nodes, ros_constraints.nodes);
     }
 }
