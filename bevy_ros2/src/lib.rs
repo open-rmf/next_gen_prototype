@@ -32,6 +32,12 @@ use std::{
 #[derive(Resource, Deref)]
 pub struct RclrsNode(Arc<NodeState>);
 
+impl RclrsNode {
+    pub fn new(node: Arc<NodeState>) -> Self {
+        Self(node)
+    }
+}
+
 impl FromWorld for RclrsNode {
     fn from_world(world: &mut World) -> Self {
         let executor_commands = world.resource::<RclrsExecutorCommands>();
@@ -45,12 +51,26 @@ impl FromWorld for RclrsNode {
 pub struct RclrsExecutorCommands(Arc<ExecutorCommands>);
 
 #[derive(Default)]
-pub struct RclrsPlugin {}
+pub struct RclrsPlugin {
+    pub node_name: Option<String>,
+}
+
+impl RclrsPlugin {
+    pub fn with_node_name(node_name: impl Into<String>) -> Self {
+        Self {
+            node_name: Some(node_name.into()),
+        }
+    }
+}
 
 impl Plugin for RclrsPlugin {
     fn build(&self, app: &mut App) {
+        if app.world().contains_resource::<RclrsNode>() {
+            return;
+        }
         let mut executor = Context::default_from_env().unwrap().create_basic_executor();
-        app.insert_resource(RclrsExecutorCommands(Arc::clone(executor.commands())));
+        let commands = Arc::clone(executor.commands());
+        app.insert_resource(RclrsExecutorCommands(Arc::clone(&commands)));
 
         thread::spawn(move || {
             let r = executor.spin(SpinOptions::default());
@@ -59,7 +79,12 @@ impl Plugin for RclrsPlugin {
             }
         });
 
-        app.init_resource::<RclrsNode>();
+        if let Some(name) = &self.node_name {
+            let node = commands.create_node(name).unwrap();
+            app.insert_resource(RclrsNode(node));
+        } else {
+            app.init_resource::<RclrsNode>();
+        }
     }
 }
 

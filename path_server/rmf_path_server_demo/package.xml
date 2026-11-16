@@ -23,6 +23,7 @@
   <exec_depend>rmf_path_server</exec_depend>
   <exec_depend>rmf_path_visualizer</exec_depend>
   <exec_depend>rmf_plan_executor</exec_depend>
+  <exec_depend>rmf_process_executor</exec_depend>
   <exec_depend>rmf_simple_destination_server</exec_depend>
   <exec_depend>rmf_reservation_destination_server</exec_depend>
 

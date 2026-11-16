@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{PlanExecutor, PlanExecutorConfig};
+use crate::{ExecutionStepOutput, PlanExecutor, PlanExecutorConfig};
 use rclrs::{IntoPrimitiveOptions, Node, ToLogParams};
 use ros_env::nav_msgs::msg::OccupancyGrid;
-use ros_env::rmf_prototype_msgs::msg::{Plan, PlanError, PlanRelease, Progress, SafeZone};
+use ros_env::rmf_prototype_msgs::msg::{
+    Action, ActionProgress, Plan, PlanError, PlanRelease, Progress, SafeZone,
+};
 use std::collections::HashMap;
 
 pub struct PlanExecutorRosNode {
@@ -24,6 +26,7 @@ pub struct PlanExecutorRosNode {
     pub plan_release_publishers: HashMap<String, rclrs::Publisher<PlanRelease>>,
     pub safezone_publishers: HashMap<String, rclrs::Publisher<SafeZone>>,
     pub plan_error_publishers: HashMap<String, rclrs::Publisher<PlanError>>,
+    pub action_publishers: HashMap<String, rclrs::Publisher<Action>>,
 }
 
 impl PlanExecutorRosNode {
@@ -42,6 +45,7 @@ impl PlanExecutorRosNode {
             plan_release_publishers: HashMap::new(),
             safezone_publishers: HashMap::new(),
             plan_error_publishers: HashMap::new(),
+            action_publishers: HashMap::new(),
         }
     }
 
@@ -66,6 +70,7 @@ impl PlanExecutorRosNode {
             self.plan_release_publishers.remove(robot_id);
             self.safezone_publishers.remove(robot_id);
             self.plan_error_publishers.remove(robot_id);
+            self.action_publishers.remove(robot_id);
         }
     }
 
@@ -117,7 +122,15 @@ impl PlanExecutorRosNode {
 
     pub fn handle_progress(&mut self, robot_id: &str, msg: Progress) {
         let output = self.executor.handle_progress(robot_id, msg);
+        self.publish_step_output(robot_id, output);
+    }
 
+    pub fn handle_action_progress(&mut self, robot_id: &str, msg: ActionProgress) {
+        let output = self.executor.handle_action_progress(robot_id, msg);
+        self.publish_step_output(robot_id, output);
+    }
+
+    fn publish_step_output(&mut self, robot_id: &str, output: ExecutionStepOutput) {
         if let Some(error) = output.plan_error {
             self.publish_plan_error(robot_id, error);
         }
@@ -128,6 +141,39 @@ impl PlanExecutorRosNode {
 
         if let Some(safe_zone) = output.safe_zone {
             self.publish_safe_zone(robot_id, safe_zone);
+        }
+
+        if let Some(action) = output.action {
+            self.publish_action(robot_id, action);
+        }
+    }
+
+    fn publish_action(&mut self, robot_id: &str, action: Action) {
+        let publisher = match self.action_publishers.entry(robot_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let topic = format!("{robot_id}/plan/action");
+                match self
+                    .node
+                    .create_publisher(topic.as_str().transient_local().reliable())
+                {
+                    Ok(publisher) => entry.insert(publisher),
+                    Err(err) => {
+                        rclrs::log_error!(
+                            self.node.logger(),
+                            "Failed to create plan action publisher for {robot_id}: {err:?}"
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+
+        if let Err(err) = publisher.publish(action) {
+            rclrs::log_warn!(
+                self.node.logger(),
+                "Failed to publish plan action for {robot_id}: {err:?}"
+            );
         }
     }
 

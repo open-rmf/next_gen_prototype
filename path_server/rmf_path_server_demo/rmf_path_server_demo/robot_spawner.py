@@ -29,6 +29,8 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rmf_next_gen_reservation_msgs.msg import ReservationConfig
 from rmf_prototype_msgs.msg import (
+    Action,
+    ActionProgress,
     Destination,
     DestinationConstraints,
     DestinationError,
@@ -146,11 +148,19 @@ class DemoRequestHandler(http.server.SimpleHTTPRequestHandler):
             name = query.get('name', [''])[0]
             x_str = query.get('x', [''])[0]
             y_str = query.get('y', [''])[0]
+            arrival_action = query.get('arrival_action', [''])[0]
+            departure_action = query.get('departure_action', [''])[0]
 
             if spawner_node and name:
                 xs = [float(val) for val in x_str.split(',')] if x_str else []
                 ys = [float(val) for val in y_str.split(',')] if y_str else []
-                spawner_node.set_goals(name, xs, ys)
+                spawner_node.set_goals(
+                    name,
+                    xs,
+                    ys,
+                    arrival_action=arrival_action,
+                    departure_action=departure_action,
+                )
                 self.send_ok_response({'status': 'goals_set', 'name': name})
             else:
                 self.send_error_response('Missing name or spawner node inactive')
@@ -210,9 +220,12 @@ class RobotSpawnerNode(Node):
         self.sse_clients = []
         self.sse_clients_lock = threading.Lock()
         self.robot_goals = {}
+        self.robot_actions = {}
         self.odom_subs = {}
         self.plan_subs = {}
         self.progress_subs = {}
+        self.action_subs = {}
+        self.action_progress_subs = {}
         self.destination_subs = {}
         self.destination_error_subs = {}
         self.discovery_timer = None
@@ -508,6 +521,8 @@ class RobotSpawnerNode(Node):
             self.subscribe_to_odom(name)
             self.subscribe_to_plan(name)
             self.subscribe_to_progress(name)
+            self.subscribe_to_action(name)
+            self.subscribe_to_action_progress(name)
             self.subscribe_to_destination(name)
             self.subscribe_to_destination_error(name)
 
@@ -558,7 +573,9 @@ class RobotSpawnerNode(Node):
                     'x': float(wp.position[0]),
                     'y': float(wp.position[1]),
                     'progress': float(wp.progress),
-                    'departure_blockers': blockers
+                    'departure_blockers': blockers,
+                    'arrival_action': str(wp.arrival_action),
+                    'departure_action': str(wp.departure_action),
                 })
             data = json.dumps({
                 'type': 'plan',
@@ -593,6 +610,57 @@ class RobotSpawnerNode(Node):
             Progress,
             f'{name}/plan/progress',
             progress_callback,
+            qos_profile=self.reliable_transient_qos
+        )
+
+    def subscribe_to_action(self, name):
+        if name in self.action_subs:
+            return
+
+        self.get_logger().info(f"Subscribing to dynamic action topic for '{name}'")
+
+        def action_callback(msg, r_name=name):
+            data = json.dumps({
+                'type': 'action',
+                'name': r_name,
+                'plan_version': int(msg.plan_id.plan_version),
+                'waypoint_id': int(msg.waypoint_id),
+                'phase': int(msg.phase),
+                'action': str(msg.action),
+            })
+            self.broadcast(data)
+
+        self.action_subs[name] = self.create_subscription(
+            Action,
+            f'{name}/plan/action',
+            action_callback,
+            qos_profile=self.reliable_transient_qos
+        )
+
+    def subscribe_to_action_progress(self, name):
+        if name in self.action_progress_subs:
+            return
+
+        self.get_logger().info(
+            f"Subscribing to dynamic action progress topic for '{name}'"
+        )
+
+        def action_progress_callback(msg, r_name=name):
+            data = json.dumps({
+                'type': 'action_progress',
+                'name': r_name,
+                'plan_version': int(msg.plan_id.plan_version),
+                'waypoint_id': int(msg.waypoint_id),
+                'phase': int(msg.phase),
+                'status': int(msg.status),
+                'error': str(msg.error),
+            })
+            self.broadcast(data)
+
+        self.action_progress_subs[name] = self.create_subscription(
+            ActionProgress,
+            f'{name}/plan/action/progress',
+            action_progress_callback,
             qos_profile=self.reliable_transient_qos
         )
 
@@ -652,13 +720,23 @@ class RobotSpawnerNode(Node):
             qos_profile=self.reliable_volatile_qos
         )
 
-    def set_goal(self, name, x, y):
-        self.set_goals(name, [x], [y])
+    def set_goal(self, name, x, y, arrival_action='', departure_action=''):
+        self.set_goals(
+            name,
+            [x],
+            [y],
+            arrival_action=arrival_action,
+            departure_action=departure_action,
+        )
 
-    def set_goals(self, name, xs, ys):
+    def set_goals(self, name, xs, ys, arrival_action='', departure_action=''):
         goals = list(zip(xs, ys))
-        self.get_logger().info(f"Setting goals for '{name}' to {goals}")
+        self.get_logger().info(
+            f"Setting goals for '{name}' to {goals} "
+            f"(arrival_action='{arrival_action}', departure_action='{departure_action}')"
+        )
         self.robot_goals[name] = goals
+        self.robot_actions[name] = (str(arrival_action or ''), str(departure_action or ''))
         if self.discovery_timer:
             self.publish_destination(name)
 
@@ -700,6 +778,8 @@ class RobotSpawnerNode(Node):
 
         self.ensure_destination_publisher(name)
 
+        arrival_action, departure_action = self.robot_actions.get(name, ('', ''))
+
         if self.use_destination_server:
             goal_msg = DestinationGoal()
             goal_msg.session.uuid = list(uuid.uuid4().bytes)
@@ -720,6 +800,8 @@ class RobotSpawnerNode(Node):
                     target_node = TargetNode()
                     target_node.key = GraphElementKey(name=[str(dock_name)])
                     constraint.nodes.append(target_node)
+                constraint.arrival_action = arrival_action
+                constraint.departure_action = departure_action
                 goal_msg.one_of.append(constraint)
 
             goal_msg.cost_bias = [0.0] * len(goals)
@@ -750,6 +832,8 @@ class RobotSpawnerNode(Node):
                 target_node = TargetNode()
                 target_node.key = GraphElementKey(name=[str(dock_name)])
                 constraint.nodes.append(target_node)
+            constraint.arrival_action = arrival_action
+            constraint.departure_action = departure_action
             dest_msg.constraints = constraint
 
             self.dest_publishers[name].publish(dest_msg)
@@ -841,6 +925,7 @@ class RobotSpawnerNode(Node):
                 pass
         self.active_log_files.clear()
         self.robot_goals.clear()
+        self.robot_actions.clear()
 
         # Destroy subscriptions and publishers
         for sub in self.odom_subs.values():
@@ -854,6 +939,14 @@ class RobotSpawnerNode(Node):
         for sub in self.progress_subs.values():
             self.destroy_subscription(sub)
         self.progress_subs.clear()
+
+        for sub in self.action_subs.values():
+            self.destroy_subscription(sub)
+        self.action_subs.clear()
+
+        for sub in self.action_progress_subs.values():
+            self.destroy_subscription(sub)
+        self.action_progress_subs.clear()
 
         for sub in self.destination_subs.values():
             self.destroy_subscription(sub)

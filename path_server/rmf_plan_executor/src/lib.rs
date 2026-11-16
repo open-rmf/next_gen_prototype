@@ -34,12 +34,12 @@ use ros_env::nav2_msgs::msg::Costmap;
 use ros_env::nav_msgs::msg::OccupancyGrid;
 use ros_env::rmf_prototype_msgs;
 use ros_env::rmf_prototype_msgs::msg::{
-    DestinationConstraints, Plan, PlanError, PlanId, PlanRelease, Progress, SafeZone, SafeZoneId,
-    TargetOrientation, TrafficDependency,
+    Action, ActionProgress, DestinationConstraints, Plan, PlanError, PlanId, PlanRelease, Progress,
+    SafeZone, SafeZoneId, TargetOrientation, TrafficDependency,
 };
 use ros_env::std_msgs;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::Instant,
 };
@@ -47,6 +47,9 @@ use std::{
 pub struct RobotState {
     pub radius: f32,
     pub latest_progress: Option<Progress>,
+    pub completed_actions: HashSet<(u64, u8)>,
+    pub active_action: Option<(u64, u8)>,
+    pub failed_action: Option<(u64, u8)>,
     pub plan: Option<Plan>,
     pub reached_waypoint: usize,
     pub safe_zone_version: u64,
@@ -59,6 +62,7 @@ pub struct ExecutionStepOutput {
     pub plan_release: Option<PlanRelease>,
     pub safe_zone: Option<SafeZone>,
     pub plan_error: Option<PlanError>,
+    pub action: Option<Action>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -257,6 +261,9 @@ impl PlanExecutor {
                 RobotState {
                     radius,
                     latest_progress: None,
+                    completed_actions: HashSet::new(),
+                    active_action: None,
+                    failed_action: None,
                     plan: None,
                     reached_waypoint: 0,
                     safe_zone_version: 0,
@@ -294,6 +301,30 @@ impl PlanExecutor {
             }
         }
 
+        if state.plan.as_ref().is_none_or(|p| p.plan_id != msg.plan_id) {
+            let mut preserved_completed = HashSet::new();
+            let mut preserved_failed = None;
+            if let Some(prev_plan) = &state.plan {
+                if prev_plan.plan_id.destination_session == msg.plan_id.destination_session
+                    && !prev_plan.waypoints.is_empty()
+                    && !msg.waypoints.is_empty()
+                {
+                    let old_last = (prev_plan.waypoints.len() - 1) as u64;
+                    let new_last = (msg.waypoints.len() - 1) as u64;
+                    for phase in [Action::PHASE_ARRIVAL, Action::PHASE_DEPARTURE] {
+                        if state.completed_actions.contains(&(old_last, phase)) {
+                            preserved_completed.insert((new_last, phase));
+                        }
+                        if state.failed_action == Some((old_last, phase)) {
+                            preserved_failed = Some((new_last, phase));
+                        }
+                    }
+                }
+            }
+            state.completed_actions = preserved_completed;
+            state.active_action = None;
+            state.failed_action = preserved_failed;
+        }
         state.plan = Some(msg);
         state.reached_waypoint = initial_reached;
         state.safe_zone_version = 0;
@@ -404,6 +435,57 @@ impl PlanExecutor {
         }
     }
 
+    pub fn handle_action_progress(
+        &mut self,
+        robot_id: &str,
+        msg: ActionProgress,
+    ) -> ExecutionStepOutput {
+        let nav_progress = {
+            let Some(state) = self.active_robots.get_mut(robot_id) else {
+                return ExecutionStepOutput::default();
+            };
+            let Some(plan) = &state.plan else {
+                return ExecutionStepOutput::default();
+            };
+            if plan.plan_id != msg.plan_id {
+                return ExecutionStepOutput::default();
+            }
+            let key = (msg.waypoint_id, msg.phase);
+            match msg.status {
+                ActionProgress::STATUS_RUNNING => {
+                    state.active_action = Some(key);
+                    return ExecutionStepOutput::default();
+                }
+                ActionProgress::STATUS_SUCCEEDED => {
+                    state.completed_actions.insert(key);
+                    if state.active_action == Some(key) {
+                        state.active_action = None;
+                    }
+                    state.latest_progress.clone()
+                }
+                ActionProgress::STATUS_FAILED => {
+                    state.failed_action = Some(key);
+                    if state.active_action == Some(key) {
+                        state.active_action = None;
+                    }
+                    return ExecutionStepOutput {
+                        plan_error: Some(PlanError {
+                            error: msg.error,
+                            plan_id: msg.plan_id,
+                        }),
+                        ..Default::default()
+                    };
+                }
+                _ => return ExecutionStepOutput::default(),
+            }
+        };
+        if let Some(progress) = nav_progress {
+            self.handle_progress(robot_id, progress)
+        } else {
+            ExecutionStepOutput::default()
+        }
+    }
+
     pub fn handle_progress(&mut self, robot_id: &str, msg: Progress) -> ExecutionStepOutput {
         let current_x = msg.pose.pose.position.x as f32;
         let current_y = msg.pose.pose.position.y as f32;
@@ -442,6 +524,7 @@ impl PlanExecutor {
                 plan_release: None,
                 safe_zone: None,
                 plan_error,
+                action: None,
             };
         }
 
@@ -458,7 +541,7 @@ impl PlanExecutor {
             }
         }
 
-        // 1. Calculate PlanRelease
+        // 1. Calculate PlanRelease and pending waypoint Action
         let robot_state = &self.active_robots[robot_id];
         let plan = robot_state.plan.as_ref().unwrap();
         let curr_wp_idx = semantic_waypoints
@@ -466,6 +549,7 @@ impl PlanExecutor {
             .map(|w| w.trajectory_index)
             .unwrap_or(0);
 
+        let mut pending_action: Option<Action> = None;
         let mut released_wp_idx = curr_wp_idx;
         while released_wp_idx < plan.waypoints.len() {
             let wp = &plan.waypoints[released_wp_idx];
@@ -481,6 +565,26 @@ impl PlanExecutor {
             {
                 break;
             }
+
+            if !wp.arrival_action.is_empty()
+                && !robot_state
+                    .completed_actions
+                    .contains(&(released_wp_idx as u64, Action::PHASE_ARRIVAL))
+            {
+                if released_wp_idx == curr_wp_idx
+                    && robot_state.failed_action
+                        != Some((released_wp_idx as u64, Action::PHASE_ARRIVAL))
+                {
+                    pending_action = Some(Action {
+                        plan_id: plan.plan_id.clone(),
+                        waypoint_id: released_wp_idx as u64,
+                        phase: Action::PHASE_ARRIVAL,
+                        action: wp.arrival_action.clone(),
+                    });
+                }
+                break;
+            }
+
             let mut blocked = false;
             for blocker in &wp.departure_blockers {
                 if !self.blocker_is_satisfied(blocker, &semantic_waypoints) {
@@ -491,6 +595,26 @@ impl PlanExecutor {
             if blocked {
                 break;
             }
+
+            if !wp.departure_action.is_empty()
+                && !robot_state
+                    .completed_actions
+                    .contains(&(released_wp_idx as u64, Action::PHASE_DEPARTURE))
+            {
+                if released_wp_idx == curr_wp_idx
+                    && robot_state.failed_action
+                        != Some((released_wp_idx as u64, Action::PHASE_DEPARTURE))
+                {
+                    pending_action = Some(Action {
+                        plan_id: plan.plan_id.clone(),
+                        waypoint_id: released_wp_idx as u64,
+                        phase: Action::PHASE_DEPARTURE,
+                        action: wp.departure_action.clone(),
+                    });
+                }
+                break;
+            }
+
             released_wp_idx += 1;
         }
 
@@ -501,6 +625,19 @@ impl PlanExecutor {
         let plan_release = PlanRelease {
             waypoint_id: released_wp_idx as u64,
             plan_id: plan.plan_id.clone(),
+        };
+
+        let emitted_action = if let Some(act) = pending_action {
+            let key = (act.waypoint_id, act.phase);
+            let state = self.active_robots.get_mut(robot_id).unwrap();
+            if state.active_action != Some(key) {
+                state.active_action = Some(key);
+                Some(act)
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         // --- Dynamic grid resizing ---
@@ -614,6 +751,7 @@ impl PlanExecutor {
                 plan_release: Some(plan_release),
                 safe_zone: None,
                 plan_error,
+                action: emitted_action,
             };
         };
         let mut positions = allocation_field
@@ -681,6 +819,7 @@ impl PlanExecutor {
                     orientations: vec![target_ori],
                 }],
                 nodes: target_nodes,
+                ..Default::default()
             },
             costmap,
             target_waypoint: vec![released_wp_idx as u64].try_into().unwrap(),
@@ -696,6 +835,7 @@ impl PlanExecutor {
             plan_release: Some(plan_release),
             safe_zone: Some(safe_zone),
             plan_error,
+            action: emitted_action,
         }
     }
 
@@ -1469,5 +1609,127 @@ mod tests {
 
         let out1_new_session = plan_executor.handle_progress("robot_1", progress_at(-2.0, 0.0));
         assert_eq!(out1_new_session.plan_release.unwrap().waypoint_id, 1);
+    }
+
+    #[test]
+    fn test_arrival_and_departure_actions_gated_with_blockers_and_action_progress() {
+        use ros_env::rmf_prototype_msgs::msg::{Action, ActionProgress};
+
+        let mut plan_executor = PlanExecutor::new();
+        plan_executor.handle_robot_added("robot_1", 0.5);
+        plan_executor.handle_robot_added("robot_2", 0.5);
+
+        let mut plan_r2 = plan_with_positions(&[[0.0, 5.0], [2.0, 5.0]]);
+        plan_r2.plan_id.destination_session.uuid = [2; 16];
+        let plan_r2_id = plan_r2.plan_id.clone();
+
+        let mut plan_r1 = plan_with_positions(&[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]);
+        plan_r1.plan_id.destination_session.uuid = [1; 16];
+        let plan_r1_id = plan_r1.plan_id.clone();
+
+        // wp 1 has arrival_action, a departure_blocker on robot_2, and departure_action
+        plan_r1.waypoints[1].arrival_action = "wait:1.0".to_string();
+        plan_r1.waypoints[1].departure_blockers = vec![TrafficDependency {
+            name: "robot_2".to_string(),
+            plan_id: plan_r2_id.clone(),
+            required_progress: 1.0,
+        }];
+        plan_r1.waypoints[1].departure_action = "open_door".to_string();
+        // Final wp 2 also has a departure_action (cleanup)
+        plan_r1.waypoints[2].departure_action = "close_door".to_string();
+
+        plan_executor.handle_plan("robot_1", plan_r1);
+        plan_executor.handle_plan("robot_2", plan_r2);
+        plan_executor.handle_progress(
+            "robot_2",
+            progress_with_progress(0.0, 5.0, &plan_r2_id, 0, 0.0),
+        );
+
+        // 1. At wp 0, robot_1 is released up to wp 1, no Action emitted yet
+        let out0 = plan_executor.handle_progress(
+            "robot_1",
+            progress_with_progress(0.0, 0.0, &plan_r1_id, 0, 0.0),
+        );
+        assert_eq!(out0.plan_release.unwrap().waypoint_id, 1);
+        assert!(out0.action.is_none());
+
+        // 2. When robot_1 arrives at wp 1, PHASE_ARRIVAL Action is emitted immediately
+        //    (even though robot_2's departure_blocker is not satisfied yet!)
+        let out_arr = plan_executor.handle_progress(
+            "robot_1",
+            progress_with_progress(1.0, 0.0, &plan_r1_id, 1, 1.0),
+        );
+        assert_eq!(out_arr.plan_release.unwrap().waypoint_id, 1);
+        let arr_action = out_arr
+            .action
+            .expect("Expected PHASE_ARRIVAL action at wp 1");
+        assert_eq!(arr_action.waypoint_id, 1);
+        assert_eq!(arr_action.phase, Action::PHASE_ARRIVAL);
+        assert_eq!(arr_action.action, "wait:1.0");
+
+        // Duplicate progress ticks while PHASE_ARRIVAL is running do not re-emit the Action
+        let out_dup = plan_executor.handle_progress(
+            "robot_1",
+            progress_with_progress(1.0, 0.0, &plan_r1_id, 1, 1.0),
+        );
+        assert!(out_dup.action.is_none());
+
+        // 3. Process executor finishes PHASE_ARRIVAL while robot_2 is still at wp 0:
+        //    robot_1 stays held at wp 1 and PHASE_DEPARTURE is NOT emitted yet because of the blocker
+        let out_arr_done = plan_executor.handle_action_progress(
+            "robot_1",
+            ActionProgress {
+                plan_id: plan_r1_id.clone(),
+                waypoint_id: 1,
+                phase: Action::PHASE_ARRIVAL,
+                status: ActionProgress::STATUS_SUCCEEDED,
+                ..Default::default()
+            },
+        );
+        assert_eq!(out_arr_done.plan_release.unwrap().waypoint_id, 1);
+        assert!(out_arr_done.action.is_none());
+
+        // 4. Now robot_2 reaches progress 1.0 -> robot_1's departure_blocker is satisfied,
+        //    so robot_1's next tick emits PHASE_DEPARTURE ("open_door") while still holding PlanRelease at 1
+        plan_executor.handle_progress(
+            "robot_2",
+            progress_with_progress(2.0, 5.0, &plan_r2_id, 1, 1.0),
+        );
+        let out_dep = plan_executor.handle_progress(
+            "robot_1",
+            progress_with_progress(1.0, 0.0, &plan_r1_id, 1, 1.0),
+        );
+        assert_eq!(out_dep.plan_release.unwrap().waypoint_id, 1);
+        let dep_action = out_dep
+            .action
+            .expect("Expected PHASE_DEPARTURE action at wp 1");
+        assert_eq!(dep_action.waypoint_id, 1);
+        assert_eq!(dep_action.phase, Action::PHASE_DEPARTURE);
+        assert_eq!(dep_action.action, "open_door");
+
+        // 5. Process executor finishes PHASE_DEPARTURE at wp 1 -> PlanRelease immediately advances to wp 2!
+        let out_dep_done = plan_executor.handle_action_progress(
+            "robot_1",
+            ActionProgress {
+                plan_id: plan_r1_id.clone(),
+                waypoint_id: 1,
+                phase: Action::PHASE_DEPARTURE,
+                status: ActionProgress::STATUS_SUCCEEDED,
+                ..Default::default()
+            },
+        );
+        assert_eq!(out_dep_done.plan_release.unwrap().waypoint_id, 2);
+
+        // 6. When robot_1 arrives at final wp 2, its final departure_action ("close_door") is emitted
+        let out_final = plan_executor.handle_progress(
+            "robot_1",
+            progress_with_progress(2.0, 0.0, &plan_r1_id, 2, 2.0),
+        );
+        let final_action = out_final
+            .action
+            .expect("Expected PHASE_DEPARTURE action on final wp 2");
+        assert_eq!(final_action.waypoint_id, 2);
+        assert_eq!(final_action.phase, Action::PHASE_DEPARTURE);
+        assert_eq!(final_action.action, "close_door");
     }
 }

@@ -20,6 +20,8 @@ find_package(unique_identifier_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 set(msg_files
+  "msg/Action.msg"
+  "msg/ActionProgress.msg"
   "msg/ControlPoint.msg"
   "msg/Curve.msg"
   "msg/Destination.msg"

@@ -332,3 +332,138 @@ fn test_cancelled_snapshot_preserves_in_flight_destination(
 
     Ok(())
 }
+
+#[test]
+fn test_action_progress_status_running_blocks_replan_until_succeeded(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ros_env::rmf_prototype_msgs::msg::{Action, ActionProgress, PlanId};
+
+    let context = Context::default_from_env().unwrap();
+    let executor = context.create_basic_executor();
+    let server_node = executor.create_node("path_server_action_progress")?;
+
+    let received_map = Arc::new(Mutex::new(None));
+    let planner = TestPlanner { received_map };
+    let footprints = Arc::new(Mutex::new(HashMap::new()));
+    let mut server = rmf_path_server::PlanServer::new(server_node, planner, footprints);
+
+    // Note: Progress.mode stays MODE_IDLE (no fleet-adapter MODE_ACTION);
+    // replan prevention comes strictly from ActionProgress::STATUS_RUNNING.
+    let mut progress = Progress::default();
+    progress.mode = Progress::MODE_IDLE;
+    server.handle_progress("robot1", progress.clone());
+    server.handle_progress("robot2", progress);
+
+    server.handle_action_progress(
+        "robot1",
+        ActionProgress {
+            plan_id: PlanId::default(),
+            waypoint_id: 1,
+            phase: Action::PHASE_ARRIVAL,
+            status: ActionProgress::STATUS_RUNNING,
+            ..Default::default()
+        },
+    );
+    assert!(server.is_executing_action("robot1"));
+
+    // Send destinations for both robot1 (executing arrival_action) and robot2
+    let mut dest1 = Destination::default();
+    dest1.session.uuid = [31; 16];
+    server.handle_destination("robot1", dest1);
+
+    let mut dest2 = Destination::default();
+    dest2.session.uuid = [32; 16];
+    server.handle_destination("robot2", dest2);
+
+    // Snapshot while robot1's ActionProgress is STATUS_RUNNING must exclude robot1!
+    let snapshot_running = server
+        .take_snapshot()
+        .expect("Expected snapshot for robot2 while robot1 is STATUS_RUNNING");
+    assert_eq!(snapshot_running.robot_ids, vec!["robot2".to_string()]);
+    assert!(!snapshot_running.goals.contains_key("robot1"));
+
+    // Once rmf_process_executor reports STATUS_SUCCEEDED, robot1 is no longer blocked
+    server.is_planning = false;
+    server.handle_action_progress(
+        "robot1",
+        ActionProgress {
+            plan_id: PlanId::default(),
+            waypoint_id: 1,
+            phase: Action::PHASE_ARRIVAL,
+            status: ActionProgress::STATUS_SUCCEEDED,
+            ..Default::default()
+        },
+    );
+    assert!(!server.is_executing_action("robot1"));
+
+    let snapshot_done = server
+        .take_snapshot()
+        .expect("Expected snapshot including robot1 after STATUS_SUCCEEDED");
+    assert!(snapshot_done.goals.contains_key("robot1"));
+
+    Ok(())
+}
+
+#[test]
+fn test_action_progress_status_failed_halts_replan_until_new_destination(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ros_env::rmf_prototype_msgs::msg::{Action, ActionProgress, PlanId};
+
+    let context = Context::default_from_env().unwrap();
+    let executor = context.create_basic_executor();
+    let server_node = executor.create_node("path_server_action_failed")?;
+
+    let received_map = Arc::new(Mutex::new(None));
+    let planner = TestPlanner { received_map };
+    let footprints = Arc::new(Mutex::new(HashMap::new()));
+    let mut server = rmf_path_server::PlanServer::new(server_node, planner, footprints);
+
+    let mut progress = Progress::default();
+    progress.mode = Progress::MODE_IDLE;
+    server.handle_progress("robot1", progress.clone());
+    server.handle_progress("robot2", progress);
+
+    let mut dest1 = Destination::default();
+    dest1.session.uuid = [41; 16];
+    server.handle_destination("robot1", dest1);
+
+    // robot1's action fails on destination [41; 16]
+    server.handle_action_progress(
+        "robot1",
+        ActionProgress {
+            plan_id: PlanId::default(),
+            waypoint_id: 1,
+            phase: Action::PHASE_ARRIVAL,
+            status: ActionProgress::STATUS_FAILED,
+            ..Default::default()
+        },
+    );
+    assert!(server.has_failed_action("robot1"));
+
+    // While robot1 is halted on its failed action, robot2 requests a plan:
+    // robot1 must be excluded from replanning its failed destination!
+    let mut dest2 = Destination::default();
+    dest2.session.uuid = [42; 16];
+    server.handle_destination("robot2", dest2);
+
+    let snapshot_while_failed = server
+        .take_snapshot()
+        .expect("Expected snapshot for robot2 while robot1 is halted on STATUS_FAILED");
+    assert_eq!(snapshot_while_failed.robot_ids, vec!["robot2".to_string()]);
+    assert!(!snapshot_while_failed.goals.contains_key("robot1"));
+
+    // Sending a NEW destination session [43; 16] to robot1 clears its failed state and replans it
+    server.is_planning = false;
+    let mut dest1_new = Destination::default();
+    dest1_new.session.uuid = [43; 16];
+    server.handle_destination("robot1", dest1_new);
+    assert!(!server.has_failed_action("robot1"));
+
+    let snapshot_recovered = server
+        .take_snapshot()
+        .expect("Expected snapshot including robot1 after new destination session");
+    assert!(snapshot_recovered.goals.contains_key("robot1"));
+    assert_eq!(snapshot_recovered.goals["robot1"].session.uuid, [43; 16]);
+
+    Ok(())
+}

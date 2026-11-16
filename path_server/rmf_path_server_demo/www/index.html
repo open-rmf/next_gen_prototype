@@ -65,6 +65,17 @@ limitations under the License.
               <div class="selector-badge" id="mode-badge">Setup Mode</div>
             </div>
 
+            <div class="action-inputs">
+              <div class="action-input-row">
+                <label for="input-arrival-action">Arrival Action</label>
+                <input id="input-arrival-action" type="text" placeholder="e.g. wait:4000" value="" />
+              </div>
+              <div class="action-input-row">
+                <label for="input-departure-action">Departure Action</label>
+                <input id="input-departure-action" type="text" placeholder="e.g. wait:1500" value="" />
+              </div>
+            </div>
+
             <div class="action-buttons">
               <button id="btn-add-robot" class="btn btn-primary">
                 <i class="fa-solid fa-plus"></i> Add Robot
@@ -74,6 +85,9 @@ limitations under the License.
               </button>
               <button id="btn-preset-dock-pass" class="btn btn-primary">
                 <i class="fa-solid fa-bolt"></i> Preset: Delayed Dock + Pass
+              </button>
+              <button id="btn-preset-action-pass" class="btn btn-primary">
+                <i class="fa-solid fa-gears"></i> Preset: Process Action + Pass
               </button>
               <button id="btn-reset" class="btn btn-primary">
                 <i class="fa-solid fa-rotate-left"></i> Reset Scenario

@@ -48,8 +48,17 @@ impl Plugin for Nav2TrafficPlugin {
                 Nav2AgentPlugin::default(),
             ));
 
-        // Spawn agents last
-        let agent_names = vec!["robot0".to_string(), "robot1".to_string()];
+        // Spawn agents last (honoring RMF_NAV2_AGENTS if set, otherwise robot0 & robot1)
+        let agent_names: Vec<String> = std::env::var("RMF_NAV2_AGENTS")
+            .ok()
+            .map(|val| {
+                val.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["robot0".to_string(), "robot1".to_string()]);
         for name in agent_names {
             app.world_mut().spawn(Nav2Agent::new(name));
         }

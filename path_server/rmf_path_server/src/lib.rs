@@ -17,7 +17,7 @@ use ros_env::{
     nav_msgs::msg::OccupancyGrid,
     rmf_prototype_msgs::{
         self,
-        msg::{Destination, Plan, PlanError, Progress},
+        msg::{ActionProgress, Destination, Plan, PlanError, Progress},
     },
 };
 use std::{
@@ -134,6 +134,7 @@ impl<P: MapfPlanner> PlanningSnapshot<P> {
 pub struct PlanServer<P: MapfPlanner> {
     pub active_destinations: HashMap<String, Destination>,
     pub latest_progress: HashMap<String, Progress>,
+    pub latest_action_progress: HashMap<String, ActionProgress>,
     pub node: Node,
     pub pending_replans: HashSet<String>,
     pub planner: Arc<P>,
@@ -185,6 +186,7 @@ impl<P: MapfPlanner> PlanServer<P> {
         Self {
             active_destinations: HashMap::new(),
             latest_progress: HashMap::new(),
+            latest_action_progress: HashMap::new(),
             node,
             pending_replans: HashSet::new(),
             planner: Arc::new(planner),
@@ -202,10 +204,34 @@ impl<P: MapfPlanner> PlanServer<P> {
     }
 
     pub fn is_executing_action(&self, robot_id: &str) -> bool {
+        if let Some(ap) = self.latest_action_progress.get(robot_id) {
+            if ap.status == ActionProgress::STATUS_RUNNING {
+                return true;
+            }
+            // Also keep replans blocked in the brief handoff between PHASE_ARRIVAL
+            // succeeding and PHASE_DEPARTURE starting on the same waypoint.
+            if ap.status == ActionProgress::STATUS_SUCCEEDED
+                && ap.phase == rmf_prototype_msgs::msg::Action::PHASE_ARRIVAL
+                && self
+                    .plan_registry
+                    .get_plan(robot_id)
+                    .filter(|p| p.plan_id == ap.plan_id)
+                    .and_then(|p| p.waypoints.get(ap.waypoint_id as usize))
+                    .is_some_and(|wp| !wp.departure_action.is_empty())
+            {
+                return true;
+            }
+        }
         let Some(progress) = self.latest_progress.get(robot_id) else {
             return false;
         };
         self.plan_registry.is_executing_action(robot_id, progress)
+    }
+
+    pub fn has_failed_action(&self, robot_id: &str) -> bool {
+        self.latest_action_progress
+            .get(robot_id)
+            .is_some_and(|ap| ap.status == ActionProgress::STATUS_FAILED)
     }
 
     pub fn occupied_path_of(&self, robot_id: &str) -> Vec<[f32; 2]> {
@@ -249,6 +275,13 @@ impl<P: MapfPlanner> PlanServer<P> {
         };
 
         if is_new_session {
+            if self
+                .latest_action_progress
+                .get(robot_id)
+                .is_some_and(|ap| ap.status != ActionProgress::STATUS_RUNNING)
+            {
+                self.latest_action_progress.remove(robot_id);
+            }
             self.active_destinations.insert(robot_id.to_owned(), msg);
             self.pending_replans.insert(robot_id.to_owned());
             if !self.is_executing_action(robot_id) {
@@ -276,6 +309,14 @@ impl<P: MapfPlanner> PlanServer<P> {
         self.latest_progress.insert(robot_id.to_string(), msg);
     }
 
+    pub fn handle_action_progress(&mut self, robot_id: &str, msg: ActionProgress) {
+        if msg.status == ActionProgress::STATUS_FAILED {
+            self.pending_replans.remove(robot_id);
+        }
+        self.latest_action_progress
+            .insert(robot_id.to_string(), msg);
+    }
+
     pub fn handle_plan_error(&mut self, robot_id: &str, msg: PlanError) {
         if msg.error.code == PlanError::CODE_PATH_BLOCKED {
             rclrs::log_warn!(
@@ -286,6 +327,16 @@ impl<P: MapfPlanner> PlanServer<P> {
             if self.active_destinations.contains_key(robot_id) {
                 self.pending_replans.insert(robot_id.to_string());
             }
+        } else {
+            rclrs::log_warn!(
+                self.node.logger(),
+                "Received non-recoverable PlanError (code={}) for robot {}: '{}'. Halting replans for current session.",
+                msg.error.code,
+                robot_id,
+                msg.error.message
+            );
+            self.pending_replans.remove(robot_id);
+            self.active_destinations.remove(robot_id);
         }
     }
 
@@ -298,11 +349,9 @@ impl<P: MapfPlanner> PlanServer<P> {
         // If there is no actionable (non-committed) robot in pending_replans,
         // wait until either a non-committed robot requests a replan or a committed
         // robot finishes its action.
-        if !self
-            .pending_replans
-            .iter()
-            .any(|robot_id| !self.is_executing_action(robot_id))
-        {
+        if !self.pending_replans.iter().any(|robot_id| {
+            !self.is_executing_action(robot_id) && !self.has_failed_action(robot_id)
+        }) {
             return None;
         }
 
@@ -315,10 +364,10 @@ impl<P: MapfPlanner> PlanServer<P> {
             // Make sure we have the latest progress for all robots.
             // Give up if progress for some robots is stale.
             if let Some(progress) = self.latest_progress.get(robot_id) {
-                if self.is_executing_action(robot_id) {
+                if self.is_executing_action(robot_id) || self.has_failed_action(robot_id) {
                     rclrs::log!(
                         self.node.logger(),
-                        "Robot {} is executing an action; excluding it from replanning and marking its occupied path",
+                        "Robot {} is executing or halted on an action; excluding it from replanning and marking its occupied path",
                         robot_id
                     );
                     committed_robots.push(robot_id.clone());
@@ -499,6 +548,7 @@ impl<P: MapfPlanner> PlanServer<P> {
 pub struct RobotPathConnections<P: MapfPlanner> {
     pub _destination_subscription: rclrs::WorkerSubscription<Destination, PlanServer<P>>,
     pub _progress_subscription: rclrs::WorkerSubscription<Progress, PlanServer<P>>,
+    pub _action_progress_subscription: rclrs::WorkerSubscription<ActionProgress, PlanServer<P>>,
     pub _plan_error_subscription: rclrs::WorkerSubscription<PlanError, PlanServer<P>>,
 }
 
@@ -657,11 +707,36 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
                     }
                 };
 
+                let robot_id_clone4 = robot_id.to_string();
+                let action_progress_topic = robot_id.to_string() + "/plan/action/progress";
+                let action_progress_sub = match server
+                    .destinations_worker
+                    .create_subscription::<ActionProgress, _>(
+                        action_progress_topic.as_str().transient_local().reliable(),
+                        move |dest_server: &mut PlanServer<P>,
+                              action_progress_msg: ActionProgress| {
+                            dest_server
+                                .handle_action_progress(&robot_id_clone4, action_progress_msg);
+                        },
+                    ) {
+                    Ok(sub) => sub,
+                    Err(err) => {
+                        rclrs::log_error!(
+                            server.node.logger(),
+                            "Failed to create action progress subscription on DestinationsWorker for {}: {:?}",
+                            robot_id,
+                            err
+                        );
+                        return;
+                    }
+                };
+
                 server.active_robots.insert(
                     robot_id.to_string(),
                     RobotPathConnections {
                         _destination_subscription: destination_sub,
                         _progress_subscription: progress_sub,
+                        _action_progress_subscription: action_progress_sub,
                         _plan_error_subscription: plan_error_sub,
                     },
                 );

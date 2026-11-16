@@ -16,12 +16,13 @@ use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use rmf_plan_executor::{PlanExecutorConfig, PlanExecutorRosNode};
 use ros_env::geometry_msgs::msg::Pose;
 use ros_env::nav_msgs::msg::OccupancyGrid;
-use ros_env::rmf_prototype_msgs::msg::{ParticipantList, Plan, Progress};
+use ros_env::rmf_prototype_msgs::msg::{ActionProgress, ParticipantList, Plan, Progress};
 use std::collections::HashMap;
 use std::env;
 
 struct RobotConnections {
     _progress_subscription: rclrs::WorkerSubscription<Progress, PlanExecutorRosNode>,
+    _action_progress_subscription: rclrs::WorkerSubscription<ActionProgress, PlanExecutorRosNode>,
     _plan_subscription: rclrs::WorkerSubscription<Plan, PlanExecutorRosNode>,
 }
 
@@ -240,7 +241,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let robot_id_clone = robot_id.to_string();
                 let robot_id_clone2 = robot_id.to_string();
+                let robot_id_clone3 = robot_id.to_string();
                 let progress_topic = robot_id.to_string() + "/plan/progress";
+                let action_progress_topic = robot_id.to_string() + "/plan/action/progress";
                 let plan_topic = robot_id.to_string() + "/plan";
 
                 let progress_sub = match server.executor_worker.create_subscription::<Progress, _>(
@@ -254,6 +257,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rclrs::log_error!(
                             server.node.logger(),
                             "Failed to create progress subscription on executor_worker for {}: {:?}",
+                            robot_id,
+                            err
+                        );
+                        return;
+                    }
+                };
+
+                let action_progress_sub = match server
+                    .executor_worker
+                    .create_subscription::<ActionProgress, _>(
+                        action_progress_topic.as_str().transient_local().reliable(),
+                        move |executor: &mut PlanExecutorRosNode, msg: ActionProgress| {
+                            executor.handle_action_progress(&robot_id_clone3, msg);
+                        },
+                    ) {
+                    Ok(sub) => sub,
+                    Err(err) => {
+                        rclrs::log_error!(
+                            server.node.logger(),
+                            "Failed to create action progress subscription on executor_worker for {}: {:?}",
                             robot_id,
                             err
                         );
@@ -283,6 +306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     robot_id.to_string(),
                     RobotConnections {
                         _progress_subscription: progress_sub,
+                        _action_progress_subscription: action_progress_sub,
                         _plan_subscription: plan_sub,
                     },
                 );

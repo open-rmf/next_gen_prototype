@@ -93,6 +93,14 @@ def generate_launch_description():
         output='both'
     )
 
+    # 5. Start the process executor
+    process_executor = Node(
+        package='rmf_process_executor',
+        executable='rmf_process_executor',
+        name='rmf_process_executor',
+        output='both'
+    )
+
     return LaunchDescription([
         declare_destination_server,
         declare_config_file,
@@ -100,5 +108,6 @@ def generate_launch_description():
         robot_spawner,
         simple_destination_server,
         reservation_destination_server,
-        plan_executor
+        plan_executor,
+        process_executor
     ])

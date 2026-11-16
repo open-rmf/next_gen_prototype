@@ -55,6 +55,7 @@ fn parking_constraints(spot: &ParkingSpot) -> DomainDestinationConstraints {
             orientations: Vec::new(),
         }],
         nodes: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -341,6 +342,7 @@ mod tests {
                     orientations: Vec::new(),
                 }],
                 nodes: Vec::new(),
+                ..Default::default()
             }],
             cost_bias: vec![],
             session: SessionUUID {
