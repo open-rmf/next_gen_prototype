@@ -240,6 +240,45 @@ body {
   border: 1px solid rgba(0, 255, 135, 0.2);
 }
 
+.action-inputs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.65rem 0.85rem;
+  background-color: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+}
+
+.action-input-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.action-input-row label {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.action-input-row input {
+  width: 120px;
+  padding: 0.3rem 0.5rem;
+  background-color: rgba(9, 10, 15, 0.8);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+}
+
+.action-input-row input:focus {
+  outline: none;
+  border-color: var(--primary-neon);
+}
+
 /* Buttons */
 .action-buttons {
   display: flex;
@@ -403,6 +442,32 @@ body {
 
 .robot-item-status.unreachable {
   color: var(--danger-neon);
+}
+
+.robot-item-status.action-running {
+  color: #ffea00;
+  animation: pulse 0.8s infinite alternate;
+}
+
+.robot-item-action {
+  margin-top: 0.45rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  color: #ffea00;
+  background-color: rgba(255, 234, 0, 0.08);
+  border: 1px solid rgba(255, 234, 0, 0.28);
+  border-radius: 8px;
+  padding: 0.35rem 0.6rem;
+  line-height: 1.3;
+}
+
+.robot-item-action.done {
+  color: var(--success-neon);
+  background-color: rgba(0, 255, 135, 0.06);
+  border-color: rgba(0, 255, 135, 0.22);
 }
 
 .robot-item-error {

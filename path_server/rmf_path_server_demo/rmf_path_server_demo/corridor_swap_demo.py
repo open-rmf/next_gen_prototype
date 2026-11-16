@@ -24,6 +24,8 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rmf_prototype_msgs.msg import (
+    Action,
+    ActionProgress,
     DestinationConstraints,
     DestinationGoal,
     GraphElementKey,
@@ -43,8 +45,10 @@ def make_destination_goal(
     yaw: float,
     seed: int,
     node_name: str | None = None,
+    arrival_action: str = '',
+    departure_action: str = '',
 ):
-    """Build a DestinationGoal message for a point target (and optional TargetNode)."""
+    """Build a DestinationGoal message for a point target (and optional TargetNode/actions)."""
     goal = DestinationGoal()
     constraints = DestinationConstraints()
     target_region = TargetRegion()
@@ -60,6 +64,8 @@ def make_destination_goal(
         target_node.key = GraphElementKey(name=[str(node_name)])
         target_node.orientations = [orientation]
         constraints.nodes = [target_node]
+    constraints.arrival_action = str(arrival_action or '')
+    constraints.departure_action = str(departure_action or '')
     goal.one_of = [constraints]
     uuid_bytes = [0] * 16
     uuid_bytes[0] = seed & 0xFF
@@ -99,6 +105,8 @@ class CorridorSwapDemo(Node):
         self.map_ready = False
         self.status = {}
         self.safe_zones = {}
+        self.action_progress = {}
+        self.completed_round_actions = set()
         self.nav2_active = set()
         self.nav2_state_futures = {}
 
@@ -142,6 +150,22 @@ class CorridorSwapDemo(Node):
                     qos,
                 )
             )
+            self._robot_subs.append(
+                self.create_subscription(
+                    Action,
+                    f'/{robot_name}/plan/action',
+                    lambda msg, r=robot_name: self._on_action(r, msg),
+                    qos,
+                )
+            )
+            self._robot_subs.append(
+                self.create_subscription(
+                    ActionProgress,
+                    f'/{robot_name}/plan/action/progress',
+                    lambda msg, r=robot_name: self._on_action_progress(r, msg),
+                    qos,
+                )
+            )
 
         self.timer = self.create_timer(0.25, self._tick)
         self.get_logger().info(
@@ -157,6 +181,50 @@ class CorridorSwapDemo(Node):
 
     def _on_safe_zone(self, robot_name: str, msg: SafeZone):
         self.safe_zones[robot_name] = msg
+
+    def _on_action(self, robot_name: str, msg: Action):
+        phase_str = (
+            'ARRIVAL'
+            if msg.phase == Action.PHASE_ARRIVAL
+            else 'DEPARTURE'
+        )
+        self.get_logger().info(
+            f'[ACTION] {robot_name} wp={msg.waypoint_id} '
+            f'phase={phase_str} action="{msg.action}"'
+        )
+
+    def _on_action_progress(self, robot_name: str, msg: ActionProgress):
+        self.action_progress[robot_name] = msg
+        if msg.status == ActionProgress.STATUS_SUCCEEDED:
+            self.completed_round_actions.add((robot_name, msg.phase))
+        phase_str = (
+            'ARRIVAL'
+            if msg.phase == Action.PHASE_ARRIVAL
+            else 'DEPARTURE'
+        )
+        status_map = {
+            ActionProgress.STATUS_RUNNING: 'RUNNING',
+            ActionProgress.STATUS_SUCCEEDED: 'SUCCEEDED',
+            ActionProgress.STATUS_FAILED: 'FAILED',
+        }
+        status_str = status_map.get(msg.status, f'UNKNOWN({msg.status})')
+        self.get_logger().info(
+            f'[ACTION_PROGRESS] {robot_name} wp={msg.waypoint_id} '
+            f'phase={phase_str} status={status_str} err="{msg.error}"'
+        )
+        if (
+            self.scenario == 'action_pass'
+            and self.state == 'waiting_for_action_running'
+            and robot_name == 'robot0'
+            and msg.status == ActionProgress.STATUS_RUNNING
+        ):
+            r1_target = self.active_targets.get('robot1', (3.0, 1.0, 0.0))
+            self.get_logger().info(
+                'robot0 process action is RUNNING (replan blocked on robot0); '
+                f'dispatching robot1 to pass -> ({r1_target[0]:.1f}, {r1_target[1]:.1f})'
+            )
+            self._publish_goal_for('robot1')
+            self.state = 'running_swap'
 
     def _robot_yaw(self, robot_name: str) -> float:
         q = self.status[robot_name].pose.pose.orientation
@@ -190,6 +258,40 @@ class CorridorSwapDemo(Node):
             return {
                 'robot0': (-1.0, 1.0, -math.pi / 2.0),
                 'robot1': (1.0, 1.0, 0.0),
+            }
+
+        if self.scenario == 'action_pass':
+            if self.swap_round % 2 == 0:
+                return {
+                    'robot0': (
+                        0.0,
+                        1.0,
+                        0.0,
+                        None,
+                        'conveyor:conveyor_r1_c1',
+                        'wait:2.0',
+                    ),
+                    'robot1': (3.0, 1.0, 0.0),
+                }
+            conveyor_diagram_json = (
+                '{"version":"0.1.0","start":"activate_conveyor","ops":{'
+                '"activate_conveyor":{"type":"node","builder":"conveyor",'
+                '"config":{"conveyor":"conveyor_r1_c1","speed":0.4,"duration_sec":3.0},'
+                '"next":"settle_wait"},'
+                '"settle_wait":{"type":"node","builder":"wait",'
+                '"config":{"duration_sec":1.0},'
+                '"next":{"builtin":"terminate"}}}}'
+            )
+            return {
+                'robot0': (
+                    1.0,
+                    1.0,
+                    0.0,
+                    None,
+                    conveyor_diagram_json,
+                    'wait:2.0',
+                ),
+                'robot1': (-2.0, 1.0, 0.0),
             }
 
         if self.swap_round % 2 == 0:
@@ -244,14 +346,23 @@ class CorridorSwapDemo(Node):
         target = self.active_targets[robot_name]
         gx, gy, gyaw = target[0], target[1], target[2]
         node_name = target[3] if len(target) >= 4 else None
+        arrival_action = target[4] if len(target) >= 5 else ''
+        departure_action = target[5] if len(target) >= 6 else ''
         self.seed_counter += 1
         goal = make_destination_goal(
-            gx, gy, gyaw, self.seed_counter, node_name=node_name
+            gx,
+            gy,
+            gyaw,
+            self.seed_counter,
+            node_name=node_name,
+            arrival_action=arrival_action,
+            departure_action=departure_action,
         )
         self.goal_pubs[robot_name].publish(goal)
         self.get_logger().info(
             f'Published DestinationGoal for {robot_name} -> '
-            f'({gx:.1f}, {gy:.1f}, yaw={gyaw:.2f}, node={node_name})'
+            f'({gx:.1f}, {gy:.1f}, yaw={gyaw:.2f}, node={node_name}, '
+            f'arrival="{arrival_action}", departure="{departure_action}")'
         )
 
     def _log_progress(self, now: float, d0: float, d1: float):
@@ -297,6 +408,14 @@ class CorridorSwapDemo(Node):
                         f'dispatching {self.scenario} scenario in 2.0s'
                     )
                 elif now - self.ready_since >= 2.0:
+                    if (
+                        self.scenario == 'action_pass'
+                        and self.swap_round == 0
+                        and abs(self.status['robot0'].pose.pose.position.x - 0.0) < 0.35
+                    ):
+                        self.swap_round = 1
+                    self.action_progress.clear()
+                    self.completed_round_actions.clear()
                     self.active_targets = self._initial_targets()
                     self.retargeted = False
                     self.round_started_at = now
@@ -312,6 +431,8 @@ class CorridorSwapDemo(Node):
                             # Undock robot0 straight South to (-1, 1, -pi/2) before
                             # resetting to (0, 1, 0) and (-2, 1, 0).
                             self.state = 'waiting_for_undock'
+                    elif self.scenario == 'action_pass':
+                        self.state = 'waiting_for_action_running'
                     elif self.second_robot_delay_sec > 0.0:
                         self.second_goal_due = (
                             now + self.second_robot_delay_sec
@@ -384,6 +505,20 @@ class CorridorSwapDemo(Node):
                 self.state = 'running_swap'
             return
 
+        if self.state == 'waiting_for_action_running':
+            p0 = self.status['robot0'].pose.pose.position
+            p1 = self.status['robot1'].pose.pose.position
+            d0 = math.hypot(
+                p0.x - self.active_targets['robot0'][0],
+                p0.y - self.active_targets['robot0'][1],
+            )
+            d1 = math.hypot(
+                p1.x - self.active_targets['robot1'][0],
+                p1.y - self.active_targets['robot1'][1],
+            )
+            self._log_progress(now, d0, d1)
+            return
+
         if self.state in ('running_swap', 'running_post_swap'):
             p0 = self.status['robot0'].pose.pose.position
             p1 = self.status['robot1'].pose.pose.position
@@ -412,7 +547,25 @@ class CorridorSwapDemo(Node):
             )
             self._log_progress(now, d0, d1)
 
-            if d0 < self.goal_tolerance and d1 < self.goal_tolerance:
+            actions_still_running = any(
+                ap.status == ActionProgress.STATUS_RUNNING
+                for ap in self.action_progress.values()
+            )
+            all_expected_actions_done = True
+            for r_name, target in self.active_targets.items():
+                arr_act = target[4] if len(target) >= 5 else ''
+                dep_act = target[5] if len(target) >= 6 else ''
+                if arr_act and (r_name, Action.PHASE_ARRIVAL) not in self.completed_round_actions:
+                    all_expected_actions_done = False
+                if dep_act and (r_name, Action.PHASE_DEPARTURE) not in self.completed_round_actions:
+                    all_expected_actions_done = False
+
+            if (
+                d0 < self.goal_tolerance
+                and d1 < self.goal_tolerance
+                and not actions_still_running
+                and all_expected_actions_done
+            ):
                 elapsed = now - self.round_started_at
                 if (
                     self.scenario == 'swap_then_new_goals'

@@ -30,6 +30,7 @@ let interactionMode = 'normal'; // 'normal', 'add-robot', 'set-goal'
 let systemMode = 'setup'; // 'setup', 'live'
 let pendingGoalReset = false;
 let pendingPassTrigger = false;
+let pendingActionPassTrigger = false;
 let eventSource = null;
 let mouseX = 0;
 let mouseY = 0;
@@ -109,7 +110,8 @@ function initSSE() {
           r.current_y = msg.y;
 
           // Update status based on destination progress
-          if (r.goal_x !== null && r.goal_y !== null) {
+          const isActionRunning = r.active_action && r.active_action.status === 1;
+          if (!isActionRunning && r.goal_x !== null && r.goal_y !== null) {
             const dist = Math.hypot(r.current_x - r.goal_x, r.current_y - r.goal_y);
             if (dist < 0.2) {
               r.status = 'Reached';
@@ -149,6 +151,60 @@ function initSSE() {
         const r = robots.find(robot => robot.name === msg.name);
         if (r) {
           r.progress = msg.progress;
+        }
+      } else if (msg.type === 'action') {
+        const r = robots.find(robot => robot.name === msg.name);
+        if (r) {
+          r.active_action = {
+            ...(r.active_action || {}),
+            plan_version: msg.plan_version,
+            waypoint_id: msg.waypoint_id,
+            phase: msg.phase,
+            action: msg.action,
+          };
+          updateRobotListUI();
+        }
+      } else if (msg.type === 'action_progress') {
+        const r = robots.find(robot => robot.name === msg.name);
+        if (r) {
+          const prevAction = (r.active_action && r.active_action.action) || '';
+          r.active_action = {
+            plan_version: msg.plan_version,
+            waypoint_id: msg.waypoint_id,
+            phase: msg.phase,
+            status: msg.status,
+            error: msg.error,
+            action: prevAction,
+          };
+          const phaseLabel = msg.phase === 1 ? 'Arr' : 'Dep';
+          if (msg.status === 1) {
+            r.status = `Action (${phaseLabel})`;
+            if (pendingActionPassTrigger && msg.name === 'robot_1') {
+              pendingActionPassTrigger = false;
+              const r2 = robots.find(bot => bot.name === 'robot_2');
+              if (r2) {
+                r2.goal_x = 3;
+                r2.goal_y = 0;
+                r2.goals = [{ x: 3, y: 0 }];
+                r2.arrival_action = '';
+                r2.departure_action = '';
+                r2.status = 'Planning';
+                sendGoalRequest(r2);
+                showInstruction(
+                  `robot_1 executing ${phaseLabel} action (${prevAction || 'wait'}) at (1, 0) [replan blocked!] — dispatched robot_2 to (3, 0) around robot_1!`
+                );
+              }
+            }
+          } else if (msg.status === 2) {
+            if (r.goal_x !== null && r.goal_y !== null) {
+              const dist = Math.hypot(r.current_x - r.goal_x, r.current_y - r.goal_y);
+              r.status = dist < 0.2 ? 'Reached' : 'Moving';
+            }
+          } else if (msg.status === 3) {
+            r.status = 'Action Failed';
+            r.errorMessage = msg.error || 'Process action failed';
+          }
+          updateRobotListUI();
         }
       } else if (msg.type === 'active_destination') {
         const r = robots.find(robot => robot.name === msg.name);
@@ -315,6 +371,18 @@ function sendGoalRequest(robot) {
   } else {
     url = `/destination?name=${robot.name}&x=${robot.goal_x}&y=${robot.goal_y}`;
   }
+  const arrAct = robot.arrival_action !== undefined
+    ? robot.arrival_action
+    : (document.getElementById('input-arrival-action')?.value || '').trim();
+  const depAct = robot.departure_action !== undefined
+    ? robot.departure_action
+    : (document.getElementById('input-departure-action')?.value || '').trim();
+  if (arrAct) {
+    url += `&arrival_action=${encodeURIComponent(arrAct)}`;
+  }
+  if (depAct) {
+    url += `&departure_action=${encodeURIComponent(depAct)}`;
+  }
   return fetch(url)
     .then(res => res.json())
     .then(data => {
@@ -359,9 +427,21 @@ function updateRobotListUI() {
     }
     
     let statusClass = '';
-    if (r.status === 'Moving') statusClass = 'moving';
+    if (r.status && r.status.startsWith('Action (')) statusClass = 'action-running';
+    else if (r.status === 'Moving') statusClass = 'moving';
     else if (r.status === 'Reached') statusClass = 'reached';
-    else if (r.status === 'Unreachable') statusClass = 'unreachable';
+    else if (r.status === 'Unreachable' || r.status === 'Action Failed') statusClass = 'unreachable';
+
+    let actionRow = '';
+    if (r.active_action && r.active_action.status) {
+      const phaseName = r.active_action.phase === 1 ? 'ARRIVAL' : 'DEPARTURE';
+      const spec = r.active_action.action || 'action';
+      if (r.active_action.status === 1) {
+        actionRow = `<div class="robot-item-action"><i class="fa-solid fa-gears"></i> ${phaseName}: ${spec} [RUNNING]</div>`;
+      } else if (r.active_action.status === 2) {
+        actionRow = `<div class="robot-item-action done"><i class="fa-solid fa-check"></i> ${phaseName}: ${spec} [DONE]</div>`;
+      }
+    }
 
     const errorRow = r.errorMessage
       ? `<div class="robot-item-error"><i class="fa-solid fa-triangle-exclamation"></i> ${r.errorMessage}</div>`
@@ -381,6 +461,7 @@ function updateRobotListUI() {
           <span><span class="coord-label">Goal:</span> ${goalStr}</span>
           <span><span class="coord-label">Plan:</span> ${r.plan_version !== undefined ? `v${r.plan_version}` : '--'}${(r.plan_count || 0) > 1 ? ` (${r.plan_count}x)` : ''}</span>
         </div>
+        ${actionRow}
         ${errorRow}
       </div>
     `;
@@ -607,6 +688,7 @@ function resetScenarioUI() {
   systemMode = 'setup';
   pendingGoalReset = false;
   pendingPassTrigger = false;
+  pendingActionPassTrigger = false;
   showInstruction(null);
   document.getElementById('mode-badge').textContent = 'Setup Mode';
   document.getElementById('mode-badge').classList.remove('live');
@@ -682,6 +764,75 @@ document.getElementById('btn-preset-dock-pass')?.addEventListener('click', async
   document.getElementById('btn-send').disabled = true;
   showInstruction(
     'Preset running: robot_1 docking into dock_north_1 (-1, 2) with delay; robot_2 will request to pass to (1, 1) mid-docking.'
+  );
+  updateRobotListUI();
+
+  await sendSpawnRequest(r1);
+  await sendSpawnRequest(r2);
+  await sendGoalRequest(r1);
+  await sendGoalRequest(r2);
+  await fetch('/send_scenario');
+});
+
+document.getElementById('btn-preset-action-pass')?.addEventListener('click', async () => {
+  if (!isConnected) {
+    alert('Not connected to backend server yet.');
+    return;
+  }
+
+  await fetch('/reset').catch(() => {});
+  resetScenarioUI();
+
+  // robot_1 moves from (-1, 0) to (1, 0) and executes arrival_action=wait:5000 & departure_action=wait:1500
+  const r1 = {
+    idNum: 1,
+    name: 'robot_1',
+    color: robotColors[0],
+    start_x: -1,
+    start_y: 0,
+    current_x: -1,
+    current_y: 0,
+    goal_x: 1,
+    goal_y: 0,
+    goals: [{ x: 1, y: 0 }],
+    arrival_action: 'wait:5000',
+    departure_action: 'wait:1500',
+    status: 'Planning',
+    waypoints: [],
+    progress: 0.0,
+    radius: 0.49
+  };
+
+  // robot_2 starts at (-2, 0) holding initially; once robot_1 starts STATUS_RUNNING at (1, 0),
+  // robot_2 is sent to (3, 0) so rmf_path_server routes robot_2 around robot_1 without replanning robot_1!
+  const r2 = {
+    idNum: 2,
+    name: 'robot_2',
+    color: robotColors[1],
+    start_x: -2,
+    start_y: 0,
+    current_x: -2,
+    current_y: 0,
+    goal_x: -2,
+    goal_y: 0,
+    goals: [{ x: -2, y: 0 }],
+    arrival_action: '',
+    departure_action: '',
+    status: 'Planning',
+    waypoints: [],
+    progress: 0.0,
+    radius: 0.49
+  };
+
+  robots.push(r1, r2);
+  pendingActionPassTrigger = true;
+  systemMode = 'live';
+  document.getElementById('mode-badge').textContent = 'Live Mode';
+  document.getElementById('mode-badge').classList.add('live');
+  document.getElementById('btn-add-robot').disabled = true;
+  document.getElementById('btn-send').disabled = true;
+  showInstruction(
+    'Preset running: robot_1 heading to (1, 0) with arrival_action=wait:5000 & departure_action=wait:1500; robot_2 will pass to (3, 0) while robot_1 action is RUNNING.'
   );
   updateRobotListUI();
 
@@ -1079,6 +1230,13 @@ function drawGrid() {
         ctx.beginPath();
         ctx.arc(wpPix.x, wpPix.y, 4, 0, 2 * Math.PI);
         ctx.fill();
+        if (wp.arrival_action || wp.departure_action) {
+          ctx.strokeStyle = '#ffea00';
+          ctx.lineWidth = 1.8;
+          ctx.beginPath();
+          ctx.arc(wpPix.x, wpPix.y, 7, 0, 2 * Math.PI);
+          ctx.stroke();
+        }
         ctx.restore();
 
         // 4c. Draw departure dependencies for this waypoint
@@ -1281,6 +1439,42 @@ function drawGrid() {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'bottom';
     ctx.fillText(`R_${r.idNum}`, pix.x, pix.y - 12);
+
+    // Draw live action execution halo + floating badge if STATUS_RUNNING
+    if (r.active_action && r.active_action.status === 1) {
+      ctx.save();
+      ctx.strokeStyle = '#ffea00';
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash([5, 3]);
+      ctx.lineDashOffset = -Date.now() / 40 % 100;
+      ctx.beginPath();
+      ctx.arc(pix.x, pix.y, footprintRadius + 5, 0, 2 * Math.PI);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      const phaseStr = r.active_action.phase === 1 ? 'ARR' : 'DEP';
+      const actLabel = `⚡ ${phaseStr}: ${r.active_action.action || 'action'}`;
+      ctx.font = '600 10px JetBrains Mono';
+      const tw = ctx.measureText(actLabel).width;
+      const bw = tw + 12;
+      const bh = 18;
+      const bx = pix.x - bw / 2;
+      const by = pix.y + footprintRadius + 6;
+
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.92)';
+      ctx.strokeStyle = '#ffea00';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.roundRect(bx, by, bw, bh, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = '#ffea00';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(actLabel, pix.x, by + bh / 2);
+      ctx.restore();
+    }
   });
 
   // 7. Draw hover tooltip when hovering over a robot

@@ -43,13 +43,28 @@ pub struct KnownDock {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct KnownLocation {
+    pub id: String,
+    pub location_key: Option<i64>,
+    pub anchor_key: Option<i64>,
+    pub x: f32,
+    pub y: f32,
+    pub arrival_action: String,
+    pub departure_action: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DockRegistry {
     pub docks: Vec<KnownDock>,
+    pub locations: Vec<KnownLocation>,
 }
 
 impl DockRegistry {
     pub fn new(docks: Vec<KnownDock>) -> Self {
-        Self { docks }
+        Self {
+            docks,
+            locations: Vec::new(),
+        }
     }
 
     pub fn from_site_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
@@ -112,6 +127,17 @@ impl DockRegistry {
 
         let mut neighbors: HashMap<String, Vec<(f32, f32)>> = HashMap::new();
         let mut docks: Vec<KnownDock> = Vec::new();
+        let mut parsed_locations: Vec<KnownLocation> = Vec::new();
+
+        let extract_action_str = |val: &serde_json::Value| -> String {
+            if let Some(s) = val.as_str() {
+                s.to_string()
+            } else if val.is_object() {
+                serde_json::to_string(val).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        };
 
         let guided = root.get("navigation").and_then(|n| n.get("guided"));
         if let Some(lanes) = guided
@@ -165,6 +191,25 @@ impl DockRegistry {
                     .unwrap_or(&default_name)
                     .to_string();
 
+                let arrival_action = loc_data
+                    .get("arrival_action")
+                    .map(&extract_action_str)
+                    .unwrap_or_default();
+                let departure_action = loc_data
+                    .get("departure_action")
+                    .map(&extract_action_str)
+                    .unwrap_or_default();
+
+                parsed_locations.push(KnownLocation {
+                    id: name.clone(),
+                    location_key: loc_id.parse::<i64>().ok(),
+                    anchor_key: anchor_id.parse::<i64>().ok(),
+                    x,
+                    y,
+                    arrival_action,
+                    departure_action,
+                });
+
                 let mut is_parking_spot = false;
                 if let Some(tags) = loc_data.get("tags").and_then(|v| v.as_array()) {
                     for tag in tags {
@@ -206,7 +251,10 @@ impl DockRegistry {
             }
         }
 
-        Ok(Self { docks })
+        Ok(Self {
+            docks,
+            locations: parsed_locations,
+        })
     }
 
     pub fn match_by_id(&self, id: &str) -> Option<KnownDock> {
@@ -248,6 +296,53 @@ impl DockRegistry {
         self.docks
             .iter()
             .find(|d| (d.x - x).hypot(d.y - y) <= tolerance)
+            .cloned()
+    }
+
+    pub fn match_location_by_id(&self, id: &str) -> Option<KnownLocation> {
+        self.locations
+            .iter()
+            .find(|l| l.id.eq_ignore_ascii_case(id))
+            .cloned()
+    }
+
+    pub fn match_location_by_node(&self, node: &TargetNode) -> Option<KnownLocation> {
+        if let Some(name_seq) = node.key.name.first() {
+            let name_str = name_seq.to_string();
+            if let Some(loc) = self.match_location_by_id(&name_str) {
+                return Some(loc);
+            }
+        }
+        if let Some(&key_id) = node.key.key.first() {
+            if let Some(loc) = self
+                .locations
+                .iter()
+                .find(|l| l.location_key == Some(key_id) || l.anchor_key == Some(key_id))
+            {
+                return Some(loc.clone());
+            }
+        }
+        None
+    }
+
+    pub fn match_location_by_nodes(&self, nodes: &[TargetNode]) -> Option<KnownLocation> {
+        for node in nodes {
+            if let Some(loc) = self.match_location_by_node(node) {
+                return Some(loc);
+            }
+        }
+        None
+    }
+
+    pub fn match_location_by_position(
+        &self,
+        x: f32,
+        y: f32,
+        tolerance: f32,
+    ) -> Option<KnownLocation> {
+        self.locations
+            .iter()
+            .find(|l| (l.x - x).hypot(l.y - y) <= tolerance)
             .cloned()
     }
 }
@@ -348,20 +443,17 @@ impl PlanRegistry {
         self.active_plans.remove(robot_id);
     }
 
-    /// Returns true if `robot_id` is currently executing an action according to
-    /// `progress` and its active plan.
+    /// Returns true if `robot_id` is currently executing a fleet-level action (such as
+    /// docking or undocking) according to `progress` and its active plan.
     pub fn is_executing_action(&self, robot_id: &str, progress: &Progress) -> bool {
         if progress.mode == Progress::MODE_ACTION {
             return true;
         }
         if let Some(plan) = self.get_plan(robot_id) {
-            let wp_has_dock_or_action = |wp: &Waypoint| -> bool {
-                !wp.arrival_action.is_empty()
-                    || !wp.departure_action.is_empty()
-                    || self
-                        .dock_registry
-                        .match_target_nodes(&wp.arrival_constraints.nodes)
-                        .is_some()
+            let wp_has_dock = |wp: &Waypoint| -> bool {
+                self.dock_registry
+                    .match_target_nodes(&wp.arrival_constraints.nodes)
+                    .is_some()
             };
             let wp0_is_undock = plan.waypoints.len() >= 2 && {
                 let start_pos = plan.waypoints[0].position;
@@ -379,32 +471,20 @@ impl PlanRegistry {
 
             if progress.mode != Progress::MODE_IDLE {
                 if let Some(wp) = plan.waypoints.get(progress.target_waypoint as usize) {
-                    if wp_has_dock_or_action(wp) {
+                    if wp_has_dock(wp) {
                         return true;
                     }
                 }
                 if progress.reached_waypoint == 0 && wp0_is_undock {
                     return true;
                 }
-                if let Some(wp) = plan.waypoints.get(progress.reached_waypoint as usize) {
-                    if !wp.departure_action.is_empty() {
-                        return true;
-                    }
-                }
             } else if progress.plan_id != plan.plan_id {
                 // Before the robot has reported Progress for the newly generated plan,
                 // block replans if the very first transition (wp 0 -> wp 1) is a dock/undock action.
-                if wp0_is_undock
-                    || plan
-                        .waypoints
-                        .first()
-                        .is_some_and(|wp0| !wp0.departure_action.is_empty())
-                {
+                if wp0_is_undock {
                     return true;
                 }
-                if plan.waypoints.len() == 2
-                    && plan.waypoints.get(1).is_some_and(wp_has_dock_or_action)
-                {
+                if plan.waypoints.len() == 2 && plan.waypoints.get(1).is_some_and(wp_has_dock) {
                     return true;
                 }
             }
@@ -712,6 +792,7 @@ impl PlanRegistry {
                             }],
                         }],
                         nodes: Vec::new(),
+                        ..Default::default()
                     },
                     progress: i as f32 * timestep,
                     maps: Vec::new(),
@@ -793,6 +874,33 @@ impl PlanRegistry {
                                 spread_radians: 0.0,
                                 tolerance_radians: std::f32::consts::PI,
                             });
+                        }
+                    }
+
+                    let matched_loc = self
+                        .dock_registry
+                        .match_location_by_nodes(&dest.constraints.nodes)
+                        .or_else(|| {
+                            self.dock_registry.match_location_by_position(
+                                last_wp.position[0],
+                                last_wp.position[1],
+                                0.35,
+                            )
+                        });
+
+                    if !dest.constraints.arrival_action.is_empty() {
+                        last_wp.arrival_action = dest.constraints.arrival_action.clone();
+                    } else if let Some(loc) = &matched_loc {
+                        if !loc.arrival_action.is_empty() {
+                            last_wp.arrival_action = loc.arrival_action.clone();
+                        }
+                    }
+
+                    if !dest.constraints.departure_action.is_empty() {
+                        last_wp.departure_action = dest.constraints.departure_action.clone();
+                    } else if let Some(loc) = &matched_loc {
+                        if !loc.departure_action.is_empty() {
+                            last_wp.departure_action = loc.departure_action.clone();
                         }
                     }
                 }
@@ -1033,6 +1141,7 @@ mod tests {
                 }],
             }],
             nodes: Vec::new(),
+            ..Default::default()
         };
 
         let mut goals = HashMap::new();
@@ -1160,5 +1269,65 @@ mod tests {
         progress.reached_waypoint = 1;
         progress.target_waypoint = 2;
         assert!(!registry.is_executing_action("robot_1", &progress));
+    }
+
+    #[test]
+    fn test_build_session_plans_populates_actions_from_site_and_constraints() {
+        let site_json = r#"{
+            "levels": {
+                "L1": {
+                    "anchors": {
+                        "1": [-1.0, 1.0],
+                        "2": [-1.0, 2.0]
+                    }
+                }
+            },
+            "navigation": {
+                "guided": {
+                    "lanes": {
+                        "10": { "left": 1, "right": 2 }
+                    },
+                    "locations": {
+                        "20": {
+                            "anchor": 2,
+                            "name": "dock_north_1",
+                            "tags": ["Dock"],
+                            "arrival_action": "wait:2500",
+                            "departure_action": "noop"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let dock_registry = DockRegistry::from_site_json_str(site_json).unwrap();
+        let registry = PlanRegistry::with_dock_registry(dock_registry);
+        let mut footprints: HashMap<String, Arc<dyn Shape>> = HashMap::new();
+        footprints.insert("robot_1".to_string(), Arc::new(Ball::new(0.49)));
+
+        // 1. Site location default arrival_action and departure_action
+        let mut dest = make_destination(11);
+        let mut node = TargetNode::default();
+        node.key.name = vec!["dock_north_1".to_string().into()].try_into().unwrap();
+        dest.constraints.nodes.push(node);
+
+        let mut goals = HashMap::new();
+        goals.insert("robot_1".to_string(), dest.clone());
+        let robot_ids = vec!["robot_1".to_string()];
+        let basic_plan = vec![make_poses(&[[-1.0, 0.0], [-1.0, 1.0], [-1.0, 2.0]])];
+
+        let (plans, _, _) =
+            registry.build_session_plans(&basic_plan, &goals, &robot_ids, &footprints, 1.0);
+        let plan = plans.get("robot_1").unwrap();
+        assert_eq!(plan.waypoints[2].arrival_action, "wait:2500");
+        assert_eq!(plan.waypoints[2].departure_action, "noop");
+
+        // 2. DestinationConstraints overrides site location action when specified
+        dest.constraints.arrival_action = "wait:5000".into();
+        goals.insert("robot_1".to_string(), dest);
+        let (plans_override, _, _) =
+            registry.build_session_plans(&basic_plan, &goals, &robot_ids, &footprints, 1.0);
+        let plan_override = plans_override.get("robot_1").unwrap();
+        assert_eq!(plan_override.waypoints[2].arrival_action, "wait:5000");
+        assert_eq!(plan_override.waypoints[2].departure_action, "noop");
     }
 }

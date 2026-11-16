@@ -57,6 +57,10 @@ def generate_launch_description():
         'robot0={x: -1.0, y: 1.0, yaw: 1.5708}; '
         'robot1={x: -2.0, y: 1.0, yaw: 0.0}'
     )
+    default_action_pass_robots = (
+        'robot0={x: -1.0, y: 1.0, yaw: 0.0}; '
+        'robot1={x: -2.0, y: 1.0, yaw: 0.0}'
+    )
     default_dock_rotate_pass_robots = (
         'robot0={x: 0.0, y: 1.0, yaw: 0.0}; '
         'robot1={x: -2.0, y: 1.0, yaw: 0.0}'
@@ -82,9 +86,11 @@ def generate_launch_description():
     default_robots = PythonExpression([
         f'"{default_dock_pass_robots}" if "',
         scenario,
-        f'" == "dock_pass" else ("{default_dock_rotate_pass_robots}" if "',
+        f'" == "dock_pass" else ("{default_action_pass_robots}" if "',
         scenario,
-        f'" == "dock_rotate_pass" else "{default_swap_robots}")',
+        f'" == "action_pass" else ("{default_dock_rotate_pass_robots}" if "',
+        scenario,
+        f'" == "dock_rotate_pass" else "{default_swap_robots}"))',
     ])
 
     rewritten_params = RewrittenYaml(
@@ -102,8 +108,16 @@ def generate_launch_description():
                 'xy_goal_tolerance'
             ): '0.10',
             (
+                'controller_server.ros__parameters.general_goal_checker.'
+                'yaw_goal_tolerance'
+            ): '0.10',
+            (
                 'controller_server.ros__parameters.FollowPath.'
                 'xy_goal_tolerance'
+            ): '0.10',
+            (
+                'controller_server.ros__parameters.FollowPath.'
+                'yaw_goal_tolerance'
             ): '0.10',
             (
                 'global_costmap.global_costmap.ros__parameters.'
@@ -177,13 +191,14 @@ def generate_launch_description():
             default_value='swap',
             description=(
                 'Corridor scenario to execute: '
-                'swap, dock_pass, dock_rotate_pass, swap_then_new_goals, '
-                'mid_swap_retarget, or none.'
+                'swap, dock_pass, dock_rotate_pass, action_pass, '
+                'swap_then_new_goals, mid_swap_retarget, or none.'
             ),
             choices=[
                 'swap',
                 'dock_pass',
                 'dock_rotate_pass',
+                'action_pass',
                 'swap_then_new_goals',
                 'mid_swap_retarget',
                 'none',
@@ -354,6 +369,14 @@ def generate_launch_description():
         }],
     )
 
+    # 6b. Start the example conveyor process executor
+    process_executor = Node(
+        package='rmf_process_executor',
+        executable='conveyor_process_executor',
+        name='rmf_process_executor',
+        output='both',
+    )
+
     # 7. Start nav2_traffic
     nav2_traffic = Node(
         package='rmf_nav2_traffic',
@@ -395,6 +418,7 @@ def generate_launch_description():
         simple_destination_server,
         reservation_destination_server,
         plan_executor,
+        process_executor,
         nav2_traffic,
         corridor_swap_demo,
     ])

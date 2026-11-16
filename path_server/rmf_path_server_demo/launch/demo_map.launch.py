@@ -53,6 +53,14 @@ def generate_launch_description():
         output='both'
     )
 
+    # 3b. Start the process executor
+    process_executor = Node(
+        package='rmf_process_executor',
+        executable='rmf_process_executor',
+        name='rmf_process_executor',
+        output='both'
+    )
+
     # 4. Start the map server
     map_server = Node(
         package='nav2_map_server',
@@ -79,6 +87,7 @@ def generate_launch_description():
         path_server,
         robot_spawner,
         plan_executor,
+        process_executor,
         map_server,
         lifecycle_manager
     ])

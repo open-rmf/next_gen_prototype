@@ -110,10 +110,12 @@ impl DomainTargetRegion {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct DomainDestinationConstraints {
     pub regions: Vec<DomainTargetRegion>,
     pub nodes: Vec<TargetNode>,
+    pub arrival_action: String,
+    pub departure_action: String,
 }
 
 impl DomainDestinationConstraints {
@@ -125,6 +127,8 @@ impl DomainDestinationConstraints {
                 .map(DomainTargetRegion::from_ros)
                 .collect(),
             nodes: ros.nodes.clone(),
+            arrival_action: ros.arrival_action.clone(),
+            departure_action: ros.departure_action.clone(),
         }
     }
 
@@ -132,6 +136,8 @@ impl DomainDestinationConstraints {
         DestinationConstraints {
             regions: self.regions.iter().map(|r| r.to_ros()).collect(),
             nodes: self.nodes.clone(),
+            arrival_action: self.arrival_action.clone(),
+            departure_action: self.departure_action.clone(),
         }
     }
 }
@@ -770,6 +776,7 @@ mod tests {
                     orientations: Vec::new(),
                 }],
                 nodes: Vec::new(),
+                ..Default::default()
             },
             DomainDestinationConstraints {
                 regions: vec![DomainTargetRegion {
@@ -781,6 +788,7 @@ mod tests {
                     orientations: Vec::new(),
                 }],
                 nodes: Vec::new(),
+                ..Default::default()
             },
         ];
 
@@ -844,10 +852,14 @@ mod tests {
                     tolerance_radians: 0.1,
                 }],
             }],
+            arrival_action: "wait:1000".into(),
+            departure_action: "noop".into(),
         };
 
         let domain = DomainDestinationConstraints::from_ros(&ros_constraints);
         let roundtrip = domain.to_ros();
         assert_eq!(roundtrip.nodes, ros_constraints.nodes);
+        assert_eq!(roundtrip.arrival_action, ros_constraints.arrival_action);
+        assert_eq!(roundtrip.departure_action, ros_constraints.departure_action);
     }
 }

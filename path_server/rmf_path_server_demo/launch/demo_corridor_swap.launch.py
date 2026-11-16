@@ -55,11 +55,14 @@ def generate_launch_description():
             default_value='swap',
             description=(
                 'Corridor scenario to execute: '
-                'swap, dock_pass, swap_then_new_goals, or mid_swap_retarget.'
+                'swap, dock_pass, dock_rotate_pass, action_pass, '
+                'swap_then_new_goals, or mid_swap_retarget.'
             ),
             choices=[
                 'swap',
                 'dock_pass',
+                'dock_rotate_pass',
+                'action_pass',
                 'swap_then_new_goals',
                 'mid_swap_retarget',
                 'none',

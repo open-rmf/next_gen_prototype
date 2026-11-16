@@ -84,6 +84,9 @@ ros2 launch rmf_path_server_demo demo_corridor_swap.launch.py
 
 # Or select a specific scenario directly on demo_corridor_nav2.launch.py:
 ros2 launch rmf_path_server_demo demo_corridor_nav2.launch.py scenario:=dock_rotate_pass
+
+# Launch the Process Action + Pass scenario (rmf_process_executor):
+ros2 launch rmf_path_server_demo demo_conveyor_with_action.launch.py
 ```
 
 Available `scenario` values:
@@ -93,6 +96,7 @@ Available `scenario` values:
 - `mid_swap_retarget`: Start a corridor swap and inject a new goal mid-swap redirecting `robot0` to `(3, -1)` once it crosses `x >= 0.0`.
 - `dock_pass`: Spawn `robot0` at `(-1, 1, pi/2)` and `robot1` at `(-2, 1, 0)` and dispatch both up-front so `robot0` docks into `dock_north_1` at `(-1, 2, pi/2)` while `robot1` passes to `(1, 1, 0)`.
 - `dock_rotate_pass`: Spawn `robot0` at `(0, 1, 0)` (facing East, wrong orientation for docking North) and `robot1` at `(-2, 1, 0)`, and dispatch both up-front so `robot0` translates to `(-1, 1, pi/2)`, rotates 90 degrees in place (gating final progress until `pi/2` is achieved), and docks into `(-1, 2, pi/2)` while traffic management routes `robot1` around to `(1, 1, 0)`.
+- `action_pass`: Spawn `robot0` at `(-1, 1, pi/2)` and `robot1` at `(-2, 1, 0)`; dispatch `robot0` to `(0, 1, 0)` with `arrival_action="wait:6000"` and `departure_action="wait:2000"`. Once `rmf_process_executor` reports `ActionProgress::STATUS_RUNNING`, dispatch `robot1` to `(2, 1, 0)` so `rmf_path_server` blocks replanning `robot0` and routes `robot1` around `robot0`.
 
 Additional launch arguments:
 - `loop:=true|false`: Continuously repeat the scenario rounds.

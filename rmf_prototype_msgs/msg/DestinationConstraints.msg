@@ -16,3 +16,9 @@ TargetRegion[] regions
 #
 # This can be used to set the destination to a named location.
 TargetNode[] nodes
+
+# Optional action to be performed upon arrival at this destination.
+string arrival_action
+
+# Optional action to be performed upon departure from this destination.
+string departure_action

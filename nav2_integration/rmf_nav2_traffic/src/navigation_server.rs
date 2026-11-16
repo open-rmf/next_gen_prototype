@@ -395,6 +395,7 @@ fn pose_stamped_to_destination_goal(pose: &PoseStamped, session: RosUuid) -> Des
     let constraints = DestinationConstraints {
         regions: vec![target_region],
         nodes: vec![],
+        ..Default::default()
     };
 
     DestinationGoal {
