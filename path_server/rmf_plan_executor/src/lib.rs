@@ -303,6 +303,7 @@ impl PlanExecutor {
 
         if state.plan.as_ref().is_none_or(|p| p.plan_id != msg.plan_id) {
             let mut preserved_completed = HashSet::new();
+            let mut preserved_failed = None;
             if let Some(prev_plan) = &state.plan {
                 if prev_plan.plan_id.destination_session == msg.plan_id.destination_session
                     && !prev_plan.waypoints.is_empty()
@@ -314,12 +315,15 @@ impl PlanExecutor {
                         if state.completed_actions.contains(&(old_last, phase)) {
                             preserved_completed.insert((new_last, phase));
                         }
+                        if state.failed_action == Some((old_last, phase)) {
+                            preserved_failed = Some((new_last, phase));
+                        }
                     }
                 }
             }
             state.completed_actions = preserved_completed;
             state.active_action = None;
-            state.failed_action = None;
+            state.failed_action = preserved_failed;
         }
         state.plan = Some(msg);
         state.reached_waypoint = initial_reached;

@@ -228,6 +228,12 @@ impl<P: MapfPlanner> PlanServer<P> {
         self.plan_registry.is_executing_action(robot_id, progress)
     }
 
+    pub fn has_failed_action(&self, robot_id: &str) -> bool {
+        self.latest_action_progress
+            .get(robot_id)
+            .is_some_and(|ap| ap.status == ActionProgress::STATUS_FAILED)
+    }
+
     pub fn occupied_path_of(&self, robot_id: &str) -> Vec<[f32; 2]> {
         let Some(progress) = self.latest_progress.get(robot_id) else {
             return Vec::new();
@@ -269,6 +275,13 @@ impl<P: MapfPlanner> PlanServer<P> {
         };
 
         if is_new_session {
+            if self
+                .latest_action_progress
+                .get(robot_id)
+                .is_some_and(|ap| ap.status != ActionProgress::STATUS_RUNNING)
+            {
+                self.latest_action_progress.remove(robot_id);
+            }
             self.active_destinations.insert(robot_id.to_owned(), msg);
             self.pending_replans.insert(robot_id.to_owned());
             if !self.is_executing_action(robot_id) {
@@ -297,6 +310,9 @@ impl<P: MapfPlanner> PlanServer<P> {
     }
 
     pub fn handle_action_progress(&mut self, robot_id: &str, msg: ActionProgress) {
+        if msg.status == ActionProgress::STATUS_FAILED {
+            self.pending_replans.remove(robot_id);
+        }
         self.latest_action_progress
             .insert(robot_id.to_string(), msg);
     }
@@ -311,6 +327,16 @@ impl<P: MapfPlanner> PlanServer<P> {
             if self.active_destinations.contains_key(robot_id) {
                 self.pending_replans.insert(robot_id.to_string());
             }
+        } else {
+            rclrs::log_warn!(
+                self.node.logger(),
+                "Received non-recoverable PlanError (code={}) for robot {}: '{}'. Halting replans for current session.",
+                msg.error.code,
+                robot_id,
+                msg.error.message
+            );
+            self.pending_replans.remove(robot_id);
+            self.active_destinations.remove(robot_id);
         }
     }
 
@@ -323,11 +349,9 @@ impl<P: MapfPlanner> PlanServer<P> {
         // If there is no actionable (non-committed) robot in pending_replans,
         // wait until either a non-committed robot requests a replan or a committed
         // robot finishes its action.
-        if !self
-            .pending_replans
-            .iter()
-            .any(|robot_id| !self.is_executing_action(robot_id))
-        {
+        if !self.pending_replans.iter().any(|robot_id| {
+            !self.is_executing_action(robot_id) && !self.has_failed_action(robot_id)
+        }) {
             return None;
         }
 
@@ -340,10 +364,10 @@ impl<P: MapfPlanner> PlanServer<P> {
             // Make sure we have the latest progress for all robots.
             // Give up if progress for some robots is stale.
             if let Some(progress) = self.latest_progress.get(robot_id) {
-                if self.is_executing_action(robot_id) {
+                if self.is_executing_action(robot_id) || self.has_failed_action(robot_id) {
                     rclrs::log!(
                         self.node.logger(),
-                        "Robot {} is executing an action; excluding it from replanning and marking its occupied path",
+                        "Robot {} is executing or halted on an action; excluding it from replanning and marking its occupied path",
                         robot_id
                     );
                     committed_robots.push(robot_id.clone());

@@ -19,7 +19,7 @@ use futures::FutureExt;
 use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use rmf_process_executor::{
     JsonMessage, JsonSchema, ProcessActionExecution, ProcessActionRequest, ProcessExecutorAppExt,
-    ProcessExecutorPlugin,
+    ProcessExecutorConfig, ProcessExecutorPlugin,
 };
 use ros_env::rmf_prototype_msgs::msg::{
     Action, ActionProgress, Participant, ParticipantList, PlanId,
@@ -61,7 +61,10 @@ fn test_custom_and_builtin_crossflow_actions_emit_running_and_succeeded() {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
     app.insert_resource(CustomActionCounter(Arc::clone(&custom_counter)));
-    app.add_plugins(ProcessExecutorPlugin::default());
+    app.add_plugins(ProcessExecutorPlugin::with_config(ProcessExecutorConfig {
+        default_action_duration_sec: 0.1,
+        discovery_topic: "/test_proc_exec_1/discovery".to_string(),
+    }));
 
     let custom_service = app.spawn_service(custom_conveyor_action);
     app.register_process_action("custom_conveyor", custom_service);
@@ -71,7 +74,9 @@ fn test_custom_and_builtin_crossflow_actions_emit_running_and_succeeded() {
     let test_node = ros_exec.create_node("test_process_executor_node").unwrap();
 
     let discovery_pub = test_node
-        .create_publisher::<ParticipantList>("/destination/discovery".transient_local().reliable())
+        .create_publisher::<ParticipantList>(
+            "/test_proc_exec_1/discovery".transient_local().reliable(),
+        )
         .unwrap();
     let action_pub = test_node
         .create_publisher::<Action>("robot_proc_1/plan/action".transient_local().reliable())
@@ -206,7 +211,10 @@ fn test_crossflow_json_diagram_over_the_wire_executes_multi_step_workflow() {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
     app.insert_resource(CustomActionCounter(Arc::clone(&step_counter)));
-    app.add_plugins(ProcessExecutorPlugin::default());
+    app.add_plugins(ProcessExecutorPlugin::with_config(ProcessExecutorConfig {
+        default_action_duration_sec: 0.1,
+        discovery_topic: "/test_proc_exec_2/discovery".to_string(),
+    }));
 
     let step_service = app.spawn_service(record_diagram_step);
     app.register_diagram_node("record_step", step_service);
@@ -218,7 +226,9 @@ fn test_crossflow_json_diagram_over_the_wire_executes_multi_step_workflow() {
         .unwrap();
 
     let discovery_pub = test_node
-        .create_publisher::<ParticipantList>("/destination/discovery".transient_local().reliable())
+        .create_publisher::<ParticipantList>(
+            "/test_proc_exec_2/discovery".transient_local().reliable(),
+        )
         .unwrap();
     let action_pub = test_node
         .create_publisher::<Action>("robot_diag_1/plan/action".transient_local().reliable())

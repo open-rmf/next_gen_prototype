@@ -102,26 +102,42 @@ pub struct ParsedActionSpec {
 pub fn parse_action_spec(raw: &str) -> ParsedActionSpec {
     let trimmed = raw.trim();
     if trimmed.starts_with('{') {
-        if let Ok(serde_json::Value::Object(mut map)) =
-            serde_json::from_str::<serde_json::Value>(trimmed)
-        {
-            if !map.contains_key("category")
-                && ((map.contains_key("ops") && map.contains_key("start"))
-                    || map.contains_key("diagram"))
-            {
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                if !map.contains_key("category")
+                    && ((map.contains_key("ops") && map.contains_key("start"))
+                        || map.contains_key("diagram"))
+                {
+                    return ParsedActionSpec {
+                        category: "diagram".to_string(),
+                        params: serde_json::Value::Object(map),
+                    };
+                }
+                let category = map
+                    .remove("category")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "default".to_string());
+                let params = map
+                    .remove("params")
+                    .unwrap_or_else(|| serde_json::Value::Object(map));
+                return ParsedActionSpec { category, params };
+            }
+            Ok(_) => {
                 return ParsedActionSpec {
-                    category: "diagram".to_string(),
-                    params: serde_json::Value::Object(map),
+                    category: "fail".to_string(),
+                    params: serde_json::json!({
+                        "message": "Action JSON must be a JSON object"
+                    }),
                 };
             }
-            let category = map
-                .remove("category")
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| "default".to_string());
-            let params = map
-                .remove("params")
-                .unwrap_or_else(|| serde_json::Value::Object(map));
-            return ParsedActionSpec { category, params };
+            Err(err) => {
+                return ParsedActionSpec {
+                    category: "fail".to_string(),
+                    params: serde_json::json!({
+                        "message": format!("Malformed action JSON: {err}")
+                    }),
+                };
+            }
         }
     }
 
@@ -216,12 +232,14 @@ pub struct ProcessActionExecution {
 #[derive(Resource, Clone)]
 pub struct ProcessExecutorConfig {
     pub default_action_duration_sec: f64,
+    pub discovery_topic: String,
 }
 
 impl Default for ProcessExecutorConfig {
     fn default() -> Self {
         Self {
             default_action_duration_sec: 0.1,
+            discovery_topic: "/destination/discovery".to_string(),
         }
     }
 }
@@ -834,12 +852,13 @@ impl Plugin for ProcessExecutorPlugin {
 
         app.insert_resource(ProcessExecutorConfig {
             default_action_duration_sec: default_duration,
+            discovery_topic: self.config.discovery_topic.clone(),
         });
 
         if let Some(node) = app.world().get_resource::<RclrsNode>() {
             let sub = Arc::new(RosSubscription::<ParticipantList>::new(
                 node,
-                "/destination/discovery".to_string(),
+                self.config.discovery_topic.clone(),
             ));
             app.insert_resource(DiscoveryState {
                 subscriber: sub,
@@ -928,5 +947,13 @@ mod tests {
         let diagram_spec = parse_action_spec(diagram_raw);
         assert_eq!(diagram_spec.category, "diagram");
         assert!(diagram_spec.params.get("ops").is_some());
+
+        let malformed = parse_action_spec("{bad json: 123");
+        assert_eq!(malformed.category, "fail");
+        assert!(malformed
+            .params
+            .get("message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.contains("Malformed action JSON")));
     }
 }
