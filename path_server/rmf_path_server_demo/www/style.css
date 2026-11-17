@@ -148,6 +148,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
+  min-height: 0;
 }
 
 .canvas-viewport {
@@ -167,6 +168,7 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  min-height: 0;
 }
 
 .glassmorphism {
@@ -175,7 +177,7 @@ body {
 }
 
 .flex-grow {
-  flex-grow: 1;
+  flex: 1 1 180px;
 }
 
 .panel-header, .viewport-header {
@@ -185,6 +187,7 @@ body {
   padding: 1rem 1.25rem;
   border-bottom: 1px solid var(--border-color);
   background-color: rgba(255, 255, 255, 0.01);
+  flex-shrink: 0;
 }
 
 .panel-header i, .viewport-header i {
@@ -203,6 +206,12 @@ body {
   display: flex;
   flex-direction: column;
   gap: 1.25rem;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.panel-body > * {
+  flex-shrink: 0;
 }
 
 /* Mode selector */
