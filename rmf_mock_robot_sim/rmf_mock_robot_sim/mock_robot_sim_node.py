@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import math
+import os
+import random
 
 from geometry_msgs.msg import Point, Quaternion
 from nav_msgs.msg import Odometry
@@ -33,6 +36,10 @@ class MockRobotSimNode(Node):
         self.declare_parameter('initial_y', 0.0)
         self.declare_parameter('initial_yaw', 0.0)
         self.declare_parameter('publish_discovery', True)
+        self.declare_parameter('site_file', '')
+        self.declare_parameter('default_action_duration', 3.0)
+        self.declare_parameter('action_time_min_scale', 0.5)
+        self.declare_parameter('action_time_max_scale', 2.0)
 
         self.robot_name = self.get_parameter(
             'robot_name'
@@ -62,22 +69,51 @@ class MockRobotSimNode(Node):
             'publish_discovery'
         ).get_parameter_value().bool_value
 
+        self.site_file = self.get_parameter(
+            'site_file'
+        ).get_parameter_value().string_value
+
+        self.default_action_duration = self.get_parameter(
+            'default_action_duration'
+        ).get_parameter_value().double_value
+
+        self.action_time_min_scale = self.get_parameter(
+            'action_time_min_scale'
+        ).get_parameter_value().double_value
+
+        self.action_time_max_scale = self.get_parameter(
+            'action_time_max_scale'
+        ).get_parameter_value().double_value
+
         self.get_logger().info(
             f"Initializing mock robot '{self.robot_name}' "
             f'at ({self.x:.2f}, {self.y:.2f}, {self.yaw:.2f}) '
             f'with speed {self.speed:.2f} m/s'
         )
 
-        # 2. Initialize path following state
+        # 2. Initialize path following and site action state
         self.current_path = []
         self.current_waypoint_idx = 0
         self.current_plan_id = None
         self.plan_start_pos = (self.x, self.y)
         self.last_update_time = self.get_clock().now()
         self.wait_time_remaining = 0.0
+        self.current_wait_duration = 1.0
+        self.active_transition_speed = self.speed
+        self.active_transition_action = None
+        self.active_transition_duration = None
+        self.sampled_action_durations = []
         self.released_waypoint_idx = 0
         self.latest_release = None
         self.was_blocked = False
+
+        self.site_anchors = {}
+        self.site_action_lanes = []
+        self.site_dock_positions = []
+        self.site_actions_by_name = {}
+        self.docked_at = None
+        if self.site_file:
+            self.load_site_file(self.site_file)
 
         # 3. Configure QoS for Discovery & Reliable Data
         discovery_qos = QoSProfile(
@@ -164,6 +200,306 @@ class MockRobotSimNode(Node):
             w=math.cos(yaw / 2.0)
         )
 
+    def load_site_file(self, site_file_path):
+        if not os.path.exists(site_file_path):
+            self.get_logger().warning(
+                f"Configured site_file '{site_file_path}' does not exist"
+            )
+            return
+
+        try:
+            with open(site_file_path, 'r', encoding='utf-8') as f:
+                site_data = json.load(f)
+        except Exception as exc:
+            self.get_logger().error(
+                f"Failed to load site_file '{site_file_path}': {exc}"
+            )
+            return
+
+        def extract_anchor_xy(pose):
+            if isinstance(pose, list) and len(pose) >= 2:
+                return (float(pose[0]), float(pose[1]))
+            if isinstance(pose, dict):
+                t2d = pose.get('Translate2D')
+                if isinstance(t2d, list) and len(t2d) >= 2:
+                    return (float(t2d[0]), float(t2d[1]))
+            return None
+
+        anchors = {}
+        for anchor_id, pose in site_data.get('anchors', {}).items():
+            xy = extract_anchor_xy(pose)
+            if xy is not None:
+                anchors[str(anchor_id)] = xy
+
+        for level_data in site_data.get('levels', {}).values():
+            if not isinstance(level_data, dict):
+                continue
+            for anchor_id, pose in level_data.get('anchors', {}).items():
+                xy = extract_anchor_xy(pose)
+                if xy is not None:
+                    anchors[str(anchor_id)] = xy
+
+        self.site_anchors = anchors
+        self.site_action_lanes = []
+        self.site_dock_positions = []
+        self.site_actions_by_name = {}
+
+        neighbors = {}
+        anchor_lane_durations = {}
+        guided = site_data.get('navigation', {}).get('guided', {})
+        lanes = guided.get('lanes', {})
+        for lane_id, lane_data in lanes.items():
+            if not isinstance(lane_data, dict):
+                continue
+            lane_anchors = lane_data.get('anchors')
+            if isinstance(lane_anchors, list) and len(lane_anchors) >= 2:
+                left_id = str(lane_anchors[0])
+                right_id = str(lane_anchors[1])
+            else:
+                left_id = str(lane_data.get('left', ''))
+                right_id = str(lane_data.get('right', ''))
+            if left_id not in anchors or right_id not in anchors:
+                continue
+            left_pos = anchors[left_id]
+            right_pos = anchors[right_id]
+
+            neighbors.setdefault(left_id, []).append(right_pos)
+            neighbors.setdefault(right_id, []).append(left_pos)
+
+            forward = lane_data.get('forward', {})
+            fwd_action = self._extract_lane_action(forward, f'lane_{lane_id}')
+            if fwd_action is not None:
+                act_name, act_dur = fwd_action
+                anchor_lane_durations[right_id] = act_dur
+                self.site_action_lanes.append({
+                    'start': left_pos,
+                    'end': right_pos,
+                    'action_name': act_name,
+                    'duration': act_dur,
+                })
+                self.site_actions_by_name[act_name] = act_dur
+
+            reverse = lane_data.get('reverse')
+            if reverse == 'Same' and fwd_action is not None:
+                act_name, act_dur = fwd_action
+                rev_name = f'undock:{act_name}'
+                self.site_action_lanes.append({
+                    'start': right_pos,
+                    'end': left_pos,
+                    'action_name': rev_name,
+                    'duration': act_dur,
+                })
+                self.site_actions_by_name[rev_name] = act_dur
+            elif isinstance(reverse, dict):
+                rev_props = reverse.get('Different', reverse)
+                rev_action = self._extract_lane_action(
+                    rev_props, f'lane_{lane_id}_rev'
+                )
+                if rev_action is not None:
+                    rev_name, rev_dur = rev_action
+                    anchor_lane_durations[left_id] = rev_dur
+                    self.site_action_lanes.append({
+                        'start': right_pos,
+                        'end': left_pos,
+                        'action_name': rev_name,
+                        'duration': rev_dur,
+                    })
+                    self.site_actions_by_name[rev_name] = rev_dur
+
+        locations = guided.get('locations', {})
+        for loc_id, loc_data in locations.items():
+            if not isinstance(loc_data, dict):
+                continue
+            anchor_id = str(loc_data.get('anchor', ''))
+            if anchor_id not in anchors:
+                continue
+            loc_pos = anchors[anchor_id]
+            loc_name = str(loc_data.get('name', f'location_{loc_id}'))
+            tags = loc_data.get('tags', [])
+            is_parking_spot = False
+            if isinstance(tags, list):
+                for tag in tags:
+                    if tag == 'ParkingSpot' or (
+                        isinstance(tag, dict) and 'ParkingSpot' in tag
+                    ):
+                        is_parking_spot = True
+            if is_parking_spot:
+                continue
+
+            anchor_neighbors = neighbors.get(anchor_id, [])
+            is_degree_one_spur = len(anchor_neighbors) == 1
+            dock_dur = float(
+                loc_data.get(
+                    'dock_duration',
+                    anchor_lane_durations.get(anchor_id, self.default_action_duration),
+                )
+            )
+            if isinstance(tags, list):
+                for tag in tags:
+                    if isinstance(tag, dict) and isinstance(tag.get('Dock'), dict):
+                        dock_info = tag['Dock']
+                        loc_name = str(dock_info.get('dock_name', loc_name))
+                        if 'duration' in dock_info:
+                            dock_dur = float(dock_info['duration'])
+
+            if is_degree_one_spur:
+                try:
+                    loc_key = int(loc_id)
+                except (TypeError, ValueError):
+                    loc_key = None
+                try:
+                    anc_key = int(anchor_id)
+                except (TypeError, ValueError):
+                    anc_key = None
+
+                self.site_dock_positions.append({
+                    'position': loc_pos,
+                    'staging_position': anchor_neighbors[0],
+                    'action_name': loc_name,
+                    'location_key': loc_key,
+                    'anchor_key': anc_key,
+                    'duration': dock_dur,
+                })
+                self.site_actions_by_name.setdefault(loc_name, dock_dur)
+
+        self.get_logger().info(
+            f"Loaded site file '{site_file_path}': "
+            f'{len(self.site_anchors)} anchors, '
+            f'{len(self.site_action_lanes)} action lanes, '
+            f'{len(self.site_dock_positions)} dock points'
+        )
+
+    def _extract_lane_action(self, lane_props, fallback_name):
+        if not isinstance(lane_props, dict):
+            return None
+        dock = lane_props.get('dock')
+        if isinstance(dock, dict):
+            name = str(dock.get('dock_name', fallback_name))
+            dur = float(dock.get('duration', self.default_action_duration))
+            if dur <= 0.0:
+                dur = self.default_action_duration
+            return (name, dur)
+        if isinstance(dock, str) and dock:
+            return (dock, self.default_action_duration)
+        action = lane_props.get('action')
+        if isinstance(action, dict):
+            name = str(action.get('name', fallback_name))
+            dur = float(action.get('duration', self.default_action_duration))
+            if dur <= 0.0:
+                dur = self.default_action_duration
+            return (name, dur)
+        if isinstance(action, str) and action:
+            return (action, self.default_action_duration)
+        return None
+
+    def sample_action_duration(self, base_duration=None):
+        if base_duration is None or base_duration <= 0.0:
+            base_duration = self.default_action_duration
+        min_scale = min(self.action_time_min_scale, self.action_time_max_scale)
+        max_scale = max(self.action_time_min_scale, self.action_time_max_scale)
+        scale = random.uniform(min_scale, max_scale)
+        return max(0.05, float(base_duration) * scale)
+
+    def _match_waypoint_dock(self, wp):
+        if wp is None:
+            return None
+        constraints = getattr(wp, 'arrival_constraints', None)
+        nodes = getattr(constraints, 'nodes', None) if constraints is not None else None
+        if not nodes:
+            return None
+        for node in nodes:
+            key = getattr(node, 'key', None)
+            if key is None:
+                continue
+            names = getattr(key, 'name', None)
+            if names:
+                node_name = str(names[0]).lower()
+                for dock in self.site_dock_positions:
+                    if dock['action_name'].lower() == node_name:
+                        return dock
+            keys = getattr(key, 'key', None)
+            if keys:
+                key_id = int(keys[0])
+                for dock in self.site_dock_positions:
+                    if key_id in (dock.get('location_key'), dock.get('anchor_key')):
+                        return dock
+        return None
+
+    def _get_transition_action(self, target_idx):
+        if not self.current_path or target_idx < 0 or target_idx >= len(self.current_path):
+            return None
+
+        target_wp = self.current_path[target_idx]
+        prev_wp = self.current_path[target_idx - 1] if target_idx > 0 else None
+
+        target_dock = self._match_waypoint_dock(target_wp)
+        if target_dock is not None:
+            self.docked_at = target_dock
+            return (target_dock['action_name'], target_dock['duration'])
+
+        prev_dock = self._match_waypoint_dock(prev_wp)
+        if prev_dock is None and self.docked_at is not None and target_idx > 0:
+            prev_dock = self.docked_at
+        if prev_dock is not None:
+            self.docked_at = None
+            return (f"undock:{prev_dock['action_name']}", prev_dock['duration'])
+
+        dep_action = getattr(prev_wp, 'departure_action', '') if prev_wp is not None else ''
+        arr_action = getattr(target_wp, 'arrival_action', '')
+        if arr_action or dep_action:
+            action_name = arr_action or dep_action
+            base_duration = self.site_actions_by_name.get(
+                action_name, self.default_action_duration
+            )
+            return (action_name, base_duration)
+
+        return None
+
+    def _configure_transition(self, target_idx, initial=False):
+        self.current_waypoint_idx = target_idx
+        if not self.current_path or target_idx >= len(self.current_path):
+            self.wait_time_remaining = 0.0
+            self.current_wait_duration = 1.0
+            self.active_transition_speed = self.speed
+            self.active_transition_action = None
+            self.active_transition_duration = None
+            return
+
+        if target_idx > 0:
+            prev_wp = self.current_path[target_idx - 1]
+            start_pos = (float(prev_wp.position[0]), float(prev_wp.position[1]))
+        else:
+            start_pos = (float(self.plan_start_pos[0]), float(self.plan_start_pos[1]))
+        target_wp = self.current_path[target_idx]
+        end_pos = (float(target_wp.position[0]), float(target_wp.position[1]))
+        seg_dist = math.hypot(end_pos[0] - start_pos[0], end_pos[1] - start_pos[1])
+
+        action_info = self._get_transition_action(target_idx)
+        if action_info is not None:
+            action_name, base_duration = action_info
+            sampled_duration = self.sample_action_duration(base_duration)
+            self.active_transition_action = action_name
+            self.active_transition_duration = sampled_duration
+            self.sampled_action_durations.append(sampled_duration)
+            if seg_dist > 1e-3:
+                self.wait_time_remaining = 0.0
+                self.current_wait_duration = sampled_duration
+                self.active_transition_speed = seg_dist / sampled_duration
+            else:
+                self.current_wait_duration = sampled_duration
+                self.wait_time_remaining = sampled_duration
+                self.active_transition_speed = self.speed
+            self.get_logger().info(
+                f"Transition to waypoint {target_idx} has action '{action_name}': "
+                f'sampled duration {sampled_duration:.2f}s (base {base_duration:.2f}s)'
+            )
+        else:
+            self.active_transition_action = None
+            self.active_transition_duration = None
+            self.active_transition_speed = self.speed
+            self.current_wait_duration = 1.0
+            self.wait_time_remaining = 0.0 if initial else 1.0
+
     def publish_discovery(self):
         msg = ParticipantList()
         p = Participant()
@@ -190,9 +526,8 @@ class MockRobotSimNode(Node):
         )
         self.current_path = msg.waypoints
         self.current_plan_id = msg.plan_id
-        self.current_waypoint_idx = 0
         self.plan_start_pos = (self.x, self.y)
-        self.wait_time_remaining = 0.0
+        self._configure_transition(0, initial=True)
         if self.latest_release and self._plan_id_matches(
             self.latest_release.plan_id, self.current_plan_id
         ):
@@ -277,13 +612,12 @@ class MockRobotSimNode(Node):
 
                     if dist > 1e-3:
                         self.yaw = math.atan2(dy, dx)
-                        step = self.speed * dt
+                        step = self.active_transition_speed * dt
                         if step >= dist:
                             # Reached the target waypoint
                             self.x = tx
                             self.y = ty
-                            self.current_waypoint_idx += 1
-                            self.wait_time_remaining = 1.0
+                            self._configure_transition(self.current_waypoint_idx + 1)
                         else:
                             self.x += (dx / dist) * step
                             self.y += (dy / dist) * step
@@ -291,8 +625,7 @@ class MockRobotSimNode(Node):
                         # Already at or extremely close to target waypoint, advance to next
                         self.x = tx
                         self.y = ty
-                        self.current_waypoint_idx += 1
-                        self.wait_time_remaining = 1.0
+                        self._configure_transition(self.current_waypoint_idx + 1)
 
         # 2. Publish plan progress
         if self.current_path:
@@ -364,7 +697,14 @@ class MockRobotSimNode(Node):
                     prev_wp.progress + fraction * diff
                 )
             else:
-                fraction = min(1.0, max(0.0, 1.0 - self.wait_time_remaining))
+                denom = (
+                    self.current_wait_duration
+                    if self.current_wait_duration > 1e-6
+                    else 1.0
+                )
+                fraction = min(
+                    1.0, max(0.0, 1.0 - (self.wait_time_remaining / denom))
+                )
                 diff = next_wp.progress - prev_wp.progress
                 progress_msg.progress = float(
                     prev_wp.progress + fraction * diff
@@ -396,8 +736,8 @@ class MockRobotSimNode(Node):
             dy = ty - self.y
             dist = math.hypot(dx, dy)
             if dist > 1e-3:
-                odom.twist.twist.linear.x = (dx / dist) * self.speed
-                odom.twist.twist.linear.y = (dy / dist) * self.speed
+                odom.twist.twist.linear.x = (dx / dist) * self.active_transition_speed
+                odom.twist.twist.linear.y = (dy / dist) * self.active_transition_speed
                 odom.twist.twist.angular.z = 0.0
         else:
             odom.twist.twist.linear.x = 0.0

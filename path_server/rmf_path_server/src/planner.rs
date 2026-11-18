@@ -218,8 +218,8 @@ impl MapfPlanner for PibtPlanner {
 
             let resolution = self.grid_resolution;
             let padding = 10.0;
-            let ox = (min_x / resolution).floor() * resolution - padding;
-            let oy = (min_y / resolution).floor() * resolution - padding;
+            let ox = (min_x / resolution).floor() * resolution - padding - 0.5 * resolution;
+            let oy = (min_y / resolution).floor() * resolution - padding - 0.5 * resolution;
 
             let w = ((max_x - ox + padding) / resolution).ceil() as usize;
             let h = ((max_y - oy + padding) / resolution).ceil() as usize;
@@ -248,8 +248,12 @@ impl MapfPlanner for PibtPlanner {
                 ))
             })?;
 
-            let sx = ((odom.pose.pose.position.x as f32 - offset_x) / resolution).round() as usize;
-            let sy = ((odom.pose.pose.position.y as f32 - offset_y) / resolution).round() as usize;
+            let sx = ((odom.pose.pose.position.x as f32 - offset_x) / resolution - 0.5)
+                .round()
+                .max(0.0) as usize;
+            let sy = ((odom.pose.pose.position.y as f32 - offset_y) / resolution - 0.5)
+                .round()
+                .max(0.0) as usize;
 
             let gx_f32;
             let gy_f32;
@@ -271,8 +275,8 @@ impl MapfPlanner for PibtPlanner {
                 )));
             }
 
-            let gx = ((gx_f32 - offset_x) / resolution).round() as usize;
-            let gy = ((gy_f32 - offset_y) / resolution).round() as usize;
+            let gx = ((gx_f32 - offset_x) / resolution - 0.5).round().max(0.0) as usize;
+            let gy = ((gy_f32 - offset_y) / resolution - 0.5).round().max(0.0) as usize;
 
             let sx = sx.min(width - 1);
             let sy = sy.min(height - 1);
@@ -294,8 +298,8 @@ impl MapfPlanner for PibtPlanner {
         let mut trajectories = vec![Vec::new(); robot_ids.len()];
         for time_step in solved_paths {
             for (agent_idx, pos) in time_step.iter().enumerate() {
-                let world_x = pos.0 as f32 * resolution + offset_x;
-                let world_y = pos.1 as f32 * resolution + offset_y;
+                let world_x = (pos.0 as f32 + 0.5) * resolution + offset_x;
+                let world_y = (pos.1 as f32 + 0.5) * resolution + offset_y;
                 trajectories[agent_idx].push(Isometry2::translation(world_x, world_y));
             }
         }

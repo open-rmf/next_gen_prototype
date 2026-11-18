@@ -38,8 +38,8 @@ fn test_pibt_planner_with_obstacle() {
 
     let mut starts = HashMap::new();
     let mut odom = Odometry::default();
-    odom.pose.pose.position.x = 0.0;
-    odom.pose.pose.position.y = 5.0;
+    odom.pose.pose.position.x = 0.5;
+    odom.pose.pose.position.y = 5.5;
     starts.insert("robot1".to_string(), odom);
 
     let mut goals = HashMap::new();
@@ -48,7 +48,7 @@ fn test_pibt_planner_with_obstacle() {
         .regions
         .push(ros_env::rmf_prototype_msgs::msg::TargetRegion {
             region: ros_env::rmf_prototype_msgs::msg::Region {
-                points: vec![9.0, 5.0],
+                points: vec![9.5, 5.5],
                 ..Default::default()
             },
             ..Default::default()
@@ -81,29 +81,28 @@ fn test_pibt_planner_with_obstacle() {
         let y = pose.translation.y;
         println!("  {}: ({}, {})", i, x, y);
 
-        // Verify that the path does not hit the obstacle at (5,5)
-        // Since resolution is 1.0 and origin is 0,0, grid coords are same as world coords (approx)
-        let dx = (x - 5.0).abs();
-        let dy = (y - 5.0).abs();
+        // Verify that the path does not hit the obstacle at cell (5,5), whose center is (5.5, 5.5)
+        let dx = (x - 5.5).abs();
+        let dy = (y - 5.5).abs();
         assert!(
             dx > 0.1 || dy > 0.1,
-            "Path hits obstacle at (5,5) at step {}",
+            "Path hits obstacle at cell (5,5) center (5.5, 5.5) at step {}",
             i
         );
     }
 
-    // Verify that it reached the goal (9,5)
+    // Verify that it reached the goal (9.5, 5.5)
     let last_pose = path.last().unwrap();
     let lx = last_pose.translation.x;
     let ly = last_pose.translation.y;
     assert!(
-        (lx - 9.0).abs() < 0.1,
-        "Last pose x is {}, expected 9.0",
+        (lx - 9.5).abs() < 0.1,
+        "Last pose x is {}, expected 9.5",
         lx
     );
     assert!(
-        (ly - 5.0).abs() < 0.1,
-        "Last pose y is {}, expected 5.0",
+        (ly - 5.5).abs() < 0.1,
+        "Last pose y is {}, expected 5.5",
         ly
     );
 }
