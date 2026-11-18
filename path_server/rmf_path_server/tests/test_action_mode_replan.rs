@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod common;
+
 use mapf_post::na::{Isometry2, Vector2};
-use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
+use rclrs::{CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use rmf_path_server::{start_path_server, Map, MapfPlanner};
 use ros_env::nav_msgs::msg::OccupancyGrid;
 use ros_env::rmf_prototype_msgs::{
@@ -66,7 +68,7 @@ impl MapfPlanner for TestPlanner {
 #[test]
 fn test_action_mode_robot_excluded_from_replan_and_cross_plan_dependencies_computed(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let context = Context::default_from_env().unwrap();
+    let context = common::isolated_context()?;
     let mut executor = context.create_basic_executor();
     let test_node = Arc::new(executor.create_node("test_action_mode_node")?);
     let server_node = Arc::new(executor.create_node("path_server_action_mode")?);
@@ -289,7 +291,7 @@ fn test_action_mode_robot_excluded_from_replan_and_cross_plan_dependencies_compu
 #[test]
 fn test_cancelled_snapshot_preserves_in_flight_destination(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let context = Context::default_from_env().unwrap();
+    let context = common::isolated_context()?;
     let executor = context.create_basic_executor();
     let server_node = executor.create_node("path_server_cancel_race")?;
 

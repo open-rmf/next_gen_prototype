@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod common;
+
 use mapf_post::na::Isometry2;
-use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
+use rclrs::{CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
 use rmf_path_server::{start_path_server, Map, MapfPlanner};
 use ros_env::nav_msgs::msg::OccupancyGrid;
 use ros_env::rmf_prototype_msgs::{
@@ -51,7 +53,7 @@ impl MapfPlanner for TestPlanner {
 
 #[test]
 fn test_map_subscription() -> Result<(), Box<dyn std::error::Error>> {
-    let context = Context::default_from_env().unwrap();
+    let context = common::isolated_context()?;
     let mut executor = context.create_basic_executor();
     let test_node = Arc::new(executor.create_node("test_node")?);
     let server_node = Arc::new(executor.create_node("path_server")?);
@@ -141,7 +143,7 @@ fn test_map_subscription() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_progress_subscription() -> Result<(), Box<dyn std::error::Error>> {
-    let context = Context::default_from_env().unwrap();
+    let context = common::isolated_context()?;
     let mut executor = context.create_basic_executor();
     let test_node = Arc::new(executor.create_node("test_progress_node")?);
     let server_node = Arc::new(executor.create_node("path_server_progress")?);
