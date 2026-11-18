@@ -72,9 +72,11 @@ class MockRobotSimNode(Node):
         self.current_path = []
         self.current_waypoint_idx = 0
         self.current_plan_id = None
+        self.plan_start_pos = (self.x, self.y)
         self.last_update_time = self.get_clock().now()
         self.wait_time_remaining = 0.0
         self.released_waypoint_idx = 0
+        self.latest_release = None
         self.was_blocked = False
 
         # 3. Configure QoS for Discovery & Reliable Data
@@ -172,6 +174,15 @@ class MockRobotSimNode(Node):
         self.dest_discovery_pub.publish(msg)
         self.plan_discovery_pub.publish(msg)
 
+    def _plan_id_matches(self, plan_id_a, plan_id_b):
+        if plan_id_a is None or plan_id_b is None:
+            return False
+        return (
+            list(plan_id_a.destination_session.uuid)
+            == list(plan_id_b.destination_session.uuid)
+            and plan_id_a.plan_version == plan_id_b.plan_version
+        )
+
     def handle_plan(self, msg: Plan):
         self.get_logger().info(
             f'Received new plan with {len(msg.waypoints)} waypoints. '
@@ -180,8 +191,14 @@ class MockRobotSimNode(Node):
         self.current_path = msg.waypoints
         self.current_plan_id = msg.plan_id
         self.current_waypoint_idx = 0
+        self.plan_start_pos = (self.x, self.y)
         self.wait_time_remaining = 0.0
-        self.released_waypoint_idx = 0
+        if self.latest_release and self._plan_id_matches(
+            self.latest_release.plan_id, self.current_plan_id
+        ):
+            self.released_waypoint_idx = self.latest_release.waypoint_id
+        else:
+            self.released_waypoint_idx = 0
         self.was_blocked = False
 
         # If the path is not empty and we are far from the start,
@@ -194,6 +211,7 @@ class MockRobotSimNode(Node):
             f'Received PlanRelease: waypoint_id={msg.waypoint_id}, '
             f'plan_version={msg.plan_id.plan_version}'
         )
+        self.latest_release = msg
         if not self.current_plan_id:
             self.get_logger().info('Cannot update release: current_plan_id is None')
             return
@@ -276,29 +294,55 @@ class MockRobotSimNode(Node):
                         self.current_waypoint_idx += 1
                         self.wait_time_remaining = 1.0
 
-            # 2. Publish plan progress
+        # 2. Publish plan progress
+        if self.current_path:
             self.publish_progress()
 
         # 3. Publish Odometry
         self.publish_odometry()
 
     def publish_progress(self):
-        if not self.current_plan_id:
+        if not self.current_plan_id or not self.current_path:
             return
 
         progress_msg = Progress()
         progress_msg.plan_id = self.current_plan_id
 
-        # Determine reached and target waypoints
-        # reached_waypoint is the last waypoint reached
-        reached_idx = max(0, self.current_waypoint_idx - 1)
-        target_idx = min(len(self.current_path) - 1, self.current_waypoint_idx)
+        num_waypoints = len(self.current_path)
 
-        progress_msg.reached_waypoint = int(reached_idx)
-        progress_msg.target_waypoint = int(target_idx)
+        if self.current_waypoint_idx >= num_waypoints:
+            last_idx = num_waypoints - 1
+            progress_msg.reached_waypoint = int(last_idx)
+            progress_msg.target_waypoint = int(last_idx)
+            progress_msg.progress = float(self.current_path[last_idx].progress)
+        elif self.current_waypoint_idx == 0:
+            first_wp = self.current_path[0]
+            progress_msg.reached_waypoint = 0
+            progress_msg.target_waypoint = 0
+            seg_dist = math.hypot(
+                first_wp.position[0] - self.plan_start_pos[0],
+                first_wp.position[1] - self.plan_start_pos[1],
+            )
+            if seg_dist > 1e-3:
+                dist_from_start = math.hypot(
+                    self.x - self.plan_start_pos[0],
+                    self.y - self.plan_start_pos[1],
+                )
+                fraction = min(1.0, max(0.0, dist_from_start / seg_dist))
+                progress_msg.progress = float(fraction * first_wp.progress)
+            else:
+                progress_msg.progress = 0.0
+        elif self.is_blocked():
+            reached_idx = self.current_waypoint_idx - 1
+            progress_msg.reached_waypoint = int(reached_idx)
+            progress_msg.target_waypoint = int(reached_idx)
+            progress_msg.progress = float(self.current_path[reached_idx].progress)
+        else:
+            reached_idx = self.current_waypoint_idx - 1
+            target_idx = self.current_waypoint_idx
+            progress_msg.reached_waypoint = int(reached_idx)
+            progress_msg.target_waypoint = int(target_idx)
 
-        # Interpolate progress value
-        if len(self.current_path) > 1:
             prev_wp = self.current_path[reached_idx]
             next_wp = self.current_path[target_idx]
 
@@ -306,13 +350,13 @@ class MockRobotSimNode(Node):
             next_pos = next_wp.position
             seg_dist = math.hypot(
                 next_pos[0] - prev_pos[0],
-                next_pos[1] - prev_pos[1]
+                next_pos[1] - prev_pos[1],
             )
 
             if seg_dist > 1e-3:
                 dist_from_prev = math.hypot(
                     self.x - prev_pos[0],
-                    self.y - prev_pos[1]
+                    self.y - prev_pos[1],
                 )
                 fraction = min(1.0, max(0.0, dist_from_prev / seg_dist))
                 diff = next_wp.progress - prev_wp.progress
@@ -320,9 +364,11 @@ class MockRobotSimNode(Node):
                     prev_wp.progress + fraction * diff
                 )
             else:
-                progress_msg.progress = float(next_wp.progress)
-        else:
-            progress_msg.progress = float(self.current_path[reached_idx].progress)
+                fraction = min(1.0, max(0.0, 1.0 - self.wait_time_remaining))
+                diff = next_wp.progress - prev_wp.progress
+                progress_msg.progress = float(
+                    prev_wp.progress + fraction * diff
+                )
 
         progress_msg.reached_keys = []
         self.progress_pub.publish(progress_msg)
