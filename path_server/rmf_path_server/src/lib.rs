@@ -387,14 +387,9 @@ impl<P: MapfPlanner> PlanServer<P> {
                     self.current_cancellation = None;
                     self.current_planning_session = None;
 
-                    let PlanSuccess {
-                        session_id,
-                        goals,
-                        plans,
-                        ..
-                    } = success;
+                    let PlanSuccess { goals, plans, .. } = success;
 
-                    self.plan_registry.record_session_plans(session_id, &plans);
+                    self.plan_registry.record_session_plans(&plans);
 
                     for (robot_id, plan) in &plans {
                         let mut wp_strs = Vec::new();

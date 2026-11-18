@@ -318,14 +318,14 @@ impl PlanRegistry {
     }
 
     /// Records a newly generated `plan` for `robot_id`, replacing any older plan.
-    pub fn insert_plan(&mut self, _session_id: u64, robot_id: String, plan: Plan) {
+    pub fn insert_plan(&mut self, robot_id: String, plan: Plan) {
         self.active_plans.insert(robot_id, plan);
     }
 
     /// Records all plans produced in a planning session.
-    pub fn record_session_plans(&mut self, session_id: u64, plans: &HashMap<String, Plan>) {
+    pub fn record_session_plans(&mut self, plans: &HashMap<String, Plan>) {
         for (robot_id, plan) in plans {
-            self.insert_plan(session_id, robot_id.clone(), plan.clone());
+            self.insert_plan(robot_id.clone(), plan.clone());
         }
     }
 
@@ -751,7 +751,6 @@ mod tests {
         assert_eq!(id0.destination_session.uuid, [1; 16]);
 
         registry.insert_plan(
-            1,
             "robot1".to_string(),
             Plan {
                 plan_id: id0,
@@ -764,7 +763,6 @@ mod tests {
         assert_eq!(id1.plan_version, 1);
 
         registry.insert_plan(
-            2,
             "robot1".to_string(),
             Plan {
                 plan_id: id1,
@@ -798,7 +796,7 @@ mod tests {
             &footprints,
             1.0,
         );
-        registry.record_session_plans(1, &plans_s1);
+        registry.record_session_plans(&plans_s1);
 
         let r1_plan = registry.get_plan("robot1").unwrap().clone();
         assert_eq!(r1_plan.plan_id.destination_session.uuid, [10; 16]);
@@ -818,7 +816,7 @@ mod tests {
             &footprints,
             1.0,
         );
-        registry.record_session_plans(2, &plans_s2);
+        registry.record_session_plans(&plans_s2);
 
         let r2_plan = plans_s2.get("robot2").unwrap();
         assert_eq!(r2_plan.waypoints.len(), 3);
@@ -889,7 +887,7 @@ mod tests {
 
         let (plans, _, _) =
             registry.build_session_plans(&basic_plan, &goals, &robot_ids, &footprints, 1.0);
-        registry.record_session_plans(1, &plans);
+        registry.record_session_plans(&plans);
         let generated_plan = registry.get_plan("robot_1").unwrap().clone();
         assert!(generated_plan.waypoints[2].arrival_action.is_empty());
         assert_eq!(
@@ -927,7 +925,7 @@ mod tests {
             &footprints,
             1.0,
         );
-        registry.record_session_plans(2, &plans_undock);
+        registry.record_session_plans(&plans_undock);
         let undock_plan = registry.get_plan("robot_1").unwrap().clone();
         assert!(undock_plan.waypoints[0].departure_action.is_empty());
 
