@@ -5,3 +5,22 @@ rmf_mock_robot_sim/rmf_mock_robot_sim/mock_robot_sim_node.py
 Cargo.lock
 *.pyc
 mock_sim_logs/
+
+# Python cache & test
+__pycache__/
+.pytest_cache/
+
+# ROS 2 & Colcon build / install / log directories
+build/
+install/
+log/
+rmf_ws/
+
+# Logs & Simulation outputs
+*.log
+
+# Rust target
+target/
+
+# Ignore colcon ignore marker files
+COLCON_IGNORE
