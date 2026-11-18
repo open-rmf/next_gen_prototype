@@ -2,7 +2,7 @@
 
 ![image](./docs/images/nav2_traffic_demo.gif)
 
-This folder contains the various packages required for Nav2 integration and demonstrates how Next Gen prototype messages and traffic management design is used for multi-robot coordination. The core `rmf_nav2_traffic` plugin manages incoming navigation requests and plans produced by the path server, and publishes action goals to the Nav2 server accordingly. We also incorporate [spatio_temporal_partition_layer](https://github.com/arjo129/spatio_temporal_partitioning) into the `rmf_nav2_traffic` plugin, where safe zone data is used to update the Nav2 costmap and provide partitions to facilitate path-planning.
+This folder contains the various packages required for Nav2 integration and demonstrates how `next_gen_prototype` messages and traffic management design is used for multi-robot coordination. The core `rmf_nav2_traffic` plugin manages incoming navigation requests and plans produced by the path server, and publishes action goals to the Nav2 server accordingly. We also incorporate [spatio_temporal_partition_layer](https://github.com/arjo129/spatio_temporal_partitioning) into the `rmf_nav2_traffic` plugin, where safe zone data is used to update the Nav2 costmap and provide partitions to facilitate path-planning.
 
 ## InnerNavigationServices Workflow Diagram
 
@@ -91,8 +91,23 @@ graph TD
 
 ## Try out the demo
 
+### Docker Setup
 
-### Setup
+Follow the steps below to use pre-made `docker/Dockerfile.base` to run the demo containerized without fuss:  
+
+<details>
+   <summary><b>Click here 🐳.</b></summary>
+
+```bash
+docker compose -f docker/docker-compose.yml build
+```
+
+</details>
+
+> [!WARNING]
+> This process typically takes about **20 minutes**, depending on internet connectivity strength.
+
+### Manual Setup
 
 Do a fresh update & upgrade:
 ```
@@ -133,18 +148,45 @@ colcon build --packages-up-to sp_demo_nav2_bringup rmf_nav2_traffic rmf_path_ser
 With the workspace built and sourced, run the following nodes:
 
 Spin up the Nav2 simulation:
-```
+```bash
 ros2 launch sp_demo_nav2_bringup cloned_multi_tb3_simulation_launch.py   robots:="robot0={x: 0.0, y: 5.0, yaw: 0.0}; robot1={x: 3.0, y: 5.0, yaw: 0.0};"
 ```
 
-In a separate terminal, run the demo launch file containing the path server, plan executor, destination server, path visualizer and Nav2 traffic nodes:
+<details>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
+
+```bash
+xhost +local:docker 
+docker compose -f docker/docker-compose.yml up -d --force-recreate
 ```
+</details>
+
+<details>
+   <summary><b>Click here if running in docker container, headless 🐳.</b></summary>
+
+```bash
+xhost +local:docker 
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.headless.override.yml up -d --force-recreate
+```
+</details>
+
+<details>
+   <summary><b>Click here if running in docker container, monolithic and with `rmw_zenoh` 🐳.</b></summary>
+
+```bash
+xhost +local:docker 
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.zenoh.override.yml up -d --force-recreate
+```
+</details>
+
+In a separate terminal, run the demo launch file containing the path server, plan executor, destination server, path visualizer and Nav2 traffic nodes:
+```bash
 ros2 launch rmf_path_server_demo demo_nav2.launch.py robots:="robot0 robot1"
 ```
 
 Send action goals to the robots:
 
-```
+```bash
 ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
   pose: {
     header: {
@@ -158,8 +200,28 @@ ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
   }
 }"
 ```
+<details>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
 
+```bash
+docker exec -it next_gen_prototype bash -c "source /nav2_traffic_ws/install/setup.bash && \
+    ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose \"{
+      pose: {
+        header: {
+          stamp: {sec: 0, nanosec: 0},
+          frame_id: 'map'
+        },
+        pose: {
+          position: {x: 5.0, y: 5.0, z: 0.0},
+          orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+        }
+      }
+    }\"
+"
 ```
+</details>
+
+```bash
 ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
   pose: {
     header: {
@@ -174,9 +236,30 @@ ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
 }"
 ```
 
+<details>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
+
+```bash
+docker exec -it next_gen_prototype bash -c "source /nav2_traffic_ws/install/setup.bash && \
+    ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose \"{
+      pose: {
+        header: {
+          stamp: {sec: 0, nanosec: 0},
+          frame_id: 'map'
+        },
+        pose: {
+          position: {x: 0.0, y: 3.0, z: 0.0},
+          orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+        }
+      }
+    }\"
+"
+```
+</details>
+
 Alternate navigation goals:
 
-```
+```bash
 ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
   pose: {
     header: {
@@ -191,7 +274,30 @@ ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose "{
 }"
 ```
 
+
+<details>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
+
+```bash
+docker exec -it next_gen_prototype bash -c "source /nav2_traffic_ws/install/setup.bash && \
+    ros2 action send_goal robot0/navigate_to_pose nav2_msgs/action/NavigateToPose \"{
+      pose: {
+        header: {
+          stamp: {sec: 0, nanosec: 0},
+          frame_id: 'map'
+        },
+        pose: {
+          position: {x: 9.0, y: 3.0, z: 0.0},
+          orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+        }
+      }
+    }\"
+"
 ```
+
+</details>
+
+```bash
 ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
   pose: {
     header: {
@@ -205,3 +311,24 @@ ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose "{
   }
 }"
 ```
+
+<details>
+   <summary><b>Click here if running in docker container 🐳.</b></summary>
+
+```bash
+docker exec -it next_gen_prototype bash -c "source /nav2_traffic_ws/install/setup.bash && \
+    ros2 action send_goal robot1/navigate_to_pose nav2_msgs/action/NavigateToPose \"{
+      pose: {
+        header: {
+          stamp: {sec: 0, nanosec: 0},
+          frame_id: 'map'
+        },
+        pose: {
+          position: {x: 9.0, y: 6.0, z: 0.0},
+          orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+        }
+      }
+    }\"
+"
+```
+</details>
