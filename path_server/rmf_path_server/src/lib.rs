@@ -100,6 +100,21 @@ impl<P: MapfPlanner> PlanServer<P> {
                 .join("")
         );
 
+        if let Some(region) = msg.constraints.regions.first() {
+            if region.region.hint != rmf_prototype_msgs::msg::Region::HINT_POINT
+                || region.region.points.len() != 2
+            {
+                rclrs::log_error!(
+                    self.node.logger(),
+                    "Destination for {} has unsupported region (hint={}, points_len={}); \
+                     only HINT_POINT with 2 coordinates supports exact goal clamping",
+                    robot_id,
+                    region.region.hint,
+                    region.region.points.len()
+                );
+            }
+        }
+
         let is_new_session = match self.active_destinations.get(robot_id) {
             Some(active_dest) => active_dest.session.uuid != msg.session.uuid,
             None => true,
@@ -199,7 +214,7 @@ impl<P: MapfPlanner> PlanServer<P> {
                                 );
                                 continue;
                             };
-                            let plan = Self::to_plan_msg(
+                            let mut plan = Self::to_plan_msg(
                                 agent_idx,
                                 traj,
                                 plan_id,
@@ -208,6 +223,11 @@ impl<P: MapfPlanner> PlanServer<P> {
                                 &self.active_plan_ids,
                                 1.0,
                             );
+                            if let Some(dest) = goals.get(robot_id) {
+                                if let Some(last_wp) = plan.waypoints.last_mut() {
+                                    last_wp.arrival_constraints = dest.constraints.clone();
+                                }
+                            }
                             plans.insert(robot_id.clone(), plan);
                         }
 
