@@ -214,7 +214,13 @@ class TestMockRobotSim(unittest.TestCase):
         )
 
         # Verify that before reaching wp0, progress interpolated between 0.0 and 1.0
-        pre_wp0_progress = [p.progress for p in received_progress if p.progress < 0.99]
+        expected_uuid = list(plan_id.destination_session.uuid)
+        pre_wp0_progress = [
+            p.progress
+            for p in received_progress
+            if list(p.plan_id.destination_session.uuid) == expected_uuid
+            and p.progress < 0.99
+        ]
         self.assertGreater(
             len(pre_wp0_progress),
             0,
@@ -243,6 +249,7 @@ class TestMockRobotSim(unittest.TestCase):
                     and latest_prog.reached_waypoint == 2
                     and latest_prog.target_waypoint == 2
                     and abs(latest_prog.progress - 3.0) < 1e-3
+                    and latest_prog.mode == Progress.MODE_IDLE
                 ):
                     plan_completed = True
                     break
@@ -259,13 +266,18 @@ class TestMockRobotSim(unittest.TestCase):
         last_x = received_odoms[-1].pose.pose.position.x
         self.assertLess(first_x, last_x, 'Robot did not move forward in x-direction')
 
-        # Verify PlanId, bounds, and monotonic non-decreasing progress across all messages
-        expected_uuid = list(plan_id.destination_session.uuid)
+        # Verify PlanId, bounds, and monotonic non-decreasing progress across all plan messages
+        plan_progress = [
+            p
+            for p in received_progress
+            if list(p.plan_id.destination_session.uuid) == expected_uuid
+        ]
+        self.assertGreater(len(plan_progress), 0, 'Expected plan Progress messages')
         prev_progress_val = 0.0
         saw_stationary_segment = False
         saw_final_segment = False
 
-        for prog in received_progress:
+        for prog in plan_progress:
             self.assertEqual(list(prog.plan_id.destination_session.uuid), expected_uuid)
             self.assertEqual(prog.plan_id.plan_version, plan_id.plan_version)
             self.assertTrue(0 <= prog.reached_waypoint <= 2)
@@ -288,6 +300,18 @@ class TestMockRobotSim(unittest.TestCase):
 
         self.assertTrue(saw_stationary_segment, 'Did not observe progress on segment 0 -> 1')
         self.assertTrue(saw_final_segment, 'Did not observe progress on segment 1 -> 2')
+
+        # Verify mode and pose fields on Progress messages
+        progress_modes = {p.mode for p in plan_progress}
+        self.assertIn(Progress.MODE_NAVIGATING, progress_modes)
+        self.assertIn(Progress.MODE_WAITING, progress_modes)
+        self.assertEqual(plan_progress[-1].mode, Progress.MODE_IDLE)
+        self.assertAlmostEqual(
+            plan_progress[-1].pose.pose.position.x, 4.0, delta=0.05
+        )
+        self.assertAlmostEqual(
+            plan_progress[-1].progress, 3.0, delta=1e-3
+        )
 
         print(
             f'Test finished. Received {len(received_odoms)} odom and '
@@ -420,6 +444,8 @@ class TestMockRobotSim(unittest.TestCase):
                 self.assertEqual(
                     sim.active_transition_action, 'custom_dock_action'
                 )
+                sim.released_waypoint_idx = 1
+                self.assertEqual(sim.determine_mode(), Progress.MODE_ACTION)
                 self.assertTrue(
                     sim.default_action_duration * 0.5
                     <= sim.active_transition_duration
