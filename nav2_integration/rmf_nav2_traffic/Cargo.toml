@@ -22,7 +22,6 @@ crossbeam = "0.8"
 crossflow = { git = "https://github.com/open-rmf/crossflow" }
 futures = "0.3"
 mapf = { git = "https://github.com/open-rmf/mapf" }
-mapf_post = { git = "https://github.com/arjo129/mapf_post" }
 nalgebra = "0.34"
 rclrs = "0.7.0"
 reqwest = { version = "0.13", features = ["json", "blocking"] }

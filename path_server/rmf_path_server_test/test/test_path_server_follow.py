@@ -287,10 +287,17 @@ class TestPathServerFollow(unittest.TestCase):
         max_x1_minus_x2 = float('-inf')
         distances = []
 
+        last_discovery_pub = 0.0
         try:
             while time.time() - start_time < timeout:
-                discovery_pub.publish(discovery_msg)
+                now = time.time()
+                if now - last_discovery_pub >= 0.5:
+                    discovery_pub.publish(discovery_msg)
+                    last_discovery_pub = now
+
                 rclpy.spin_once(self.node, timeout_sec=0.05)
+                for _ in range(50):
+                    rclpy.spin_once(self.node, timeout_sec=0.0)
 
                 if r1_positions and r2_positions:
                     pos1 = r1_positions[-1]
@@ -313,8 +320,6 @@ class TestPathServerFollow(unittest.TestCase):
                 if r1_reached and r2_reached:
                     break
 
-                time.sleep(0.05)
-
             # Asserts
             self.assertTrue(
                 r1_reached,
@@ -325,6 +330,10 @@ class TestPathServerFollow(unittest.TestCase):
                 r2_reached,
                 f'robot_2 did not reach destination (10.0, 0.0). '
                 f'Last pos: {r2_positions[-1] if r2_positions else "None"}'
+            )
+            self.assertTrue(
+                r2_plans,
+                'Expected robot_2 to receive at least one plan',
             )
 
             # Verify robot_1's plan includes departure_blockers on robot_2

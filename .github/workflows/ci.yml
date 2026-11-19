@@ -46,7 +46,7 @@ jobs:
           source /opt/ros/jazzy/setup.bash
           export ROS_LOCALHOST_ONLY=1
           export RMW_IMPLEMENTATION=${{ matrix.rmw_implementation }}
-          colcon test --executor sequential --packages-select rmf_path_server rmf_plan_executor --event-handlers console_direct+
+          colcon test --executor sequential --packages-select rmf_path_server rmf_plan_executor rmf_nav2_traffic --event-handlers console_direct+
           source install/setup.bash
           colcon test --executor sequential --packages-select rmf_path_server_test rmf_reservation_tests rmf_path_server_demo --event-handlers console_direct+
           colcon test-result --all

@@ -1159,4 +1159,93 @@ mod tests {
         progress.target_waypoint = 2;
         assert!(!registry.is_executing_action("robot_1", &progress));
     }
+
+    #[test]
+    fn test_push_or_max_blocker_deduplicates_and_retains_max_progress() {
+        let mut blockers: Vec<TrafficDependency> = Vec::new();
+        let mut plan_a = PlanId::default();
+        plan_a.destination_session.uuid = [1; 16];
+        plan_a.plan_version = 1;
+        let mut plan_b = PlanId::default();
+        plan_b.destination_session.uuid = [1; 16];
+        plan_b.plan_version = 2;
+
+        push_or_max_blocker(
+            &mut blockers,
+            TrafficDependency {
+                name: "robot_2".to_string(),
+                plan_id: plan_a.clone(),
+                required_progress: 2.0,
+            },
+        );
+        // Smaller progress for same (name, plan_id) does not overwrite
+        push_or_max_blocker(
+            &mut blockers,
+            TrafficDependency {
+                name: "robot_2".to_string(),
+                plan_id: plan_a.clone(),
+                required_progress: 1.0,
+            },
+        );
+        // Larger progress for same (name, plan_id) updates in place
+        push_or_max_blocker(
+            &mut blockers,
+            TrafficDependency {
+                name: "robot_2".to_string(),
+                plan_id: plan_a.clone(),
+                required_progress: 4.5,
+            },
+        );
+        // Different plan_id creates a distinct entry
+        push_or_max_blocker(
+            &mut blockers,
+            TrafficDependency {
+                name: "robot_2".to_string(),
+                plan_id: plan_b.clone(),
+                required_progress: 1.5,
+            },
+        );
+
+        assert_eq!(blockers.len(), 2);
+        assert_eq!(blockers[0].plan_id, plan_a);
+        assert!((blockers[0].required_progress - 4.5).abs() < 1e-5);
+        assert_eq!(blockers[1].plan_id, plan_b);
+        assert!((blockers[1].required_progress - 1.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_waypoints_compute_non_zero_intermediate_travel_headings() {
+        let registry = PlanRegistry::new();
+        let mut footprints: HashMap<String, Arc<dyn Shape>> = HashMap::new();
+        footprints.insert("robot_1".to_string(), Arc::new(Ball::new(0.49)));
+
+        let mut goals = HashMap::new();
+        goals.insert("robot_1".to_string(), make_destination(11));
+        let robot_ids = vec!["robot_1".to_string()];
+        // 4-waypoint trajectory: +Y segment (PI/2), diagonal (-2, +2) segment (3*PI/4), then -Y segment (-PI/2)
+        let basic_plan = vec![make_poses(&[
+            [0.0, 0.0],
+            [0.0, 2.0],
+            [-2.0, 4.0],
+            [-2.0, 1.0],
+        ])];
+
+        let (plans, _, _) =
+            registry.build_session_plans(&basic_plan, &goals, &robot_ids, &footprints, 1.0);
+        let plan = plans.get("robot_1").unwrap();
+        assert_eq!(plan.waypoints.len(), 4);
+
+        let ori_0 = &plan.waypoints[0].arrival_constraints.regions[0].orientations[0];
+        assert!((ori_0.orientation_radians - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        assert!((ori_0.tolerance_radians - std::f32::consts::PI).abs() < 1e-5);
+
+        let ori_1 = &plan.waypoints[1].arrival_constraints.regions[0].orientations[0];
+        assert!((ori_1.orientation_radians - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        assert!((ori_1.tolerance_radians - std::f32::consts::PI).abs() < 1e-5);
+
+        let ori_2 = &plan.waypoints[2].arrival_constraints.regions[0].orientations[0];
+        let expected_diag = (2.0f32).atan2(-2.0f32);
+        assert!((ori_2.orientation_radians - expected_diag).abs() < 1e-5);
+        assert!((ori_2.tolerance_radians - std::f32::consts::PI).abs() < 1e-5);
+    }
 }

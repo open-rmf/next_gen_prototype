@@ -197,7 +197,7 @@ impl PlanExecutorRosNode {
                 let topic = format!("{robot_id}/plan/error");
                 match self
                     .node
-                    .create_publisher(topic.as_str().transient_local().reliable())
+                    .create_publisher(topic.as_str().transient_local().reliable().keep_last(1))
                 {
                     Ok(publisher) => entry.insert(publisher),
                     Err(err) => {

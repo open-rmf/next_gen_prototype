@@ -205,3 +205,65 @@ fn test_progress_subscription() -> Result<(), Box<dyn std::error::Error>> {
 
     Err("Timeout waiting for progress in PlanServer".into())
 }
+
+#[test]
+fn test_stale_plan_error_is_ignored() -> Result<(), Box<dyn std::error::Error>> {
+    use ros_env::rmf_prototype_msgs::msg::{Plan, PlanError, PlanId, Waypoint};
+
+    let context = common::isolated_context()?;
+    let mut executor = context.create_basic_executor();
+    let server_node = Arc::new(executor.create_node("test_path_server_plan_error")?);
+    let test_node = Arc::new(executor.create_node("test_plan_error_pub_node")?);
+
+    let received_map = Arc::new(Mutex::new(None));
+    let planner = TestPlanner { received_map };
+    let path_server_guard = start_path_server(Arc::clone(&server_node), planner)?;
+
+    let robot_id = "robot1";
+    let mut active_plan_id = PlanId::default();
+    active_plan_id.destination_session.uuid = [5; 16];
+    active_plan_id.plan_version = 3;
+
+    let mut active_plan = Plan::default();
+    active_plan.plan_id = active_plan_id.clone();
+    active_plan.waypoints = vec![Waypoint::default()];
+
+    let mut dest = Destination::default();
+    dest.session.uuid = [5; 16];
+
+    let active_plan_clone = active_plan.clone();
+    let dest_clone = dest.clone();
+    let _ = path_server_guard.destinations_worker.run(move |server| {
+        let mut plans = HashMap::new();
+        plans.insert(robot_id.to_string(), active_plan_clone);
+        server.plan_registry.record_session_plans(&plans);
+        server
+            .active_destinations
+            .insert(robot_id.to_string(), dest_clone);
+        server.pending_replans.clear();
+
+        // Stale PlanError from an older plan version must NOT enqueue a replan
+        let mut stale_err = PlanError::default();
+        stale_err.error.code = PlanError::CODE_PATH_BLOCKED;
+        stale_err.plan_id.destination_session.uuid = [5; 16];
+        stale_err.plan_id.plan_version = 2;
+        server.handle_plan_error(robot_id, stale_err);
+        assert!(
+            !server.pending_replans.contains(robot_id),
+            "Stale PlanError should be ignored"
+        );
+
+        // Matching PlanError for the active plan version MUST enqueue a replan
+        let mut matching_err = PlanError::default();
+        matching_err.error.code = PlanError::CODE_PATH_BLOCKED;
+        matching_err.plan_id = active_plan_id;
+        server.handle_plan_error(robot_id, matching_err);
+        assert!(
+            server.pending_replans.contains(robot_id),
+            "Active-plan PlanError should enqueue a replan"
+        );
+    });
+    executor.spin(SpinOptions::spin_once().timeout(std::time::Duration::from_millis(50)));
+    let _ = test_node;
+    Ok(())
+}

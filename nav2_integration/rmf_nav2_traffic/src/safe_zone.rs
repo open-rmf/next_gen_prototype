@@ -7,20 +7,29 @@ use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
 use ros_env::{
     geometry_msgs::msg::PoseStamped,
     nav2_msgs::msg::Costmap,
-    rmf_prototype_msgs::msg::{Plan, PlanError, PlanId, Progress, Region, SafeZone, SafeZoneId},
+    rmf_prototype_msgs::msg::{
+        Plan, PlanError, PlanId, Progress, Region, SafeZone, SafeZoneId, TargetOrientation,
+    },
 };
 use std::{collections::VecDeque, sync::Arc};
+
+/// Ordering label for SafeZone and local-plan ingestion systems in `PreUpdate`.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SafeZoneSystems;
 
 #[derive(Component)]
 pub struct SafeZoneSubscription {
     pub subscriber: Arc<RosSubscription<SafeZone>>,
 }
 
+/// Subscription to `{robot}/plan` used to project continuous robot poses onto the
+/// multi-waypoint trajectory of the active `Plan`.
 #[derive(Component)]
 pub struct PlanSubscription {
     pub subscriber: Arc<RosSubscription<Plan>>,
 }
 
+/// Bounded per-agent cache of recent `Plan` messages keyed by `PlanId`.
 #[derive(Component, Debug, Clone, Default)]
 pub struct LocalPlanRegistry {
     entries: VecDeque<Plan>,
@@ -63,6 +72,8 @@ pub fn shortest_angular_distance(a: f32, b: f32) -> f32 {
     diff.min(std::f32::consts::TAU - diff)
 }
 
+/// Tracks monotonic waypoint and continuous `progress` along the active `Plan`
+/// and `SafeZone` segment for traffic dependency release.
 #[derive(Component, Debug, Clone, Default)]
 pub struct ProgressTracker {
     pub plan_id: Option<PlanId>,
@@ -78,7 +89,28 @@ pub struct ProgressTracker {
     pub target_yaw_tolerance: f32,
 }
 
+fn resolve_target_orientation(safe_zone: &SafeZone) -> Option<&TargetOrientation> {
+    safe_zone
+        .incremental_target
+        .nodes
+        .iter()
+        .find_map(|n| n.orientations.first())
+        .or_else(|| {
+            safe_zone
+                .incremental_target
+                .regions
+                .iter()
+                .find_map(|r| r.orientations.first())
+        })
+}
+
 impl ProgressTracker {
+    const MAX_SEGMENT_LOOKAHEAD: usize = 3;
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
     fn extract_plan_waypoints(plan: &Plan) -> Vec<([f32; 2], f32)> {
         plan.waypoints
             .iter()
@@ -108,25 +140,23 @@ impl ProgressTracker {
     }
 
     fn extract_orientation_constraint(safe_zone: &SafeZone) -> (Option<f32>, f32) {
-        let ori = safe_zone
-            .incremental_target
-            .regions
-            .first()
-            .and_then(|r| r.orientations.first())
-            .or_else(|| {
-                safe_zone
-                    .incremental_target
-                    .nodes
-                    .first()
-                    .and_then(|n| n.orientations.first())
-            });
-        let Some(ori) = ori else {
+        let Some(ori) = resolve_target_orientation(safe_zone) else {
             return (None, std::f32::consts::PI);
         };
-        let effective_tol = if ori.tolerance_radians <= 0.0 && ori.spread_radians <= 0.0 {
+        let spread = if ori.spread_radians.is_finite() {
+            ori.spread_radians.max(0.0)
+        } else {
+            0.0
+        };
+        let tol = if ori.tolerance_radians.is_finite() {
+            ori.tolerance_radians.max(0.0)
+        } else {
+            0.0
+        };
+        let effective_tol = if tol <= 0.0 && spread <= 0.0 {
             0.25
         } else {
-            0.5 * ori.spread_radians.max(0.0) + ori.tolerance_radians.max(0.0)
+            spread + tol
         };
         if effective_tol < std::f32::consts::PI - 1e-3 {
             (Some(ori.orientation_radians), effective_tol)
@@ -280,11 +310,7 @@ impl ProgressTracker {
                 let seg_len_sq = dx * dx + dy * dy;
                 let prog_span = (self.target_progress - start_prog).max(0.0);
                 let wp_span = (self.target_waypoint - self.start_waypoint) as f32;
-                let pre_final_cap = if self.target_yaw.is_some() {
-                    (self.target_progress - 1e-3).max(start_prog)
-                } else {
-                    self.target_progress
-                };
+                let pre_final_cap = (self.target_progress - 1e-3).max(start_prog);
 
                 if pos_reached && !ori_reached {
                     let pre_rot_wp = self
@@ -301,7 +327,7 @@ impl ProgressTracker {
                         }
                     });
                     let interp = if seg_len_sq > 1e-6 {
-                        pre_final_cap.max(pre_rot_prog).min(pre_final_cap)
+                        pre_final_cap
                     } else {
                         pre_rot_prog.min(pre_final_cap)
                     };
@@ -314,6 +340,7 @@ impl ProgressTracker {
                     let mut best_seg: Option<(f32, usize, f32, f32)> = None;
 
                     if !self.plan_waypoints.is_empty() && search_start < target_idx {
+                        let mut non_zero_scanned = 0usize;
                         for i in search_start..target_idx {
                             let (p0, prog0) = self.plan_waypoints[i];
                             let (p1, prog1) = self.plan_waypoints[i + 1];
@@ -323,6 +350,10 @@ impl ProgressTracker {
                             if slen_sq <= 1e-6 {
                                 continue;
                             }
+                            if non_zero_scanned >= Self::MAX_SEGMENT_LOOKAHEAD {
+                                break;
+                            }
+                            non_zero_scanned += 1;
                             let t = (((rx - p0[0]) * sdx + (ry - p0[1]) * sdy) / slen_sq)
                                 .clamp(0.0, 1.0);
                             let proj_x = p0[0] + t * sdx;
@@ -352,6 +383,15 @@ impl ProgressTracker {
                                 seg_wp.min(self.target_waypoint.saturating_sub(1));
                             reached_waypoint = reached_waypoint.max(intermediate_wp);
                         }
+                    } else if !self.plan_waypoints.is_empty() {
+                        let hold_wp = reached_waypoint
+                            .max(self.start_waypoint)
+                            .min(self.target_waypoint.saturating_sub(1));
+                        let hold_prog = self
+                            .waypoint_progress(hold_wp)
+                            .unwrap_or(start_prog)
+                            .clamp(start_prog, pre_final_cap);
+                        progress = progress.max(hold_prog).min(self.target_progress);
                     } else if seg_len_sq > 1e-6 {
                         let t = (((rx - sx) * dx + (ry - sy) * dy) / seg_len_sq).clamp(0.0, 1.0);
                         let interp = (start_prog + t * prog_span).min(pre_final_cap);
@@ -456,11 +496,7 @@ impl CurrentSafeZone {
         if let (Some(cur_yaw), Some(other_yaw)) =
             (Self::get_orientation(current), Self::get_orientation(other))
         {
-            let diff = (cur_yaw - other_yaw)
-                .abs()
-                .rem_euclid(std::f32::consts::TAU);
-            let norm_diff = diff.min(std::f32::consts::TAU - diff);
-            if norm_diff > 0.05 {
+            if shortest_angular_distance(cur_yaw, other_yaw) > 0.05 {
                 return true;
             }
         }
@@ -469,18 +505,7 @@ impl CurrentSafeZone {
     }
 
     fn get_orientation(safe_zone: &SafeZone) -> Option<f32> {
-        safe_zone
-            .incremental_target
-            .regions
-            .first()
-            .and_then(|r| r.orientations.first().map(|o| o.orientation_radians))
-            .or_else(|| {
-                safe_zone
-                    .incremental_target
-                    .nodes
-                    .first()
-                    .and_then(|n| n.orientations.first().map(|o| o.orientation_radians))
-            })
+        resolve_target_orientation(safe_zone).map(|o| o.orientation_radians)
     }
 
     pub fn distancesq_to_target(&self, other: &SafeZone) -> f64 {
@@ -526,7 +551,9 @@ impl Plugin for SafeZoneSubscriptionPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             PreUpdate,
-            (update_local_plans, update_incremental_target).chain(),
+            (update_local_plans, update_incremental_target)
+                .chain()
+                .in_set(SafeZoneSystems),
         )
         .add_observer(create_safe_zone_subscriber)
         .add_observer(create_costmap_publisher)
@@ -670,9 +697,9 @@ fn update_incremental_target(
         let Some(safe_zone) = safe_zone_sub.subscriber.data_callback() else {
             continue;
         };
-        //if current_safe_zone.matches(&safe_zone) {
-        //    continue;
-        //}
+        if current_safe_zone.matches(&safe_zone) {
+            continue;
+        }
 
         // Call updateCosts() before setting new inner nav target
         let Ok(_) = costmap_pub.publisher.publish(safe_zone.costmap.clone()) else {
@@ -689,7 +716,8 @@ fn update_incremental_target(
             continue;
         };
 
-        let current_pose = amcl_pose.map(|p| p.xy_yaw());
+        let localized_pose = amcl_pose.filter(|_| agent.localized);
+        let current_pose = localized_pose.map(|p| p.xy_yaw());
 
         // Publish progress
         let matching_plan = local_plans.get(&safe_zone.id.plan_id);
@@ -699,7 +727,7 @@ fn update_incremental_target(
             current_pose,
             latest_progress.0.as_ref(),
         );
-        let pose = amcl_pose
+        let pose = localized_pose
             .map(|p| PoseStamped {
                 header: p.0.header.clone(),
                 pose: p.0.pose.pose.clone(),
@@ -711,11 +739,13 @@ fn update_incremental_target(
             Some(&base_progress),
             Some(&safe_zone.id),
         );
-        let Ok(_) = progress_pub.publisher.publish(progress_msg.clone()) else {
-            error!("Failed to publish progress for agent [{}]", agent.name);
-            continue;
-        };
-        latest_progress.0 = Some(progress_msg);
+        if latest_progress.0.as_ref() != Some(&progress_msg) {
+            let Ok(_) = progress_pub.publisher.publish(progress_msg.clone()) else {
+                error!("Failed to publish progress for agent [{}]", agent.name);
+                continue;
+            };
+            latest_progress.0 = Some(progress_msg);
+        }
 
         if !current_safe_zone.should_update_target(&safe_zone) {
             continue;
@@ -814,7 +844,7 @@ fn next_target(safe_zone: &SafeZone) -> Option<(f32, f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ros_env::rmf_prototype_msgs::msg::{TargetOrientation, TargetRegion};
+    use ros_env::rmf_prototype_msgs::msg::{TargetNode, TargetOrientation, TargetRegion, Waypoint};
 
     fn safe_zone(
         session: u8,
@@ -973,8 +1003,6 @@ mod tests {
 
     #[test]
     fn progress_tracker_does_not_overreport_when_target_has_duplicate_hold_waypoints() {
-        use ros_env::rmf_prototype_msgs::msg::Waypoint;
-
         let mut tracker = ProgressTracker::default();
         let mut sz = safe_zone(1, 0, 1, 5.0, 0.0);
         sz.last_waypoint = 0;
@@ -1017,8 +1045,6 @@ mod tests {
 
     #[test]
     fn progress_tracker_handles_non_unit_waypoint_spacing() {
-        use ros_env::rmf_prototype_msgs::msg::Waypoint;
-
         // 1. SafeZone-only fallback with waypoints spaced 2m apart at X = 0, 2, 4, 6
         // (start_waypoint = 0, target_waypoint = 3, target_progress = 3.0).
         // A robot at X = 2.0 (or 2.1) has only reached waypoint 1, NOT waypoint 2.
@@ -1157,5 +1183,212 @@ mod tests {
         let p_done = tracker.compute_progress(Some((1.0, 0.0, std::f32::consts::PI)), Some(&p0));
         assert_eq!(p_done.reached_waypoint, 1);
         assert!((p_done.progress - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn local_plan_registry_overwrites_in_place_and_evicts_oldest() {
+        let mut reg = LocalPlanRegistry::default();
+        for v in 0..20u64 {
+            let mut plan = Plan::default();
+            plan.plan_id.plan_version = v;
+            plan.waypoints = vec![Waypoint {
+                progress: v as f32,
+                ..Default::default()
+            }];
+            reg.insert(plan);
+        }
+
+        // First 4 versions (0..4) were evicted; 4..20 remain
+        let mut lookup = PlanId::default();
+        lookup.plan_version = 3;
+        assert!(reg.get(&lookup).is_none());
+        lookup.plan_version = 4;
+        assert!(reg.get(&lookup).is_some());
+
+        // Inserting an existing PlanId updates in place without evicting version 4
+        let mut updated = Plan::default();
+        updated.plan_id.plan_version = 10;
+        updated.waypoints = vec![Waypoint {
+            progress: 99.0,
+            ..Default::default()
+        }];
+        reg.insert(updated);
+        assert!(reg.get(&lookup).is_some());
+        lookup.plan_version = 10;
+        assert!((reg.get(&lookup).unwrap().waypoints[0].progress - 99.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn shortest_angular_distance_and_mark_target_reached_behave_correctly() {
+        assert!((shortest_angular_distance(0.1, -0.1) - 0.2).abs() < 1e-5);
+        assert!(
+            (shortest_angular_distance(std::f32::consts::PI - 0.1, -std::f32::consts::PI + 0.1)
+                - 0.2)
+                .abs()
+                < 1e-5
+        );
+        assert!((shortest_angular_distance(0.0, std::f32::consts::TAU) - 0.0).abs() < 1e-5);
+
+        let mut tracker = ProgressTracker::default();
+        assert!(tracker.mark_target_reached(None).is_none());
+
+        let mut sz = safe_zone(1, 2, 0, 3.0, 0.0);
+        sz.target_waypoint = vec![3].try_into().unwrap();
+        sz.target_progress = 3.0;
+        let _ = tracker.on_safe_zone(&sz, Some((0.0, 0.0, 0.0)), None);
+        let prev = Progress {
+            plan_id: sz.id.plan_id.clone(),
+            reached_waypoint: 4,
+            progress: 4.5,
+            ..Default::default()
+        };
+        let marked = tracker.mark_target_reached(Some(&prev)).unwrap();
+        assert_eq!(marked.reached_waypoint, 4);
+        assert!((marked.progress - 4.5).abs() < 1e-5);
+
+        tracker.clear();
+        assert!(tracker.plan_id.is_none());
+    }
+
+    #[test]
+    fn progress_tracker_caps_pre_final_progress_when_laterally_offset_even_without_yaw_constraint()
+    {
+        let mut tracker = ProgressTracker::default();
+        let mut sz = safe_zone(1, 0, 1, 2.0, 0.0);
+        sz.last_waypoint = 0;
+        sz.target_waypoint = vec![2].try_into().unwrap();
+        sz.target_progress = 2.0;
+        sz.incremental_target.regions[0].tolerance = 0.25;
+        // Unconstrained yaw (target_yaw == None)
+        sz.incremental_target.regions[0].orientations = vec![TargetOrientation {
+            orientation_radians: 0.0,
+            spread_radians: 0.0,
+            tolerance_radians: std::f32::consts::PI,
+        }];
+
+        let p0 = tracker.on_safe_zone(&sz, Some((0.0, 0.0, 0.0)), None);
+        assert!(tracker.target_yaw.is_none());
+
+        // Robot is at X = 2.0 (t = 1.0 along segment) but laterally offset by Y = 0.5m (> 0.25m tolerance)
+        let p_offset = tracker.compute_progress(Some((2.0, 0.5, 0.0)), Some(&p0));
+        assert_eq!(p_offset.reached_waypoint, 1);
+        assert!(
+            p_offset.progress < 2.0,
+            "Laterally offset robot must not report target_progress=2.0 before entering tolerance, got {}",
+            p_offset.progress
+        );
+    }
+
+    #[test]
+    fn progress_tracker_holds_on_trailing_duplicate_waypoints_and_bounds_uturn_lookahead() {
+        // 1. Trailing duplicate hold waypoints with lateral offset must NOT jump via straight-chord fallback
+        let mut tracker = ProgressTracker::default();
+        let mut sz = safe_zone(1, 0, 1, 2.0, 0.0);
+        sz.last_waypoint = 1;
+        sz.target_waypoint = vec![3].try_into().unwrap();
+        sz.target_progress = 3.0;
+        sz.incremental_target.regions[0].tolerance = 0.25;
+
+        let mut plan = Plan::default();
+        plan.plan_id = sz.id.plan_id.clone();
+        // Waypoints 1, 2, 3 are all stationary holds at (2.0, 0.0) with progresses 1.0, 2.0, 3.0
+        for (pos, prog) in [
+            ([0.0, 0.0], 0.0),
+            ([2.0, 0.0], 1.0),
+            ([2.0, 0.0], 2.0),
+            ([2.0, 0.0], 3.0),
+        ] {
+            plan.waypoints.push(Waypoint {
+                position: pos,
+                progress: prog,
+                ..Default::default()
+            });
+        }
+
+        // Robot starts slightly off (2.0, 0.0) at (1.5, 0.4) outside 0.25m tolerance
+        let p0 = tracker.on_safe_zone_with_plan(&sz, Some(&plan), Some((1.5, 0.4, 0.0)), None);
+        let p1 = tracker.compute_progress(Some((2.0, 0.4, 0.0)), Some(&p0));
+        assert_eq!(p1.reached_waypoint, 1);
+        assert!(
+            (p1.progress - 1.0).abs() < 1e-4,
+            "Expected progress to hold at 1.0 across zero-length hold span until arrival, got {}",
+            p1.progress
+        );
+
+        // 2. U-turn trajectory: outbound (0,0)->(2,0)->(4,0)->(6,0)->(6,0.2) then return ->(0,0.2).
+        // A robot near (0.1, 0.18) at start_waypoint=0 must project onto outbound segment 0, NOT jump
+        // to the return leg 4 segments ahead!
+        let mut uturn_tracker = ProgressTracker::default();
+        let mut uturn_sz = safe_zone(2, 0, 1, 0.0, 0.2);
+        uturn_sz.last_waypoint = 0;
+        uturn_sz.target_waypoint = vec![5].try_into().unwrap();
+        uturn_sz.target_progress = 5.0;
+        uturn_sz.incremental_target.regions[0].tolerance = 0.05;
+
+        let mut uturn_plan = Plan::default();
+        uturn_plan.plan_id = uturn_sz.id.plan_id.clone();
+        for (i, pos) in [
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [4.0, 0.0],
+            [6.0, 0.0],
+            [6.0, 0.2],
+            [0.0, 0.2],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            uturn_plan.waypoints.push(Waypoint {
+                position: pos,
+                progress: i as f32,
+                ..Default::default()
+            });
+        }
+
+        let u0 = uturn_tracker.on_safe_zone_with_plan(
+            &uturn_sz,
+            Some(&uturn_plan),
+            Some((0.1, 0.18, 0.0)),
+            None,
+        );
+        assert_eq!(u0.reached_waypoint, 0);
+        assert!(
+            u0.progress < 0.2,
+            "Bounded segment lookahead must prevent jumping onto return leg, got {}",
+            u0.progress
+        );
+    }
+
+    #[test]
+    fn orientation_constraint_respects_spread_half_width_and_node_precedence() {
+        let mut tracker = ProgressTracker::default();
+        let mut sz = safe_zone(1, 0, 1, 1.0, 0.0);
+        sz.target_waypoint = vec![1].try_into().unwrap();
+        sz.target_progress = 1.0;
+        sz.incremental_target.regions[0].tolerance = 0.25;
+        // Region says yaw = 0.0 unconstrained (tol = PI), while Node overrides with yaw = PI, spread = PI/2
+        sz.incremental_target.regions[0].orientations = vec![TargetOrientation {
+            orientation_radians: 0.0,
+            spread_radians: 0.0,
+            tolerance_radians: std::f32::consts::PI,
+        }];
+        sz.incremental_target.nodes.push(TargetNode {
+            orientations: vec![TargetOrientation {
+                orientation_radians: std::f32::consts::PI,
+                spread_radians: std::f32::consts::FRAC_PI_2,
+                tolerance_radians: 0.0,
+            }],
+            ..Default::default()
+        });
+
+        // Facing yaw = 0.0 is outside PI +/- PI/2 -> must NOT complete!
+        let p_blocked = tracker.on_safe_zone(&sz, Some((1.0, 0.0, 0.0)), None);
+        assert_eq!(p_blocked.reached_waypoint, 0);
+        assert!(p_blocked.progress < 1.0);
+
+        // Facing yaw = 2.0 rad (within PI/2 of PI) satisfies spread half-width -> completes!
+        let p_ok = tracker.compute_progress(Some((1.0, 0.0, 2.0)), Some(&p_blocked));
+        assert_eq!(p_ok.reached_waypoint, 1);
+        assert!((p_ok.progress - 1.0).abs() < 1e-4);
     }
 }

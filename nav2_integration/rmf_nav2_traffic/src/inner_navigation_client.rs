@@ -297,8 +297,10 @@ impl InnerNavigationServices {
                 async_monitor_new_navigation_request.input,
             );
 
-            // On completed navigation request, check goal status code and process accordingly
-            // Aborted -> retry, Cancelled -> publish cancellation to outer workflow, Succeeded -> do nothing
+            // On completed navigation request, check goal status code and process accordingly:
+            // Aborted -> publish CODE_PATH_BLOCKED to trigger replanning,
+            // Cancelled -> publish cancellation to outer workflow,
+            // Succeeded -> advance progress when target pose is satisfied.
             // Then connect to cleanup existing goal client data
             builder.connect(
                 async_monitor_new_navigation_request.output,
@@ -306,10 +308,7 @@ impl InnerNavigationServices {
             );
             let (post_nav_fork_result_input, post_nav_fork_result) = builder.create_fork_result();
             builder.connect(post_nav_processing.output, post_nav_fork_result_input);
-            // If goal was aborted, retry navigation by requesting new goal
-            // Goal client will be updated in a downstream node
             builder.connect(post_nav_fork_result.ok, async_request_new_goal.input);
-            // Otherwise, cleanup goal client
             builder.connect(post_nav_fork_result.err, cleanup_goal_client.input);
 
             // Connect errors to logging node
@@ -733,9 +732,9 @@ fn async_monitor_ongoing_navigation(
 }
 
 /// Evaluates the outcome of a completed or failed navigation goal.
-/// If a goal is aborted (and is not stale), it retries the goal.
-/// If a goal is cancelled via external request, it marks the cancellation as
-/// successful and publish to external navigation workflow.
+/// If a current goal is aborted, it publishes `PlanError::CODE_PATH_BLOCKED` so
+/// the path server can replan. If a goal is cancelled via external request, it
+/// marks the cancellation as successful for the outer navigation workflow.
 fn process_navigation_result(
     Blocking {
         request: result, ..
