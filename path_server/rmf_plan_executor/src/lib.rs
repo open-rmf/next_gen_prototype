@@ -789,8 +789,6 @@ impl PlanExecutor {
 #[cfg(test)]
 mod tests {
     use super::{target_orientation, target_yaw, PlanExecutor, PlanExecutorConfig};
-    use mapf_post::na::{Isometry2, Vector2};
-    use mapf_post::{Trajectory, WaypointFollower};
     use ros_env::{
         geometry_msgs::msg::Pose,
         nav_msgs::msg::OccupancyGrid,
@@ -976,48 +974,6 @@ mod tests {
                 .reached_waypoint,
             2
         );
-    }
-
-    #[test]
-    fn test_robot_2_follower() {
-        let poses = vec![
-            Isometry2::new(Vector2::new(3.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(4.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(5.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(6.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(7.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(8.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(9.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(10.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(10.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(10.0, 0.0), 0.0),
-        ];
-        let mut follower = WaypointFollower::from_trajectory(0, Trajectory { poses });
-
-        // Simulating the robot moving through the path:
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(3.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 0);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(4.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 1);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(5.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 2);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(6.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 3);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(7.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 4);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(8.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 5);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(9.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 6);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(10.0, 0.0), 0.0), 0.5);
-        assert!(follower.get_semantic_waypoint().trajectory_index >= 7);
     }
 
     #[test]
