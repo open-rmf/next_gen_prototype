@@ -17,7 +17,7 @@ use ros_env::{
     nav_msgs::msg::OccupancyGrid,
     rmf_prototype_msgs::{
         self,
-        msg::{Destination, Plan, PlanError, Progress},
+        msg::{Destination, Plan, PlanError, PlanId, Progress},
     },
 };
 use std::{
@@ -278,6 +278,17 @@ impl<P: MapfPlanner> PlanServer<P> {
 
     pub fn handle_plan_error(&mut self, robot_id: &str, msg: PlanError) {
         if msg.error.code == PlanError::CODE_PATH_BLOCKED {
+            let active_plan_id = self.plan_registry.get_plan(robot_id).map(|p| &p.plan_id);
+            if msg.plan_id != PlanId::default() && active_plan_id != Some(&msg.plan_id) {
+                rclrs::log_debug!(
+                    self.node.logger(),
+                    "Ignoring stale CODE_PATH_BLOCKED for robot {} (error plan_version={}, active={:?})",
+                    robot_id,
+                    msg.plan_id.plan_version,
+                    active_plan_id.map(|id| id.plan_version)
+                );
+                return;
+            }
             rclrs::log_warn!(
                 self.node.logger(),
                 "Received CODE_PATH_BLOCKED for robot {}. Enqueuing replan...",
@@ -635,7 +646,11 @@ pub fn start_path_server<P: MapfPlanner + 'static>(
                 let plan_error_sub = match server
                     .destinations_worker
                     .create_subscription::<PlanError, _>(
-                        plan_error_topic.as_str(),
+                        plan_error_topic
+                            .as_str()
+                            .transient_local()
+                            .reliable()
+                            .keep_last(1),
                         move |dest_server: &mut PlanServer<P>, error_msg: PlanError| {
                             dest_server.handle_plan_error(&robot_id_clone3, error_msg);
                         },

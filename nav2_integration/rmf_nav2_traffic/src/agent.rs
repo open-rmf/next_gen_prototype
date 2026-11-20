@@ -1,6 +1,9 @@
 use crate::{
     navigation_server::CurrentNavigationRequest,
-    safe_zone::{build_progress_status, CurrentSafeZone, LatestProgress, ProgressPublisher},
+    safe_zone::{
+        build_progress_status, CurrentSafeZone, LatestProgress, ProgressPublisher, ProgressTracker,
+        SafeZoneSystems,
+    },
 };
 use bevy::prelude::*;
 use bevy_ros2::{RclrsNode, RosPublisher, RosSubscription};
@@ -51,6 +54,17 @@ impl Nav2Agent {
 #[derive(Component)]
 pub struct AmclPose(pub PoseWithCovarianceStamped);
 
+impl AmclPose {
+    pub fn xy_yaw(&self) -> (f32, f32, f32) {
+        let pos = &self.0.pose.pose.position;
+        let q = &self.0.pose.pose.orientation;
+        let siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+        let cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+        let yaw = siny_cosp.atan2(cosy_cosp) as f32;
+        (pos.x as f32, pos.y as f32, yaw)
+    }
+}
+
 #[derive(Component)]
 pub struct AmclPoseSubscription {
     pub subscriber: Arc<RosSubscription<PoseWithCovarianceStamped>>,
@@ -83,7 +97,7 @@ pub struct Nav2AgentPlugin {}
 impl Plugin for Nav2AgentPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DiscoveryPublisher>()
-            .add_systems(PreUpdate, update_amcl_pose)
+            .add_systems(PreUpdate, update_amcl_pose.before(SafeZoneSystems))
             .add_observer(create_amcl_pose_subscriber)
             .add_observer(publish_discovery);
     }
@@ -125,7 +139,8 @@ fn update_amcl_pose(
         &AmclPoseSubscription,
         &OdomPublisher,
         Option<&ProgressPublisher>,
-        Option<&LatestProgress>,
+        Option<&mut LatestProgress>,
+        Option<&mut ProgressTracker>,
         Option<&CurrentSafeZone>,
         Option<&CurrentNavigationRequest>,
     )>,
@@ -136,14 +151,17 @@ fn update_amcl_pose(
         amcl_pose_sub,
         odom_pub,
         progress_pub,
-        latest_progress,
+        mut latest_progress,
+        mut progress_tracker,
         current_safe_zone,
         current_nav_req,
     ) in agents.iter_mut()
     {
-        if let Some(amcl_pose_msg) = amcl_pose_sub.subscriber.data_callback() {
-            amcl_pose.0 = amcl_pose_msg.clone();
+        let mut has_new_pose = false;
+        if let Some(amcl_pose_msg) = amcl_pose_sub.subscriber.take_data() {
+            amcl_pose.0 = amcl_pose_msg;
             agent.localized = true;
+            has_new_pose = true;
         }
         if !agent.localized {
             continue;
@@ -156,6 +174,18 @@ fn update_amcl_pose(
         odom.twist = TwistWithCovariance::default();
         let _ = odom_pub.publisher.publish(odom);
 
+        let prev_published = latest_progress.as_ref().and_then(|lp| lp.0.clone());
+        let current_pose = Some(amcl_pose.xy_yaw());
+        let computed_prog = match (progress_tracker.as_deref_mut(), prev_published.as_ref()) {
+            (Some(tracker), prev)
+                if tracker.plan_id.is_some()
+                    && (has_new_pose || tracker.has_pending_plan_recompute()) =>
+            {
+                Some(tracker.compute_progress(current_pose, prev))
+            }
+            (_, prev) => prev.cloned(),
+        };
+
         if let Some(progress_pub) = progress_pub {
             let pose = PoseStamped {
                 header: amcl_pose.0.header.clone(),
@@ -166,10 +196,18 @@ fn update_amcl_pose(
             } else {
                 Progress::MODE_IDLE
             };
-            let prog = latest_progress.and_then(|lp| lp.0.as_ref());
             let sz_id = current_safe_zone.and_then(|csz| csz.0.as_ref().map(|sz| &sz.id));
-            let progress_msg = build_progress_status(pose, mode, prog, sz_id);
-            let _ = progress_pub.publisher.publish(progress_msg);
+            let progress_msg = build_progress_status(pose, mode, computed_prog.as_ref(), sz_id);
+            if has_new_pose || prev_published.as_ref() != Some(&progress_msg) {
+                let _ = progress_pub.publisher.publish(progress_msg.clone());
+                if let Some(latest_prog) = latest_progress.as_deref_mut() {
+                    latest_prog.0 = Some(progress_msg);
+                }
+            }
+        } else if let (Some(latest_prog), Some(prog)) =
+            (latest_progress.as_deref_mut(), computed_prog)
+        {
+            latest_prog.0 = Some(prog);
         }
     }
 }
@@ -187,4 +225,24 @@ fn publish_discovery(
         });
     }
     let _ = publisher.publisher.publish(msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amcl_pose_xy_yaw_extracts_position_and_yaw_from_quaternion() {
+        let mut msg = PoseWithCovarianceStamped::default();
+        msg.pose.pose.position.x = 3.5;
+        msg.pose.pose.position.y = -1.25;
+        let half_yaw = std::f64::consts::FRAC_PI_4; // yaw = PI/2
+        msg.pose.pose.orientation.z = half_yaw.sin();
+        msg.pose.pose.orientation.w = half_yaw.cos();
+
+        let (x, y, yaw) = AmclPose(msg).xy_yaw();
+        assert!((x - 3.5).abs() < 1e-5);
+        assert!((y - (-1.25)).abs() < 1e-5);
+        assert!((yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+    }
 }

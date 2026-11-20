@@ -1,4 +1,11 @@
-use crate::{safe_zone::PlanErrorPublisher, Nav2Agent};
+use crate::{
+    agent::AmclPose,
+    safe_zone::{
+        build_progress_status, CurrentSafeZone, LatestProgress, PlanErrorPublisher,
+        ProgressPublisher, ProgressTracker,
+    },
+    Nav2Agent,
+};
 use bevy::prelude::*;
 use bevy_ros2::{RclrsExecutorCommands, RclrsNode, RosActionClient};
 use crossflow::{prelude::*, service::Service};
@@ -290,8 +297,10 @@ impl InnerNavigationServices {
                 async_monitor_new_navigation_request.input,
             );
 
-            // On completed navigation request, check goal status code and process accordingly
-            // Aborted -> retry, Cancelled -> publish cancellation to outer workflow, Succeeded -> do nothing
+            // On completed navigation request, check goal status code and process accordingly:
+            // Aborted -> publish CODE_PATH_BLOCKED to trigger replanning,
+            // Cancelled -> publish cancellation to outer workflow,
+            // Succeeded -> advance progress when target pose is satisfied.
             // Then connect to cleanup existing goal client data
             builder.connect(
                 async_monitor_new_navigation_request.output,
@@ -299,10 +308,7 @@ impl InnerNavigationServices {
             );
             let (post_nav_fork_result_input, post_nav_fork_result) = builder.create_fork_result();
             builder.connect(post_nav_processing.output, post_nav_fork_result_input);
-            // If goal was aborted, retry navigation by requesting new goal
-            // Goal client will be updated in a downstream node
             builder.connect(post_nav_fork_result.ok, async_request_new_goal.input);
-            // Otherwise, cleanup goal client
             builder.connect(post_nav_fork_result.err, cleanup_goal_client.input);
 
             // Connect errors to logging node
@@ -726,9 +732,9 @@ fn async_monitor_ongoing_navigation(
 }
 
 /// Evaluates the outcome of a completed or failed navigation goal.
-/// If a goal is aborted (and is not stale), it retries the goal.
-/// If a goal is cancelled via external request, it marks the cancellation as
-/// successful and publish to external navigation workflow.
+/// If a current goal is aborted, it publishes `PlanError::CODE_PATH_BLOCKED` so
+/// the path server can replan. If a goal is cancelled via external request, it
+/// marks the cancellation as successful for the outer navigation workflow.
 fn process_navigation_result(
     Blocking {
         request: result, ..
@@ -736,9 +742,54 @@ fn process_navigation_result(
     mut cancelling_inner: Query<&mut CancellingInnerNavigation>,
     inner_nav_clients: Query<&InnerNavigationClient>,
     plan_error_publishers: Query<&PlanErrorPublisher>,
+    mut progress_query: Query<(
+        &ProgressTracker,
+        &mut LatestProgress,
+        &ProgressPublisher,
+        Option<&AmclPose>,
+        Option<&CurrentSafeZone>,
+    )>,
 ) -> Result<InnerNavigationRequest, InnerNavigationResult> {
     match result {
-        Ok(_) => return Err(result),
+        Ok(ref success) => {
+            let agent = success.handle.request.agent;
+            if let Ok((tracker, mut latest_prog, prog_pub, amcl_pose, current_safe_zone)) =
+                progress_query.get_mut(agent)
+            {
+                if tracker.plan_id.as_ref() == Some(&success.handle.request.safe_zone_id.plan_id) {
+                    let current_pose = amcl_pose.map(|p| p.xy_yaw());
+                    if !tracker.is_target_pose_satisfied(current_pose) {
+                        warn!(
+                            "[{:?}] Nav2 reported goal succeeded before target pose was satisfied (current={:?}); retrying goal {:?}.",
+                            agent.index(),
+                            current_pose,
+                            success.handle.request.safe_zone_id,
+                        );
+                        return Ok(success.handle.request.clone());
+                    }
+                    if let Some(updated_prog) = tracker.mark_target_reached(latest_prog.0.as_ref())
+                    {
+                        let pose = amcl_pose
+                            .map(|p| PoseStamped {
+                                header: p.0.header.clone(),
+                                pose: p.0.pose.pose.clone(),
+                            })
+                            .unwrap_or_default();
+                        let sz_id =
+                            current_safe_zone.and_then(|csz| csz.0.as_ref().map(|sz| &sz.id));
+                        let progress_msg = build_progress_status(
+                            pose,
+                            ros_env::rmf_prototype_msgs::msg::Progress::MODE_NAVIGATING,
+                            Some(&updated_prog),
+                            sz_id,
+                        );
+                        let _ = prog_pub.publisher.publish(progress_msg.clone());
+                        latest_prog.0 = Some(progress_msg);
+                    }
+                }
+            }
+            return Err(result);
+        }
         Err(ref err) => match err.kind {
             InnerNavigationErrorKind::GoalAbortedError => {
                 let Some(ref handle) = err.handle else {

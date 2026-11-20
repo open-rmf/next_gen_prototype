@@ -32,7 +32,6 @@ graph TD
     UpdateGoal --> MonitorGoal[Monitor Navigation]
     MonitorGoal --> ProcessNav[Process Navigation Result]
 
-    ProcessNav -->|Ok| RequestGoal
     ProcessNav -->|Err| CleanupGoal[Cleanup Goal Client]
     
     CancelGoal -->|Err| LogError[Log Error]

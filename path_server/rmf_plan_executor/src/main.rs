@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, SpinOptions};
+use rclrs::{Context, CreateBasicExecutor, IntoPrimitiveOptions, ParameterRange, SpinOptions};
 use rmf_plan_executor::{PlanExecutorConfig, PlanExecutorRosNode};
 use ros_env::geometry_msgs::msg::Pose;
 use ros_env::nav_msgs::msg::OccupancyGrid;
@@ -88,6 +88,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|p| p.get())
         .unwrap_or(0.0);
 
+    let param_grid_subdivision = node
+        .declare_parameter("grid_subdivision")
+        .default(1i64)
+        .range(ParameterRange {
+            lower: Some(1),
+            upper: Some(64),
+            step: None,
+        })
+        .description("Subdivision factor applied to /map cells for SafeZone Voronoi allocation")
+        .read_only()?
+        .get() as u32;
+
+    let param_blur_radius = node
+        .declare_parameter("blur_radius")
+        .default(1.0f64)
+        .range(ParameterRange {
+            lower: Some(0.0),
+            upper: Some(f32::MAX as f64),
+            step: None,
+        })
+        .description(
+            "Footprint dilation / blur radius in subdivided grid cells for SafeZone Voronoi allocation",
+        )
+        .read_only()?
+        .get() as f32;
+
     let args: Vec<String> = env::args().collect();
     let get_cli_arg = |flag: &str| -> Option<String> {
         args.iter()
@@ -102,15 +128,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let grid_width = get_cli_arg("--grid-width")
         .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&v| v > 0)
         .unwrap_or(param_grid_width);
 
     let grid_height = get_cli_arg("--grid-height")
         .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&v| v > 0)
         .unwrap_or(param_grid_height);
 
     let grid_resolution = get_cli_arg("--grid-resolution")
         .or_else(|| get_cli_arg("--grid-size"))
         .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
         .unwrap_or_else(|| {
             if param_grid_size != 1.0 && param_grid_resolution == 1.0 {
                 param_grid_size
@@ -121,32 +150,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let grid_origin_x = get_cli_arg("--grid-origin-x")
         .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
         .unwrap_or(param_grid_origin_x);
 
     let grid_origin_y = get_cli_arg("--grid-origin-y")
         .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
         .unwrap_or(param_grid_origin_y);
+
+    let grid_subdivision = get_cli_arg("--grid-subdivision")
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|v| v.clamp(1, 64))
+        .unwrap_or(param_grid_subdivision);
+
+    let blur_radius = get_cli_arg("--blur-radius")
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .map(|v| v.max(0.0))
+        .unwrap_or(param_blur_radius);
 
     let mut origin = Pose::default();
     origin.position.x = grid_origin_x;
     origin.position.y = grid_origin_y;
     origin.orientation.w = 1.0;
 
-    let config = PlanExecutorConfig {
-        grid_width,
-        grid_height,
-        grid_resolution,
-        grid_origin: origin,
-    };
+    let config = PlanExecutorConfig::new(grid_width, grid_height, grid_resolution, origin)
+        .with_subdivision(grid_subdivision)
+        .with_blur_radius(blur_radius);
 
     rclrs::log!(
         node.logger(),
-        "PlanExecutor initialized with grid: width={}, height={}, resolution={}, origin=({}, {})",
+        "PlanExecutor initialized with grid: width={}, height={}, resolution={}, origin=({}, {}), subdivision={}, blur_radius={}",
         config.grid_width,
         config.grid_height,
         config.grid_resolution,
         config.grid_origin.position.x,
-        config.grid_origin.position.y
+        config.grid_origin.position.y,
+        config.grid_subdivision,
+        config.blur_radius
     );
 
     // Create the executor worker

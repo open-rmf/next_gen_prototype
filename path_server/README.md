@@ -12,6 +12,17 @@ The path server accepts these read-only startup parameters:
 | --- | --- | --- |
 | `planning_grid_resolution` | `1.0` m | Minimum PiBT grid cell size. Lower values preserve more map detail but increase planning work. Coarser maps are not upsampled. |
 
+The plan executor (`rmf_plan_executor`) accepts these startup parameters (and matching CLI flags `--grid-subdivision`, `--blur-radius`):
+
+| Parameter | Default | Effect |
+| --- | --- | --- |
+| `grid_subdivision` | `1` | Integer subdivision factor (`1..=64`) applied to `/map` cells when constructing the SafeZone Voronoi allocation grid (automatically capped to keep total cells within `4,000,000`). |
+| `blur_radius` | `1.0` cells | Footprint dilation / blur radius in subdivided grid cells (Chebyshev step count) passed to `mapf_post::Grid2D` during SafeZone allocation. |
+
+### `{robot}/plan/error` QoS
+
+`{robot}/plan/error` uses `RELIABLE` + `TRANSIENT_LOCAL` (`keep_last(1)`) so late-joining subscribers do not miss an active `CODE_PATH_BLOCKED` error; the path server validates `PlanError.plan_id` against the robot's active `PlanId` to ignore stale latched errors from superseded plans.
+
 ## Path Server Demo Dashboard
 
 There is a simple web-based dashboard that can be used to visualize the paths of the robots. It can be accessed at http://localhost:8080.

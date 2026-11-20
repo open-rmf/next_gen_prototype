@@ -6,7 +6,7 @@ use crate::{
         InnerNavigationFeedback,
     },
     safe_zone::{
-        build_progress_status, CurrentSafeZone, LatestProgress, ProgressPublisher,
+        build_progress_status, CurrentSafeZone, LatestProgress, ProgressPublisher, ProgressTracker,
         SafeZoneSubscription,
     },
     Nav2Agent,
@@ -335,6 +335,7 @@ impl AgentPose {
 pub struct NavigationCompleted {
     pub agent: Entity,
     pub plan_id: PlanId,
+    pub cancelled: bool,
 }
 
 fn on_inner_navigation_feedback(
@@ -414,6 +415,7 @@ fn monitor_inner_navigation_clients(
                 nav_completed.write(NavigationCompleted {
                     agent: request.agent,
                     plan_id: request.plan_id.clone(),
+                    cancelled: false,
                 });
                 order.respond(());
                 return;
@@ -427,6 +429,7 @@ fn monitor_inner_navigation_clients(
                 nav_completed.write(NavigationCompleted {
                     agent: request.agent,
                     plan_id: request.plan_id.clone(),
+                    cancelled: true,
                 });
                 order.respond(());
                 return;
@@ -477,8 +480,10 @@ fn cleanup_navigation(
     mut nav_completed: EventReader<NavigationCompleted>,
     current_nav_requests: Query<&CurrentNavigationRequest>,
     mut safe_zones: Query<(
+        &Nav2Agent,
         &SafeZoneSubscription,
-        &CurrentSafeZone,
+        &mut CurrentSafeZone,
+        &mut ProgressTracker,
         &ProgressPublisher,
         &mut LatestProgress,
         Option<&AmclPose>,
@@ -488,30 +493,51 @@ fn cleanup_navigation(
         if current_nav_requests.get(event.agent).is_ok_and(|req| {
             req.request.agent == event.agent && req.request.plan_id == event.plan_id
         }) {
-            // Publish final Progress message to indicate path completion
             if let Ok((
+                agent,
                 safe_zone_sub,
-                current_safe_zone,
+                mut current_safe_zone,
+                mut progress_tracker,
                 progress_pub,
                 mut latest_progress,
                 amcl_pose,
             )) = safe_zones.get_mut(event.agent)
             {
-                if let Some(safe_zone) = safe_zone_sub
+                let pose = amcl_pose
+                    .filter(|_| agent.localized)
+                    .map(|p| PoseStamped {
+                        header: p.0.header.clone(),
+                        pose: p.0.pose.pose.clone(),
+                    })
+                    .unwrap_or_default();
+                if event.cancelled {
+                    let cancel_progress = build_progress_status(
+                        pose,
+                        Progress::MODE_IDLE,
+                        latest_progress.0.as_ref(),
+                        None,
+                    );
+                    let _ = progress_pub.publisher.publish(cancel_progress.clone());
+                    latest_progress.0 = Some(cancel_progress);
+                } else if let Some(safe_zone) = safe_zone_sub
                     .subscriber
                     .data_callback()
                     .or_else(|| current_safe_zone.0.clone())
                 {
                     let target_wp = safe_zone.target_waypoint.first().copied().unwrap_or(0);
-                    let pose = amcl_pose
-                        .map(|p| PoseStamped {
-                            header: p.0.header.clone(),
-                            pose: p.0.pose.pose.clone(),
-                        })
-                        .unwrap_or_default();
+                    let prev_same_plan = latest_progress
+                        .0
+                        .as_ref()
+                        .filter(|p| p.plan_id == safe_zone.id.plan_id);
+                    let reached_wp = prev_same_plan
+                        .map(|p| p.reached_waypoint.max(target_wp))
+                        .unwrap_or(target_wp);
+                    let reached_prog = prev_same_plan
+                        .map(|p| p.progress.max(safe_zone.target_progress))
+                        .unwrap_or(safe_zone.target_progress);
                     let base_progress = Progress {
-                        progress: safe_zone.target_progress,
-                        reached_waypoint: target_wp,
+                        progress: reached_prog,
+                        reached_waypoint: reached_wp,
                         target_waypoint: target_wp,
                         reached_keys: vec![],
                         plan_id: safe_zone.id.plan_id.clone(),
@@ -526,6 +552,8 @@ fn cleanup_navigation(
                     let _ = progress_pub.publisher.publish(final_progress.clone());
                     latest_progress.0 = Some(final_progress);
                 }
+                progress_tracker.clear();
+                current_safe_zone.clear();
             }
             commands
                 .entity(event.agent)

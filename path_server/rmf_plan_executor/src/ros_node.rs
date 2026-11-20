@@ -84,7 +84,11 @@ impl PlanExecutorRosNode {
             return;
         }
 
-        self.executor.handle_plan(robot_id, msg);
+        if self.executor.handle_plan(robot_id, msg) {
+            if let Some(cached_progress) = self.executor.cached_progress(robot_id) {
+                self.handle_progress(robot_id, cached_progress);
+            }
+        }
     }
 
     pub fn handle_map(&mut self, msg: OccupancyGrid) {
@@ -195,7 +199,10 @@ impl PlanExecutorRosNode {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let topic = format!("{robot_id}/plan/error");
-                match self.node.create_publisher(topic.as_str()) {
+                match self
+                    .node
+                    .create_publisher(topic.as_str().transient_local().reliable().keep_last(1))
+                {
                     Ok(publisher) => entry.insert(publisher),
                     Err(err) => {
                         rclrs::log_error!(
@@ -230,12 +237,46 @@ impl PlanExecutorRosNode {
 #[cfg(test)]
 mod tests {
     use super::PlanExecutorRosNode;
-    use rclrs::{Context, CreateBasicExecutor};
+    use rclrs::{Context, CreateBasicExecutor, InitOptions};
     use ros_env::rmf_prototype_msgs::msg::{Plan, Progress, Waypoint};
+    use std::net::TcpListener;
+    use std::ops::Deref;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct IsolatedContext {
+        context: Context,
+        _port_lock: TcpListener,
+    }
+
+    impl Deref for IsolatedContext {
+        type Target = Context;
+
+        fn deref(&self) -> &Self::Target {
+            &self.context
+        }
+    }
+
+    fn isolated_context() -> IsolatedContext {
+        static NEXT_OFFSET: AtomicUsize = AtomicUsize::new(0);
+        let pid_seed = std::process::id() as usize;
+        let offset = NEXT_OFFSET.fetch_add(1, Ordering::Relaxed);
+        for i in 0..100 {
+            let domain_id = ((pid_seed + offset + i) % 100) + 1;
+            if let Ok(listener) = TcpListener::bind(("0.0.0.0", 32768 + domain_id as u16)) {
+                let context = Context::from_env(InitOptions::new().with_domain_id(Some(domain_id)))
+                    .expect("ROS environment required for this test");
+                return IsolatedContext {
+                    context,
+                    _port_lock: listener,
+                };
+            }
+        }
+        panic!("Failed to reserve a unique ROS_DOMAIN_ID in 1..=100");
+    }
 
     #[test]
     fn ros_node_manages_publishers_on_add_and_remove() {
-        let context = Context::default_from_env().expect("ROS environment required for this test");
+        let context = isolated_context();
         let executor = context.create_basic_executor();
         let node = executor
             .create_node("test_plan_executor_ros_node")

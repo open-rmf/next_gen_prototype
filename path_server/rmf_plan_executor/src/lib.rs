@@ -25,7 +25,7 @@ use crate::{
 use mapf_post::{
     na::{Isometry2, Vector2},
     spatial_allocation::{CurrentPosition, Grid2D},
-    SemanticWaypoint, Trajectory, WaypointFollower,
+    SemanticWaypoint,
 };
 use ros_env::builtin_interfaces;
 use ros_env::geometry_msgs::msg::Pose;
@@ -48,7 +48,7 @@ pub struct RobotState {
     pub radius: f32,
     pub latest_progress: Option<Progress>,
     pub plan: Option<Plan>,
-    pub waypoint_follower: Option<WaypointFollower>,
+    pub reached_waypoint: usize,
     pub safe_zone_version: u64,
     pub last_incremental_target_wp: Option<usize>,
     blockage_monitor: BlockageMonitor,
@@ -61,12 +61,21 @@ pub struct ExecutionStepOutput {
     pub plan_error: Option<PlanError>,
 }
 
+const MAX_GRID_CELLS: usize = 4_000_000;
+
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlanExecutorConfig {
     pub grid_width: u32,
     pub grid_height: u32,
     pub grid_resolution: f32,
     pub grid_origin: Pose,
+    /// Subdivision factor applied to incoming `/map` cells when constructing the
+    /// SafeZone Voronoi allocation grid (`>= 1`).
+    pub grid_subdivision: u32,
+    /// Footprint dilation / blur radius in subdivided grid cells (Chebyshev
+    /// step count) passed to `mapf_post::Grid2D` (`>= 0.0`).
+    pub blur_radius: f32,
 }
 
 impl Default for PlanExecutorConfig {
@@ -78,6 +87,8 @@ impl Default for PlanExecutorConfig {
             grid_height: 20,
             grid_resolution: 1.0,
             grid_origin: origin,
+            grid_subdivision: 1,
+            blur_radius: 1.0,
         }
     }
 }
@@ -87,8 +98,14 @@ impl PlanExecutorConfig {
         Self {
             grid_width,
             grid_height,
-            grid_resolution,
+            grid_resolution: if grid_resolution.is_finite() && grid_resolution > 0.0 {
+                grid_resolution
+            } else {
+                1.0
+            },
             grid_origin,
+            grid_subdivision: 1,
+            blur_radius: 1.0,
         }
     }
 
@@ -99,12 +116,28 @@ impl PlanExecutorConfig {
     }
 
     pub fn with_resolution(mut self, resolution: f32) -> Self {
-        self.grid_resolution = resolution;
+        if resolution.is_finite() && resolution > 0.0 {
+            self.grid_resolution = resolution;
+        }
         self
     }
 
     pub fn with_origin(mut self, origin: Pose) -> Self {
         self.grid_origin = origin;
+        self
+    }
+
+    pub fn with_subdivision(mut self, subdivision: u32) -> Self {
+        self.grid_subdivision = subdivision.max(1);
+        self
+    }
+
+    pub fn with_blur_radius(mut self, blur_radius: f32) -> Self {
+        self.blur_radius = if blur_radius.is_finite() {
+            blur_radius.max(0.0)
+        } else {
+            0.0
+        };
         self
     }
 }
@@ -119,6 +152,9 @@ pub struct PlanExecutor {
     pub grid_height: u32,
     pub grid_resolution: f32,
     pub grid_origin: Pose,
+    pub grid_subdivision: u32,
+    effective_subdivision: u32,
+    pub blur_radius: f32,
     pub latest_map: Option<OccupancyGrid>,
     plan_registry: PlanRegistry,
 }
@@ -168,8 +204,17 @@ fn target_yaw(plan: &Plan, target_idx: usize) -> f32 {
 }
 
 fn is_constrained_orientation(ori: &TargetOrientation) -> bool {
-    let effective_tol = 0.5 * ori.spread_radians.max(0.0) + ori.tolerance_radians.max(0.0);
-    effective_tol < std::f32::consts::PI - 1e-3
+    let spread = if ori.spread_radians.is_finite() {
+        ori.spread_radians.max(0.0)
+    } else {
+        0.0
+    };
+    let tol = if ori.tolerance_radians.is_finite() {
+        ori.tolerance_radians.max(0.0)
+    } else {
+        0.0
+    };
+    spread + tol < std::f32::consts::PI - 1e-3
 }
 
 fn target_orientation(plan: &Plan, target_idx: usize) -> TargetOrientation {
@@ -208,17 +253,43 @@ impl PlanExecutor {
     }
 
     pub fn with_config(config: PlanExecutorConfig) -> Self {
-        let grid = Arc::new(Grid2D::new(
-            vec![vec![0; config.grid_height as usize]; config.grid_width as usize],
-            config.grid_resolution,
-        ));
+        let subdiv = config.grid_subdivision.max(1);
+        let blur_radius = if config.blur_radius.is_finite() {
+            config.blur_radius.max(0.0)
+        } else {
+            0.0
+        };
+        let grid_resolution = if config.grid_resolution.is_finite() && config.grid_resolution > 0.0
+        {
+            config.grid_resolution
+        } else {
+            1.0
+        };
+        let (grid_width, grid_height) = if (config.grid_width as usize)
+            .checked_mul(config.grid_height as usize)
+            .is_some_and(|cells| cells > 0 && cells <= MAX_GRID_CELLS)
+        {
+            (config.grid_width, config.grid_height)
+        } else {
+            (20, 20)
+        };
+        let grid = Arc::new(
+            Grid2D::new(
+                vec![vec![0; grid_height as usize]; grid_width as usize],
+                grid_resolution,
+            )
+            .with_blur_radius(blur_radius),
+        );
         Self {
             active_robots: BTreeMap::new(),
             grid,
-            grid_width: config.grid_width,
-            grid_height: config.grid_height,
-            grid_resolution: config.grid_resolution,
+            grid_width,
+            grid_height,
+            grid_resolution,
             grid_origin: config.grid_origin,
+            grid_subdivision: subdiv,
+            effective_subdivision: subdiv,
+            blur_radius,
             latest_map: None,
             plan_registry: PlanRegistry::default(),
         }
@@ -233,7 +304,7 @@ impl PlanExecutor {
                     radius,
                     latest_progress: None,
                     plan: None,
-                    waypoint_follower: None,
+                    reached_waypoint: 0,
                     safe_zone_version: 0,
                     last_incremental_target_wp: None,
                     blockage_monitor: BlockageMonitor::default(),
@@ -249,15 +320,13 @@ impl PlanExecutor {
         self.active_robots.remove(robot_id).is_some()
     }
 
-    fn get_agent_index(&self, robot_id: &str) -> Option<usize> {
-        self.active_robots.keys().position(|k| k == robot_id)
+    pub fn cached_progress(&self, robot_id: &str) -> Option<Progress> {
+        self.active_robots
+            .get(robot_id)
+            .and_then(|s| s.latest_progress.clone())
     }
 
     pub fn handle_plan(&mut self, robot_id: &str, msg: Plan) -> bool {
-        let Some(agent_idx) = self.get_agent_index(robot_id) else {
-            return false;
-        };
-
         let Some(state) = self.active_robots.get_mut(robot_id) else {
             return false;
         };
@@ -269,21 +338,16 @@ impl PlanExecutor {
         self.plan_registry
             .add_robot_plan(robot_id.to_string(), msg.clone());
 
-        let poses: Vec<Isometry2<f32>> = msg
-            .waypoints
-            .iter()
-            .map(|wp| Isometry2::new(Vector2::new(wp.position[0], wp.position[1]), 0.0))
-            .collect();
-        let mut follower = WaypointFollower::from_trajectory(agent_idx, Trajectory { poses });
+        let mut initial_reached = 0;
         if let Some(progress) = &state.latest_progress {
-            let current_x = progress.pose.pose.position.x as f32;
-            let current_y = progress.pose.pose.position.y as f32;
-            let position = Isometry2::new(Vector2::new(current_x, current_y), 0.0);
-            follower.update_position_estimate(&position, 0.5);
+            if progress.plan_id == msg.plan_id {
+                initial_reached =
+                    (progress.reached_waypoint as usize).min(msg.waypoints.len().saturating_sub(1));
+            }
         }
 
         state.plan = Some(msg);
-        state.waypoint_follower = Some(follower);
+        state.reached_waypoint = initial_reached;
         state.safe_zone_version = 0;
         state.last_incremental_target_wp = None;
         state.blockage_monitor.begin_plan();
@@ -291,20 +355,59 @@ impl PlanExecutor {
     }
 
     pub fn handle_map(&mut self, msg: OccupancyGrid) -> Vec<(String, PlanError)> {
-        if msg.info.width == 0 || msg.info.height == 0 || msg.info.resolution <= 0.0 {
+        if msg.info.width == 0
+            || msg.info.height == 0
+            || !msg.info.resolution.is_finite()
+            || msg.info.resolution <= 0.0
+        {
             return Vec::new();
         }
 
-        self.grid_width = msg.info.width;
-        self.grid_height = msg.info.height;
-        self.grid_resolution = msg.info.resolution;
+        let Some(base_cells) = (msg.info.width as usize).checked_mul(msg.info.height as usize)
+        else {
+            return Vec::new();
+        };
+        if !msg.data.is_empty() && msg.data.len() != base_cells {
+            return Vec::new();
+        }
+
+        let mut subdiv: u32 = self.grid_subdivision.max(1);
+        while subdiv > 1 {
+            let fits = msg
+                .info
+                .width
+                .checked_mul(subdiv)
+                .zip(msg.info.height.checked_mul(subdiv))
+                .and_then(|(w, h)| (w as usize).checked_mul(h as usize))
+                .is_some_and(|cells| cells <= MAX_GRID_CELLS);
+            if fits {
+                break;
+            }
+            subdiv -= 1;
+        }
+
+        let Some((new_width, new_height)) = msg
+            .info
+            .width
+            .checked_mul(subdiv)
+            .zip(msg.info.height.checked_mul(subdiv))
+            .filter(|&(w, h)| {
+                (w as usize)
+                    .checked_mul(h as usize)
+                    .is_some_and(|cells| cells <= MAX_GRID_CELLS)
+            })
+        else {
+            return Vec::new();
+        };
+
+        self.effective_subdivision = subdiv;
+        self.grid_width = new_width;
+        self.grid_height = new_height;
+        self.grid_resolution = msg.info.resolution / (subdiv as f32);
         self.grid_origin = msg.info.origin.clone();
-        self.grid = Arc::new(Grid2D::new(
-            vec![vec![0; self.grid_height as usize]; self.grid_width as usize],
-            self.grid_resolution,
-        ));
 
         self.latest_map = Some(msg);
+        self.rebuild_grid_from_latest_map();
         let robot_ids: Vec<_> = self.active_robots.keys().cloned().collect();
         let mut errors = Vec::new();
         for robot_id in robot_ids {
@@ -315,12 +418,57 @@ impl PlanExecutor {
         errors
     }
 
+    fn rebuild_grid_from_latest_map(&mut self) {
+        let mut static_obstacles =
+            vec![vec![0i8; self.grid_height as usize]; self.grid_width as usize];
+        if let Some(msg) = &self.latest_map {
+            let expected_len = (msg.info.width as usize).checked_mul(msg.info.height as usize);
+            if Some(msg.data.len()) == expected_len {
+                let subdiv = self.effective_subdivision.max(1) as usize;
+                let offset_x = ((msg.info.origin.position.x - self.grid_origin.position.x)
+                    / (self.grid_resolution as f64))
+                    .round() as isize;
+                let offset_y = ((msg.info.origin.position.y - self.grid_origin.position.y)
+                    / (self.grid_resolution as f64))
+                    .round() as isize;
+
+                for cy in 0..msg.info.height as usize {
+                    for cx in 0..msg.info.width as usize {
+                        let idx = cy * (msg.info.width as usize) + cx;
+                        if msg.data[idx] > 50 {
+                            for dy in 0..subdiv {
+                                for dx in 0..subdiv {
+                                    let fx = (cx * subdiv + dx) as isize + offset_x;
+                                    let fy = (cy * subdiv + dy) as isize + offset_y;
+                                    if fx >= 0
+                                        && (fx as usize) < self.grid_width as usize
+                                        && fy >= 0
+                                        && (fy as usize) < self.grid_height as usize
+                                    {
+                                        let grid_y =
+                                            (self.grid_height as usize - 1) - (fy as usize);
+                                        static_obstacles[fx as usize][grid_y] = 100;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.grid = Arc::new(
+            Grid2D::new(static_obstacles, self.grid_resolution).with_blur_radius(self.blur_radius),
+        );
+    }
+
     /// Decide whether a traffic dependency has been satisfied.
     ///
-    /// We prefer the blocker's own reported `Progress`, because that is its own
-    /// statement of how far it has got. We only fall back to projecting its pose
-    /// onto its plan when it has not reported progress against the plan we are
-    /// depending on.
+    /// We check the blocker's reported `Progress` first whenever its `plan_id`
+    /// matches `blocker.plan_id`. If the blocker's active `Plan` has already
+    /// moved on to a different non-default `PlanId`, we hold (`false`) until both
+    /// robots' plans and progress reports align. Otherwise, we fall back to
+    /// comparing the blocker's tracked `SemanticWaypoint` index against
+    /// `blocker.required_progress`.
     fn blocker_is_satisfied(
         &self,
         blocker: &TrafficDependency,
@@ -367,26 +515,34 @@ impl PlanExecutor {
 
             state.latest_progress = Some(msg.clone());
 
-            if let (Some(fw), Some(plan)) = (&mut state.waypoint_follower, &state.plan) {
-                if msg.mode == Progress::MODE_ACTION {
-                    if msg.plan_id == plan.plan_id {
-                        let reached = msg.reached_waypoint as usize;
-                        if reached > fw.get_semantic_waypoint().trajectory_index {
-                            if let Some(wp) = plan.waypoints.get(reached) {
-                                let wp_pos = Isometry2::new(
-                                    Vector2::new(wp.position[0], wp.position[1]),
-                                    0.0,
-                                );
-                                fw.update_position_estimate(&wp_pos, 0.1);
-                            }
-                        }
+            if let Some(plan) = &state.plan {
+                let mut registry_progress = state.reached_waypoint;
+                if msg.plan_id == plan.plan_id {
+                    let last_idx = plan.waypoints.len().saturating_sub(1);
+                    let reached = (msg.reached_waypoint as usize).min(last_idx);
+                    if reached > state.reached_waypoint {
+                        state.reached_waypoint = reached;
                     }
-                } else {
-                    fw.update_position_estimate(&position, 0.5);
+                    registry_progress = state.reached_waypoint;
+                    let completed_final_wp = msg.mode == Progress::MODE_IDLE
+                        && state.reached_waypoint == last_idx
+                        && (msg.reached_waypoint as usize) >= last_idx
+                        && plan.waypoints.get(last_idx).is_some_and(|wp| {
+                            wp.departure_action.is_empty()
+                                && (last_idx > 0
+                                    || (current_x - wp.position[0])
+                                        .hypot(current_y - wp.position[1])
+                                        <= 0.3)
+                        });
+                    if completed_final_wp {
+                        registry_progress = plan.waypoints.len();
+                    }
                 }
-                let after = fw.get_semantic_waypoint().trajectory_index;
-                self.plan_registry
-                    .update_progress(robot_id, after, plan.plan_id.clone());
+                self.plan_registry.update_progress(
+                    robot_id,
+                    registry_progress,
+                    plan.plan_id.clone(),
+                );
             }
         }
 
@@ -400,16 +556,14 @@ impl PlanExecutor {
             };
         }
 
-        // Cache all semantic waypoints first because get_semantic_waypoint requires &mut self.
-        // Doing this first avoids borrowing active_robots as mutable during later immutable reads.
         let mut semantic_waypoints = HashMap::new();
-        for (robot_index, (name, r_state)) in self.active_robots.iter_mut().enumerate() {
-            if let Some(fw) = &mut r_state.waypoint_follower {
+        for (robot_index, (name, r_state)) in self.active_robots.iter().enumerate() {
+            if r_state.plan.is_some() {
                 semantic_waypoints.insert(
                     name.clone(),
                     SemanticWaypoint {
                         agent: robot_index,
-                        trajectory_index: fw.get_semantic_waypoint().trajectory_index,
+                        trajectory_index: r_state.reached_waypoint,
                     },
                 );
             }
@@ -451,23 +605,6 @@ impl PlanExecutor {
             released_wp_idx += 1;
         }
 
-        if released_wp_idx < plan.waypoints.len() {
-            let wp_pos = &plan.waypoints[released_wp_idx].position;
-            for (r_name, r_state) in &self.active_robots {
-                if r_name == robot_id {
-                    continue;
-                }
-                if let Some(progress) = &r_state.latest_progress {
-                    let dx = wp_pos[0] - progress.pose.pose.position.x as f32;
-                    let dy = wp_pos[1] - progress.pose.pose.position.y as f32;
-                    if dx.hypot(dy) < 0.8 {
-                        released_wp_idx = released_wp_idx.saturating_sub(1);
-                        break;
-                    }
-                }
-            }
-        }
-
         if released_wp_idx >= plan.waypoints.len() {
             released_wp_idx = plan.waypoints.len() - 1;
         }
@@ -505,27 +642,45 @@ impl PlanExecutor {
         let current_max_x = current_min_x + (self.grid_width as f32 * self.grid_resolution);
         let current_max_y = current_min_y + (self.grid_height as f32 * self.grid_resolution);
 
-        if min_x < current_min_x
-            || min_y < current_min_y
-            || max_x > current_max_x
-            || max_y > current_max_y
+        if min_x.is_finite()
+            && min_y.is_finite()
+            && max_x.is_finite()
+            && max_y.is_finite()
+            && min_x <= max_x
+            && min_y <= max_y
+            && (min_x < current_min_x
+                || min_y < current_min_y
+                || max_x > current_max_x
+                || max_y > current_max_y)
         {
             let new_min_x = min_x - 20.0;
             let new_min_y = min_y - 20.0;
             let new_max_x = max_x + 20.0;
             let new_max_y = max_y + 20.0;
 
-            self.grid_origin.position.x = new_min_x as f64;
-            self.grid_origin.position.y = new_min_y as f64;
-            self.grid_origin.orientation.w = 1.0;
-
-            self.grid_width = ((new_max_x - new_min_x) / self.grid_resolution).ceil() as u32;
-            self.grid_height = ((new_max_y - new_min_y) / self.grid_resolution).ceil() as u32;
-
-            self.grid = Arc::new(Grid2D::new(
-                vec![vec![0; self.grid_height as usize]; self.grid_width as usize],
-                self.grid_resolution,
-            ));
+            let cand_w = ((new_max_x - new_min_x) / self.grid_resolution).ceil();
+            let cand_h = ((new_max_y - new_min_y) / self.grid_resolution).ceil();
+            if cand_w.is_finite()
+                && cand_h.is_finite()
+                && cand_w >= 1.0
+                && cand_h >= 1.0
+                && cand_w <= (u32::MAX as f32)
+                && cand_h <= (u32::MAX as f32)
+            {
+                let new_w = cand_w as u32;
+                let new_h = cand_h as u32;
+                if (new_w as usize)
+                    .checked_mul(new_h as usize)
+                    .is_some_and(|cells| cells <= MAX_GRID_CELLS)
+                {
+                    self.grid_origin.position.x = new_min_x as f64;
+                    self.grid_origin.position.y = new_min_y as f64;
+                    self.grid_origin.orientation.w = 1.0;
+                    self.grid_width = new_w;
+                    self.grid_height = new_h;
+                    self.rebuild_grid_from_latest_map();
+                }
+            }
         }
         // --- End dynamic grid resizing ---
 
@@ -546,19 +701,27 @@ impl PlanExecutor {
             let r_state = &self.active_robots[r_name];
             let real_position = if let Some(r_progress) = &r_state.latest_progress {
                 (
-                    r_progress.pose.pose.position.x as f32 - self.grid_origin.position.x as f32,
-                    r_progress.pose.pose.position.y as f32 - self.grid_origin.position.y as f32,
+                    r_progress.pose.pose.position.x as f32 - origin_offset.x,
+                    r_progress.pose.pose.position.y as f32 - origin_offset.y,
                 )
             } else {
                 (0.0, 0.0)
             };
+
+            let max_traj_idx = snapshot
+                .mapf_result
+                .trajectories
+                .get(idx)
+                .map(|t| t.poses.len().saturating_sub(1))
+                .unwrap_or(0);
 
             let semantic_position = semantic_waypoints
                 .get(r_name)
                 .map(|sem| {
                     let global_idx = snapshot
                         .get_global_waypoint_index(r_name, sem.trajectory_index)
-                        .unwrap_or(sem.trajectory_index);
+                        .unwrap_or(0)
+                        .min(max_traj_idx);
                     SemanticWaypoint {
                         agent: idx,
                         trajectory_index: global_idx,
@@ -578,14 +741,38 @@ impl PlanExecutor {
             .grid
             .allocate_trajectory(&snapshot.mapf_result, &current_positions);
 
-        let snapshot_agent_idx = snapshot.get_agent_index(robot_id).unwrap_or(0);
-        let positions = allocation_field
+        let Some(snapshot_agent_idx) = snapshot.get_agent_index(robot_id) else {
+            return ExecutionStepOutput {
+                plan_release: Some(plan_release),
+                safe_zone: None,
+                plan_error,
+            };
+        };
+        let mut positions = allocation_field
             .get_alloc_for_agent(snapshot_agent_idx)
             .unwrap_or_default();
 
+        let plan = self.active_robots[robot_id].plan.as_ref().unwrap();
         let target_wp = &plan.waypoints[released_wp_idx];
         let target_x = target_wp.position[0];
         let target_y = target_wp.position[1];
+        let mut injected: Vec<(usize, usize)> = Vec::with_capacity(2);
+        for &(wx, wy) in &[(current_x, current_y), (target_x, target_y)] {
+            let (gx, gy) = self
+                .grid
+                .from_world_coords(wx - origin_offset.x, wy - origin_offset.y);
+            if gx >= 0 && gy >= 0 {
+                let (ux, uy) = (gx as usize, gy as usize);
+                if ux < self.grid_width as usize
+                    && uy < self.grid_height as usize
+                    && allocation_field.get_allocation(gx, gy).is_none()
+                    && !injected.contains(&(ux, uy))
+                {
+                    injected.push((ux, uy));
+                    positions.push((ux, uy));
+                }
+            }
+        }
         let target_ori = target_orientation(plan, released_wp_idx);
         let target_tolerance = target_wp
             .arrival_constraints
@@ -597,12 +784,14 @@ impl PlanExecutor {
         let target_nodes = target_wp.arrival_constraints.nodes.clone();
         let target_progress = target_wp.progress;
 
+        let costmap_origin = self.grid_origin.clone();
+
         let costmap = Self::to_costmap_msg(
             &positions,
             self.grid_width,
             self.grid_height,
             self.grid_resolution,
-            self.grid_origin.clone(),
+            costmap_origin,
             msg.pose.header.stamp.clone(),
         );
 
@@ -646,21 +835,25 @@ impl PlanExecutor {
     fn update_route_blockage(&mut self, robot_id: &str) -> Option<PlanError> {
         let map = self.latest_map.as_ref()?;
         let state = self.active_robots.get_mut(robot_id)?;
-        let (Some(plan), Some(progress), Some(follower)) = (
-            state.plan.as_ref(),
-            state.latest_progress.as_ref(),
-            state.waypoint_follower.as_mut(),
-        ) else {
+        let (Some(plan), Some(progress)) = (state.plan.as_ref(), state.latest_progress.as_ref())
+        else {
             return None;
         };
 
-        let remaining = follower.remaining_trajectory();
-        let mut route = Vec::with_capacity(remaining.len() + 1);
-        route.push((
-            progress.pose.pose.position.x as f32,
-            progress.pose.pose.position.y as f32,
-        ));
-        route.extend(remaining);
+        let curr_idx = state.reached_waypoint;
+        let remaining_len = plan.waypoints.len().saturating_sub(curr_idx + 1);
+        let mut route = Vec::with_capacity(remaining_len + 1);
+        if let Some(curr_wp) = plan.waypoints.get(curr_idx) {
+            route.push((curr_wp.position[0], curr_wp.position[1]));
+        } else {
+            route.push((
+                progress.pose.pose.position.x as f32,
+                progress.pose.pose.position.y as f32,
+            ));
+        }
+        for wp in plan.waypoints.iter().skip(curr_idx + 1) {
+            route.push((wp.position[0], wp.position[1]));
+        }
 
         let blocked = route_intersects_map(map, &route, state.radius);
         let plan_id = plan.plan_id.clone();
@@ -683,11 +876,9 @@ impl PlanExecutor {
 
     /// Whether we can generate a release and safe zone for `robot_id`.
     fn ready_to_execute(&self, robot_id: &str) -> bool {
-        self.active_robots.get(robot_id).is_some_and(|state| {
-            state.latest_progress.is_some()
-                && state.plan.is_some()
-                && state.waypoint_follower.is_some()
-        })
+        self.active_robots
+            .get(robot_id)
+            .is_some_and(|state| state.latest_progress.is_some() && state.plan.is_some())
     }
 
     pub fn to_costmap_msg(
@@ -698,7 +889,8 @@ impl PlanExecutor {
         origin: Pose,
         stamp: builtin_interfaces::msg::Time,
     ) -> Costmap {
-        let mut data = vec![254u8; (width * height) as usize];
+        let total_cells = (width as usize).checked_mul(height as usize).unwrap_or(0);
+        let mut data = vec![254u8; total_cells];
         for &(x, y) in positions {
             if x < width as usize && y < height as usize {
                 // Grid2D from mapf_post returns y with top-left origin (i.e. flipped)
@@ -731,8 +923,6 @@ impl PlanExecutor {
 #[cfg(test)]
 mod tests {
     use super::{target_orientation, target_yaw, PlanExecutor, PlanExecutorConfig};
-    use mapf_post::na::{Isometry2, Vector2};
-    use mapf_post::{Trajectory, WaypointFollower};
     use ros_env::{
         geometry_msgs::msg::Pose,
         nav_msgs::msg::OccupancyGrid,
@@ -759,6 +949,21 @@ mod tests {
         progress.pose.pose.position.x = x;
         progress.pose.pose.position.y = y;
         progress
+    }
+
+    fn progress_with_progress(
+        x: f64,
+        y: f64,
+        plan_id: &PlanId,
+        reached: u64,
+        progress: f32,
+    ) -> Progress {
+        let mut msg = progress_at(x, y);
+        msg.plan_id = plan_id.clone();
+        msg.reached_waypoint = reached;
+        msg.target_waypoint = reached;
+        msg.progress = progress;
+        msg
     }
 
     #[test]
@@ -883,13 +1088,9 @@ mod tests {
         assert_eq!(
             executor
                 .active_robots
-                .get_mut("robot_1")
+                .get("robot_1")
                 .unwrap()
-                .waypoint_follower
-                .as_mut()
-                .unwrap()
-                .get_semantic_waypoint()
-                .trajectory_index,
+                .reached_waypoint,
             2
         );
 
@@ -898,61 +1099,15 @@ mod tests {
         let plan_2 = plan_with_positions(&[[5.0, 5.0], [6.0, 5.0]]);
         executor.handle_plan("robot_2", plan_2);
 
-        // robot_1's follower must NOT have been reset back to 0!
+        // robot_1's progress must NOT have been reset back to 0!
         assert_eq!(
             executor
                 .active_robots
-                .get_mut("robot_1")
+                .get("robot_1")
                 .unwrap()
-                .waypoint_follower
-                .as_mut()
-                .unwrap()
-                .get_semantic_waypoint()
-                .trajectory_index,
+                .reached_waypoint,
             2
         );
-    }
-
-    #[test]
-    fn test_robot_2_follower() {
-        let poses = vec![
-            Isometry2::new(Vector2::new(3.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(4.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(5.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(6.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(7.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(8.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(9.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(10.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(10.0, 0.0), 0.0),
-            Isometry2::new(Vector2::new(10.0, 0.0), 0.0),
-        ];
-        let mut follower = WaypointFollower::from_trajectory(0, Trajectory { poses });
-
-        // Simulating the robot moving through the path:
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(3.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 0);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(4.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 1);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(5.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 2);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(6.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 3);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(7.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 4);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(8.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 5);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(9.0, 0.0), 0.0), 0.5);
-        assert_eq!(follower.get_semantic_waypoint().trajectory_index, 6);
-
-        follower.update_position_estimate(&Isometry2::new(Vector2::new(10.0, 0.0), 0.0), 0.5);
-        assert!(follower.get_semantic_waypoint().trajectory_index >= 7);
     }
 
     #[test]
@@ -977,11 +1132,41 @@ mod tests {
         let builder_config = PlanExecutorConfig::default()
             .with_grid_size(100, 200)
             .with_resolution(0.2)
-            .with_origin(custom_origin.clone());
+            .with_origin(custom_origin.clone())
+            .with_subdivision(5)
+            .with_blur_radius(2.0);
         assert_eq!(builder_config.grid_width, 100);
         assert_eq!(builder_config.grid_height, 200);
         assert_eq!(builder_config.grid_resolution, 0.2);
         assert_eq!(builder_config.grid_origin, custom_origin);
+        assert_eq!(builder_config.grid_subdivision, 5);
+        assert_eq!(builder_config.blur_radius, 2.0);
+    }
+
+    #[test]
+    fn test_handle_map_with_subdivision_centers_waypoints() {
+        let config = PlanExecutorConfig::default()
+            .with_subdivision(5)
+            .with_blur_radius(2.0);
+        let mut plan_executor = PlanExecutor::with_config(config);
+
+        let mut map_msg = OccupancyGrid::default();
+        map_msg.info.width = 12;
+        map_msg.info.height = 6;
+        map_msg.info.resolution = 1.0;
+        map_msg.info.origin.position.x = -5.5;
+        map_msg.info.origin.position.y = -4.5;
+        map_msg.info.origin.orientation.w = 1.0;
+        map_msg.data = vec![0; 72];
+
+        let errors = plan_executor.handle_map(map_msg);
+        assert!(errors.is_empty());
+
+        assert_eq!(plan_executor.grid_width, 60);
+        assert_eq!(plan_executor.grid_height, 30);
+        assert!((plan_executor.grid_resolution - 0.2).abs() < 1e-6);
+        assert!((plan_executor.grid_origin.position.x - (-5.5)).abs() < 1e-6);
+        assert!((plan_executor.grid_origin.position.y - (-4.5)).abs() < 1e-6);
     }
 
     #[test]
@@ -1090,12 +1275,11 @@ mod tests {
 
         let plan2 = plan_with_positions(&[[0.0, 5.0], [2.0, 5.0]]);
 
+        let plan2_id = plan2.plan_id.clone();
         plan_executor.handle_plan("robot_1", plan1);
         plan_executor.handle_plan("robot_2", plan2);
 
-        let mut progress2 = Progress::default();
-        progress2.pose.pose.position.x = 0.0;
-        progress2.pose.pose.position.y = 5.0;
+        let progress2 = progress_with_progress(0.0, 5.0, &plan2_id, 0, 0.0);
         plan_executor.handle_progress("robot_2", progress2);
 
         let mut progress1 = Progress::default();
@@ -1106,9 +1290,7 @@ mod tests {
         assert_eq!(out1.plan_release.unwrap().waypoint_id, 1);
 
         // Advance robot_2 to waypoint 1 (2.0, 5.0)
-        let mut progress2_reached = Progress::default();
-        progress2_reached.pose.pose.position.x = 2.0;
-        progress2_reached.pose.pose.position.y = 5.0;
+        let progress2_reached = progress_with_progress(2.0, 5.0, &plan2_id, 1, 1.0);
         plan_executor.handle_progress("robot_2", progress2_reached);
 
         // Now robot_1 should be released up to waypoint 2
@@ -1182,6 +1364,7 @@ mod tests {
         plan_executor.handle_robot_added("robot_1", 0.5);
 
         let mut plan = plan_with_positions(&[[0.0, 0.0], [2.0, 0.0], [4.0, 0.0], [6.0, 0.0]]);
+        let plan_id = plan.plan_id.clone();
 
         // Intermediate wp[1] has a TargetNode with an orientation constraint (-pi/2)
         let mut staging_key = GraphElementKey::default();
@@ -1212,10 +1395,7 @@ mod tests {
         assert!(plan_executor.handle_plan("robot_1", plan));
 
         // 1. At start (0, 0), execution gates at wp[1] and forwards its node + orientation (-pi/2)
-        let mut progress1 = Progress::default();
-        progress1.pose.pose.position.x = 0.0;
-        progress1.pose.pose.position.y = 0.0;
-        let out1 = plan_executor.handle_progress("robot_1", progress1);
+        let out1 = plan_executor.handle_progress("robot_1", progress_at(0.0, 0.0));
         assert_eq!(out1.plan_release.unwrap().waypoint_id, 1);
         let sz1 = out1.safe_zone.expect("SafeZone should be emitted at start");
         assert_eq!(sz1.target_waypoint.as_slice(), &[1]);
@@ -1233,10 +1413,10 @@ mod tests {
         assert_eq!(sz1.incremental_target.nodes[0].key.key.as_slice(), &[13]);
 
         // 2. At wp[1] (2, 0), execution gates at wp[2] and forwards its region orientation (pi) and tolerance (0.35)
-        let mut progress2 = Progress::default();
-        progress2.pose.pose.position.x = 2.0;
-        progress2.pose.pose.position.y = 0.0;
-        let out2 = plan_executor.handle_progress("robot_1", progress2);
+        let out2 = plan_executor.handle_progress(
+            "robot_1",
+            progress_with_progress(2.0, 0.0, &plan_id, 1, 1.0),
+        );
         assert_eq!(out2.plan_release.unwrap().waypoint_id, 2);
         let sz2 = out2.safe_zone.expect("SafeZone should be emitted at wp[1]");
         assert_eq!(sz2.target_waypoint.as_slice(), &[2]);
@@ -1253,10 +1433,10 @@ mod tests {
         );
 
         // 3. At wp[2] (4, 0), execution releases to final wp[3]
-        let mut progress3 = Progress::default();
-        progress3.pose.pose.position.x = 4.0;
-        progress3.pose.pose.position.y = 0.0;
-        let out3 = plan_executor.handle_progress("robot_1", progress3);
+        let out3 = plan_executor.handle_progress(
+            "robot_1",
+            progress_with_progress(4.0, 0.0, &plan_id, 2, 2.0),
+        );
         assert_eq!(out3.plan_release.unwrap().waypoint_id, 3);
     }
 
@@ -1379,5 +1559,237 @@ mod tests {
 
         let out1_new_session = plan_executor.handle_progress("robot_1", progress_at(-2.0, 0.0));
         assert_eq!(out1_new_session.plan_release.unwrap().waypoint_id, 1);
+    }
+
+    #[test]
+    fn test_subdivision_expands_obstacles_survives_dynamic_resize_and_injects_endpoints() {
+        let config = PlanExecutorConfig::default()
+            .with_subdivision(4)
+            .with_blur_radius(4.0);
+        let mut executor = PlanExecutor::with_config(config);
+        executor.handle_robot_added("robot_1", 0.5);
+        assert!((executor.grid.blur_radius() - 4.0).abs() < 1e-6);
+
+        // 4x4 map at 1.0m resolution with origin (0, 0), occupied cell at (cx=2, cy=1) -> world [2..3, 1..2]
+        let mut map_msg = OccupancyGrid::default();
+        map_msg.info.width = 4;
+        map_msg.info.height = 4;
+        map_msg.info.resolution = 1.0;
+        map_msg.info.origin.orientation.w = 1.0;
+        let mut data = vec![0i8; 16];
+        data[1 * 4 + 2] = 100;
+        map_msg.data = data;
+
+        assert!(executor.handle_map(map_msg).is_empty());
+        assert_eq!(executor.grid_width, 16);
+        assert_eq!(executor.grid_height, 16);
+        assert!((executor.grid_resolution - 0.25).abs() < 1e-6);
+
+        // Give robot_1 a plan extending outside [0, 4] x [0, 4] to trigger dynamic grid resize,
+        // passing right next to world [2..3, 1..2] (within the 4-cell = 1.0m blur_radius)
+        let mut plan = plan_with_positions(&[[0.5, 0.5], [6.5, 0.5]]);
+        plan.plan_id.destination_session.uuid = [7; 16];
+        executor.handle_plan("robot_1", plan);
+
+        let out = executor.handle_progress("robot_1", progress_at(0.5, 0.5));
+        let sz = out.safe_zone.expect("SafeZone should be generated");
+        assert!((executor.grid.blur_radius() - 4.0).abs() < 1e-6);
+
+        // Verify all 4x4 subdivided cells inside obstacle [2..3, 1..2] remain lethal (254)
+        // in SafeZone costmap even though the lower rows lie within 4 cells of y = 0.5!
+        for sub_y in 0..4 {
+            for sub_x in 0..4 {
+                let wx = 2.0 + (sub_x as f32 + 0.5) * 0.25;
+                let wy = 1.0 + (sub_y as f32 + 0.5) * 0.25;
+                let cx = ((wx - sz.costmap.metadata.origin.position.x as f32)
+                    / sz.costmap.metadata.resolution)
+                    .floor() as usize;
+                let cy = ((wy - sz.costmap.metadata.origin.position.y as f32)
+                    / sz.costmap.metadata.resolution)
+                    .floor() as usize;
+                let idx = cy * (sz.costmap.metadata.size_x as usize) + cx;
+                assert_eq!(
+                    sz.costmap.data[idx], 254,
+                    "Expected subdivided obstacle cell at ({wx}, {wy}) to stay lethal (254) after resize"
+                );
+            }
+        }
+
+        // Meanwhile an unobstructed cell 2 grid cells away on the -Y side (2.5, -0.1) IS free (0)
+        {
+            let (wx, wy) = (2.5f32, -0.1f32);
+            let cx = ((wx - sz.costmap.metadata.origin.position.x as f32)
+                / sz.costmap.metadata.resolution)
+                .floor() as usize;
+            let cy = ((wy - sz.costmap.metadata.origin.position.y as f32)
+                / sz.costmap.metadata.resolution)
+                .floor() as usize;
+            let idx = cy * (sz.costmap.metadata.size_x as usize) + cx;
+            assert_eq!(sz.costmap.data[idx], 0);
+        }
+
+        // Verify current (0.5, 0.5) and target (6.5, 0.5) cells are free (0) in SafeZone costmap
+        for &(wx, wy) in &[(0.5f32, 0.5f32), (6.5f32, 0.5f32)] {
+            let cx = ((wx - sz.costmap.metadata.origin.position.x as f32)
+                / sz.costmap.metadata.resolution)
+                .floor() as usize;
+            let cy = ((wy - sz.costmap.metadata.origin.position.y as f32)
+                / sz.costmap.metadata.resolution)
+                .floor() as usize;
+            let idx = cy * (sz.costmap.metadata.size_x as usize) + cx;
+            assert_eq!(
+                sz.costmap.data[idx], 0,
+                "Expected endpoint ({wx}, {wy}) to be free in SafeZone costmap"
+            );
+        }
+    }
+
+    #[test]
+    fn test_handle_map_validates_inputs_and_caps_subdivision_cells() {
+        let mut executor = PlanExecutor::with_config(
+            PlanExecutorConfig::default()
+                .with_subdivision(5)
+                .with_blur_radius(f32::NAN),
+        );
+        assert_eq!(executor.blur_radius, 0.0);
+
+        // Non-finite resolution is rejected
+        let mut nan_map = OccupancyGrid::default();
+        nan_map.info.width = 10;
+        nan_map.info.height = 10;
+        nan_map.info.resolution = f32::NAN;
+        assert!(executor.handle_map(nan_map).is_empty());
+        assert!(executor.latest_map.is_none());
+
+        // Mismatched non-empty data length is rejected
+        let mut bad_len_map = OccupancyGrid::default();
+        bad_len_map.info.width = 10;
+        bad_len_map.info.height = 10;
+        bad_len_map.info.resolution = 0.5;
+        bad_len_map.data = vec![0; 50];
+        assert!(executor.handle_map(bad_len_map).is_empty());
+        assert!(executor.latest_map.is_none());
+
+        // Large 1000x1000 map with subdivision=5 (25M cells > MAX_GRID_CELLS=4M) clamps subdiv to 2 (4M cells)
+        let mut large_map = OccupancyGrid::default();
+        large_map.info.width = 1000;
+        large_map.info.height = 1000;
+        large_map.info.resolution = 0.1;
+        large_map.info.origin.orientation.w = 1.0;
+        large_map.data = vec![0; 1_000_000];
+        assert!(executor.handle_map(large_map).is_empty());
+        assert_eq!(executor.grid_width, 2000);
+        assert_eq!(executor.grid_height, 2000);
+        assert!((executor.grid_resolution - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_handle_plan_initial_reached_and_progress_retirement() {
+        let mut executor = PlanExecutor::new();
+        executor.handle_robot_added("robot_1", 0.5);
+        executor.handle_robot_added("robot_2", 0.5);
+
+        let mut plan_1 = plan_with_positions(&[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]);
+        plan_1.plan_id.destination_session.uuid = [11; 16];
+        plan_1.plan_id.plan_version = 1;
+        let plan_1_id = plan_1.plan_id.clone();
+
+        // Pre-existing progress for the SAME plan_id with out-of-range reached_waypoint clamps to len - 1
+        let mut pre_prog = progress_with_progress(2.0, 0.0, &plan_1_id, 99, 2.0);
+        pre_prog.mode = Progress::MODE_NAVIGATING;
+        executor.handle_progress("robot_1", pre_prog);
+        executor.handle_plan("robot_1", plan_1.clone());
+        assert_eq!(executor.active_robots["robot_1"].reached_waypoint, 2);
+
+        // New plan version resets reached_waypoint to 0 and keeps progress monotonic
+        let mut plan_1_v2 = plan_1;
+        plan_1_v2.plan_id.plan_version = 2;
+        let plan_1_v2_id = plan_1_v2.plan_id.clone();
+        executor.handle_plan("robot_1", plan_1_v2);
+        assert_eq!(executor.active_robots["robot_1"].reached_waypoint, 0);
+
+        let mut nav_prog_1 = progress_with_progress(1.0, 0.0, &plan_1_v2_id, 1, 1.0);
+        nav_prog_1.mode = Progress::MODE_NAVIGATING;
+        executor.handle_progress("robot_1", nav_prog_1);
+        // Regressing reached_waypoint in subsequent message does not decrease tracked reached_waypoint
+        let mut nav_prog_regress = progress_with_progress(0.8, 0.0, &plan_1_v2_id, 0, 0.8);
+        nav_prog_regress.mode = Progress::MODE_NAVIGATING;
+        executor.handle_progress("robot_1", nav_prog_regress);
+        assert_eq!(executor.active_robots["robot_1"].reached_waypoint, 1);
+
+        // Completing the final waypoint with MODE_IDLE retires robot_1's active plan in PlanRegistry
+        // (so waypoint_arrival_times no longer maps robot_1's active plan waypoints, and robot_1
+        // transitions to a 1-pose stationary obstacle at its final waypoint for robot_2).
+        assert!(executor
+            .plan_registry
+            .get_mapf_snapshot()
+            .get_global_waypoint_index("robot_1", 0)
+            .is_some());
+        let mut idle_done = progress_with_progress(2.0, 0.0, &plan_1_v2_id, 2, 2.0);
+        idle_done.mode = Progress::MODE_IDLE;
+        executor.handle_progress("robot_1", idle_done);
+        let retired_snap = executor.plan_registry.get_mapf_snapshot();
+        assert!(retired_snap
+            .get_global_waypoint_index("robot_1", 0)
+            .is_none());
+        let r1_retired_idx = retired_snap.get_agent_index("robot_1").unwrap();
+        assert_eq!(
+            retired_snap.mapf_result.trajectories[r1_retired_idx]
+                .poses
+                .len(),
+            1
+        );
+
+        let mut plan_2 = plan_with_positions(&[[0.0, 2.0], [2.0, 2.0]]);
+        plan_2.plan_id.destination_session.uuid = [22; 16];
+        executor.handle_plan("robot_2", plan_2);
+        let out_r2 = executor.handle_progress("robot_2", progress_at(0.0, 2.0));
+        assert!(out_r2.safe_zone.is_some());
+        let snap = executor.plan_registry.get_mapf_snapshot();
+        assert!(snap.included_robots.contains(&"robot_1".to_string()));
+        assert!(snap.included_robots.contains(&"robot_2".to_string()));
+    }
+
+    #[test]
+    fn test_spread_radians_is_treated_as_half_width_when_gating_waypoints() {
+        use ros_env::rmf_prototype_msgs::msg::{TargetOrientation, TargetRegion};
+
+        let mut executor = PlanExecutor::new();
+        executor.handle_robot_added("robot_1", 0.5);
+
+        // Case A: spread_radians = PI/2 (half-plane, < PI) at wp[1] IS constrained -> gates at wp[1]
+        let mut plan_half_plane = plan_with_positions(&[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]);
+        plan_half_plane.waypoints[1]
+            .arrival_constraints
+            .regions
+            .push(TargetRegion {
+                orientations: vec![TargetOrientation {
+                    orientation_radians: std::f32::consts::PI,
+                    spread_radians: std::f32::consts::FRAC_PI_2,
+                    tolerance_radians: 0.0,
+                }],
+                ..Default::default()
+            });
+        executor.handle_plan("robot_1", plan_half_plane);
+        let out_gated = executor.handle_progress("robot_1", progress_at(0.0, 0.0));
+        assert_eq!(out_gated.plan_release.unwrap().waypoint_id, 1);
+
+        // Case B: spread_radians = PI (full circle +/- PI) at wp[1] is unconstrained -> releases to wp[2]
+        let mut plan_full_circle = plan_with_positions(&[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]);
+        plan_full_circle.plan_id.plan_version = 1;
+        plan_full_circle.waypoints[1]
+            .arrival_constraints
+            .regions
+            .push(TargetRegion {
+                orientations: vec![TargetOrientation {
+                    orientation_radians: 0.0,
+                    spread_radians: std::f32::consts::PI,
+                    tolerance_radians: 0.0,
+                }],
+                ..Default::default()
+            });
+        executor.handle_plan("robot_1", plan_full_circle);
+        let out_unconstrained = executor.handle_progress("robot_1", progress_at(0.0, 0.0));
+        assert_eq!(out_unconstrained.plan_release.unwrap().waypoint_id, 2);
     }
 }

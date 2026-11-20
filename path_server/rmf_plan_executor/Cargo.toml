@@ -8,5 +8,5 @@ edition = "2021"
 rclrs = "0.7.0"
 ros-env = "=0.2.0"
 
-mapf_post = { git = "https://github.com/arjo129/mapf_post", branch = "arjoc/feat/head_on_segment" }
+mapf_post = { git = "https://github.com/arjo129/mapf_post", rev = "50759780f9fe5f40a1218415405bc7c3f402cf36" }
 rmf_participant_discovery = { path = "../../rmf_participant_discovery" }
