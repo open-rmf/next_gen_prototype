@@ -98,10 +98,14 @@ SpatioTemporalPartitionLayer::onInitialize()
   auto node = node_.lock();
   declareParameter("enabled", rclcpp::ParameterValue(true));
   node->get_parameter(name_ + "." + "enabled", enabled_);
-  costmap_sub_ = node->create_subscription<nav2_msgs::msg::Costmap>("plan/costmap", 10, 
+  auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).transient_local().reliable();
+  costmap_sub_ = node->create_subscription<nav2_msgs::msg::Costmap>("plan/costmap", qos, 
     std::bind(&SpatioTemporalPartitionLayer::costmap_cb, this, std::placeholders::_1));
+  costmap_updated_pub_ = node->create_publisher<std_msgs::msg::Header>("plan/costmap_updated", qos);
   
   need_recalculation_ = false;
+  recalculating_ = false;
+  pending_ack_ = false;
   current_ = true;
   RCLCPP_ERROR(logger_, "Initializing grid");
   current_robot_ = node->get_namespace();
@@ -116,6 +120,7 @@ SpatioTemporalPartitionLayer::updateBounds(
   double robot_x, double robot_y, double /*robot_yaw*/, double * min_x,
   double * min_y, double * max_x, double * max_y)
 {
+  std::lock_guard<std::mutex> lock(mutex_);
   robot_x_ = robot_x;
   robot_y_ = robot_y;
   pose_recvd_ = true;
@@ -127,11 +132,12 @@ SpatioTemporalPartitionLayer::updateBounds(
     // For some reason when I make these -<double>::max() it does not
     // work with Costmap2D::worldToMapEnforceBounds(), so I'm using
     // -<float>::max() instead.
-    *min_x = -std::numeric_limits<float>::max();
-    *min_y = -std::numeric_limits<float>::max();
-    *max_x = std::numeric_limits<float>::max();
-    *max_y = std::numeric_limits<float>::max();
+    *min_x = std::min(static_cast<double>(-std::numeric_limits<float>::max()), *min_x);
+    *min_y = std::min(static_cast<double>(-std::numeric_limits<float>::max()), *min_y);
+    *max_x = std::max(static_cast<double>(std::numeric_limits<float>::max()), *max_x);
+    *max_y = std::max(static_cast<double>(std::numeric_limits<float>::max()), *max_y);
     need_recalculation_ = false;
+    recalculating_ = true;
   } else {
     double tmp_min_x = last_min_x_;
     double tmp_min_y = last_min_y_;
@@ -151,6 +157,9 @@ SpatioTemporalPartitionLayer::updateBounds(
 void SpatioTemporalPartitionLayer::costmap_cb(nav2_msgs::msg::Costmap::SharedPtr msg) {
   std::lock_guard<std::mutex> lock(mutex_);
   costmap_msg_ = msg;
+  need_recalculation_ = true;
+  pending_ack_ = true;
+  current_ = false;
 }
 
 // Callback function to write curl response to a string
@@ -164,6 +173,7 @@ size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* use
 void
 SpatioTemporalPartitionLayer::onFootprintChanged()
 {
+  std::lock_guard<std::mutex> lock(mutex_);
   need_recalculation_ = true;
 
   RCLCPP_DEBUG(rclcpp::get_logger(
@@ -229,6 +239,16 @@ SpatioTemporalPartitionLayer::updateCosts(
           master_grid.setCost(i, j, costmap_cost);
         }
       }
+    }
+  }
+
+  if (recalculating_) {
+    recalculating_ = false;
+    need_recalculation_ = false;
+    current_ = true;
+    if (pending_ack_) {
+      pending_ack_ = false;
+      costmap_updated_pub_->publish(costmap_msg_->header);
     }
   }
 }
