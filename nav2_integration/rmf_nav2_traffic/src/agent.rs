@@ -205,13 +205,16 @@ fn update_amcl_pose(
                 header: amcl_pose.0.header.clone(),
                 pose: amcl_pose.0.pose.pose.clone(),
             };
-            let mode = if current_nav_req.is_some()
-                || inner_nav_client.is_some_and(|c| c.goal().is_some())
-            {
-                Progress::MODE_NAVIGATING
-            } else {
-                Progress::MODE_IDLE
-            };
+            let is_navigating =
+                current_nav_req.is_some() || inner_nav_client.is_some_and(|c| c.has_active_goal());
+            let mode = progress_tracker
+                .as_ref()
+                .map(|t| t.execution_mode(is_navigating))
+                .unwrap_or(if is_navigating {
+                    Progress::MODE_NAVIGATING
+                } else {
+                    Progress::MODE_IDLE
+                });
             let sz_id = current_safe_zone.and_then(|csz| csz.0.as_ref().map(|sz| &sz.id));
             let progress_msg = build_progress_status(pose, mode, computed_prog.as_ref(), sz_id);
             if has_new_pose || prev_published.as_ref() != Some(&progress_msg) {

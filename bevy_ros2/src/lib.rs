@@ -19,8 +19,9 @@ use bevy::prelude::*;
 use futures::Future;
 use rclrs::{
     ActionClientState, ActionIDL, ActionServerState, ClientState, Context, CreateBasicExecutor,
-    ExecutorCommands, IntoPrimitiveOptions, MessageIDL, NodeState, PublisherState, RclrsError,
-    RequestedGoal, RequestedGoalClient, ServiceIDL, SpinOptions, Subscription, TerminatedGoal,
+    ExecutorCommands, IntoPrimitiveOptions, MessageIDL, MultiCancelResponseClient, NodeState,
+    PublisherState, RclrsError, RequestedGoal, RequestedGoalClient, ServiceIDL, SpinOptions,
+    Subscription, TerminatedGoal,
 };
 use std::{
     fmt::Debug,
@@ -156,6 +157,10 @@ impl<T: ActionIDL> RosActionClient<T> {
 
     pub fn request_goal(&self, goal: T::Goal) -> RequestedGoalClient<T> {
         self.action_client.request_goal(goal)
+    }
+
+    pub fn cancel_all_goals(&self) -> MultiCancelResponseClient<T> {
+        self.action_client.cancel_all_goals()
     }
 }
 
