@@ -84,7 +84,11 @@ impl PlanExecutorRosNode {
             return;
         }
 
-        self.executor.handle_plan(robot_id, msg);
+        if self.executor.handle_plan(robot_id, msg) {
+            if let Some(cached_progress) = self.executor.cached_progress(robot_id) {
+                self.handle_progress(robot_id, cached_progress);
+            }
+        }
     }
 
     pub fn handle_map(&mut self, msg: OccupancyGrid) {

@@ -72,12 +72,15 @@ pub fn shortest_angular_distance(a: f32, b: f32) -> f32 {
     diff.min(std::f32::consts::TAU - diff)
 }
 
-/// Tracks monotonic waypoint and continuous `progress` along the active `Plan`
-/// and `SafeZone` segment for traffic dependency release.
-#[derive(Component, Debug, Clone, Default)]
+/// Monotonically tracks `reached_waypoint` along the active `Plan` and `SafeZone`,
+/// using floating-point `progress` as a rough non-decreasing estimate between
+/// waypoint indices.
+#[derive(Component, Debug, Clone)]
 pub struct ProgressTracker {
     pub plan_id: Option<PlanId>,
     pub plan_waypoints: Vec<([f32; 2], f32)>,
+    pub reached_waypoint: u64,
+    pub progress: f32,
     pub start_waypoint: u64,
     pub start_progress: f32,
     pub target_waypoint: u64,
@@ -87,6 +90,34 @@ pub struct ProgressTracker {
     pub target_tolerance: f32,
     pub target_yaw: Option<f32>,
     pub target_yaw_tolerance: f32,
+    pub max_step_dist: f32,
+    last_confirmed_pose: Option<(f32, f32, f32)>,
+    pending_jump_pose: Option<(f32, f32, f32)>,
+    pending_plan_recompute: bool,
+}
+
+impl Default for ProgressTracker {
+    fn default() -> Self {
+        Self {
+            plan_id: None,
+            plan_waypoints: Vec::new(),
+            reached_waypoint: 0,
+            progress: 0.0,
+            start_waypoint: 0,
+            start_progress: 0.0,
+            target_waypoint: 0,
+            target_progress: 0.0,
+            start_xy: (0.0, 0.0),
+            target_xy: (0.0, 0.0),
+            target_tolerance: 0.25,
+            target_yaw: None,
+            target_yaw_tolerance: std::f32::consts::PI,
+            max_step_dist: Self::DEFAULT_MAX_STEP_DIST,
+            last_confirmed_pose: None,
+            pending_jump_pose: None,
+            pending_plan_recompute: false,
+        }
+    }
 }
 
 fn resolve_target_orientation(safe_zone: &SafeZone) -> Option<&TargetOrientation> {
@@ -106,9 +137,27 @@ fn resolve_target_orientation(safe_zone: &SafeZone) -> Option<&TargetOrientation
 
 impl ProgressTracker {
     const MAX_SEGMENT_LOOKAHEAD: usize = 3;
+    const MAX_CROSS_TRACK_DIST: f32 = 1.0;
+    const WAYPOINT_PASS_TOLERANCE: f32 = 0.5;
+    const DEFAULT_MAX_STEP_DIST: f32 = 1.5;
 
     pub fn clear(&mut self) {
-        *self = Self::default();
+        let max_step_dist = self.max_step_dist;
+        *self = Self {
+            max_step_dist,
+            ..Self::default()
+        };
+    }
+
+    pub fn with_max_step_distance(mut self, max_step_dist: f32) -> Self {
+        if max_step_dist.is_finite() && max_step_dist > 0.0 {
+            self.max_step_dist = max_step_dist;
+        }
+        self
+    }
+
+    pub fn has_pending_plan_recompute(&self) -> bool {
+        self.pending_plan_recompute
     }
 
     fn extract_plan_waypoints(plan: &Plan) -> Vec<([f32; 2], f32)> {
@@ -130,11 +179,67 @@ impl ProgressTracker {
         self.plan_waypoints.get(wp_idx as usize).map(|&(_, p)| p)
     }
 
+    fn index_progress(&self, wp_idx: u64) -> f32 {
+        if let Some(p) = self.waypoint_progress(wp_idx) {
+            return p.min(self.target_progress);
+        }
+        if wp_idx >= self.target_waypoint {
+            return self.target_progress;
+        }
+        if wp_idx <= self.start_waypoint {
+            return self.start_progress;
+        }
+        let wp_span = (self.target_waypoint - self.start_waypoint) as f32;
+        let prog_span = (self.target_progress - self.start_progress).max(0.0);
+        let frac = (wp_idx - self.start_waypoint) as f32 / wp_span;
+        (self.start_progress + frac * prog_span).min(self.target_progress)
+    }
+
+    fn find_segment(
+        waypoints: &[([f32; 2], f32)],
+        range: std::ops::Range<usize>,
+        rx: f32,
+        ry: f32,
+        max_dist_sq: f32,
+        max_non_zero: Option<usize>,
+    ) -> Option<(usize, f32, f32)> {
+        let mut best: Option<(usize, f32, f32)> = None;
+        let mut non_zero_seen = 0usize;
+        for i in range {
+            let (p0, _) = waypoints[i];
+            let (p1, _) = waypoints[i + 1];
+            let sdx = p1[0] - p0[0];
+            let sdy = p1[1] - p0[1];
+            let slen_sq = sdx * sdx + sdy * sdy;
+            if slen_sq <= 1e-6 {
+                continue;
+            }
+            if let Some(limit) = max_non_zero {
+                if non_zero_seen >= limit {
+                    break;
+                }
+            }
+            non_zero_seen += 1;
+            let t = (((rx - p0[0]) * sdx + (ry - p0[1]) * sdy) / slen_sq).clamp(0.0, 1.0);
+            let proj_x = p0[0] + t * sdx;
+            let proj_y = p0[1] + t * sdy;
+            let dist_sq = (rx - proj_x).powi(2) + (ry - proj_y).powi(2);
+            if dist_sq <= max_dist_sq && best.is_none_or(|(_, _, best_d)| dist_sq + 1e-3 < best_d) {
+                best = Some((i, t, dist_sq));
+            }
+        }
+        best
+    }
+
     pub fn set_plan(&mut self, plan: &Plan) {
         if self.plan_id.as_ref() == Some(&plan.plan_id) {
+            let was_empty = self.plan_waypoints.is_empty();
             self.plan_waypoints = Self::extract_plan_waypoints(plan);
             if let Some(wp_prog) = self.waypoint_progress(self.start_waypoint) {
                 self.start_progress = wp_prog.min(self.target_progress);
+            }
+            if was_empty && !self.plan_waypoints.is_empty() {
+                self.pending_plan_recompute = true;
             }
         }
     }
@@ -213,8 +318,8 @@ impl ProgressTracker {
         let (target_yaw, target_yaw_tolerance) = Self::extract_orientation_constraint(safe_zone);
 
         let same_plan = self.plan_id.as_ref() == Some(&plan_id);
-        let current_xy = current_pose.map(|(x, y, _)| (x, y));
-        let fallback_start = current_xy.unwrap_or(target_xy);
+        let sanitized_pose =
+            current_pose.filter(|(x, y, yaw)| x.is_finite() && y.is_finite() && yaw.is_finite());
 
         if !same_plan {
             self.plan_waypoints = plan
@@ -227,189 +332,229 @@ impl ProgressTracker {
                 .waypoint_progress(safe_zone.last_waypoint)
                 .unwrap_or(safe_zone.last_waypoint as f32)
                 .min(safe_zone.target_progress);
+            self.reached_waypoint = safe_zone.last_waypoint;
+            self.progress = self.start_progress;
             self.target_waypoint = target_wp;
             self.target_progress = safe_zone.target_progress;
-            self.start_xy = fallback_start;
+            self.last_confirmed_pose = sanitized_pose;
+            self.pending_jump_pose = None;
+            self.pending_plan_recompute = false;
+            self.start_xy = sanitized_pose.map(|(x, y, _)| (x, y)).unwrap_or(target_xy);
             self.target_xy = target_xy;
             self.target_tolerance = target_tolerance;
             self.target_yaw = target_yaw;
             self.target_yaw_tolerance = target_yaw_tolerance;
-        } else {
-            if self.plan_waypoints.is_empty() {
-                if let Some(p) = plan.filter(|p| p.plan_id == plan_id) {
-                    self.plan_waypoints = Self::extract_plan_waypoints(p);
-                    if let Some(wp_prog) = self.waypoint_progress(self.start_waypoint) {
-                        self.start_progress = wp_prog.min(safe_zone.target_progress);
-                    }
-                }
-            }
-            let yaw_changed = match (self.target_yaw, target_yaw) {
-                (Some(a), Some(b)) => shortest_angular_distance(a, b) > 0.05,
-                (None, None) => false,
-                _ => true,
-            };
-            let target_changed = target_wp != self.target_waypoint
-                || (target_xy.0 - self.target_xy.0).hypot(target_xy.1 - self.target_xy.1) > 1e-3
-                || yaw_changed;
-            if target_changed {
-                let prev_same_plan = previous.filter(|p| p.plan_id == plan_id);
-                self.start_xy = current_xy.unwrap_or(self.target_xy);
-                self.start_waypoint = self.start_waypoint.max(safe_zone.last_waypoint);
-                self.start_progress = self
-                    .waypoint_progress(self.start_waypoint)
-                    .unwrap_or_else(|| {
-                        prev_same_plan
-                            .map(|p| p.progress)
-                            .unwrap_or(self.start_waypoint as f32)
-                    })
-                    .min(safe_zone.target_progress);
-            }
-            self.target_waypoint = target_wp;
-            self.target_progress = safe_zone.target_progress;
-            self.target_xy = target_xy;
-            self.target_tolerance = target_tolerance;
-            self.target_yaw = target_yaw;
-            self.target_yaw_tolerance = target_yaw_tolerance;
+            return self.evaluate_progress(self.last_confirmed_pose, previous);
         }
 
-        self.compute_progress(current_pose, previous)
+        if self.plan_waypoints.is_empty() {
+            if let Some(p) = plan.filter(|p| p.plan_id == plan_id) {
+                self.plan_waypoints = Self::extract_plan_waypoints(p);
+                if let Some(wp_prog) = self.waypoint_progress(self.start_waypoint) {
+                    self.start_progress = wp_prog.min(safe_zone.target_progress);
+                }
+            }
+        }
+        let effective_pose = self.observe_pose(sanitized_pose);
+        let current_xy = effective_pose.map(|(x, y, _)| (x, y));
+        let yaw_changed = match (self.target_yaw, target_yaw) {
+            (Some(a), Some(b)) => shortest_angular_distance(a, b) > 0.05,
+            (None, None) => false,
+            _ => true,
+        };
+        let target_changed = target_wp != self.target_waypoint
+            || (target_xy.0 - self.target_xy.0).hypot(target_xy.1 - self.target_xy.1) > 1e-3
+            || yaw_changed;
+        if target_changed {
+            let prev_same_plan = previous.filter(|p| p.plan_id == plan_id);
+            self.start_xy = current_xy.unwrap_or(self.target_xy);
+            self.start_waypoint = self.start_waypoint.max(safe_zone.last_waypoint);
+            self.start_progress = self
+                .waypoint_progress(self.start_waypoint)
+                .unwrap_or_else(|| {
+                    prev_same_plan
+                        .map(|p| p.progress)
+                        .unwrap_or(self.start_waypoint as f32)
+                })
+                .min(safe_zone.target_progress);
+        }
+        self.target_waypoint = target_wp;
+        self.target_progress = safe_zone.target_progress;
+        self.target_xy = target_xy;
+        self.target_tolerance = target_tolerance;
+        self.target_yaw = target_yaw;
+        self.target_yaw_tolerance = target_yaw_tolerance;
+
+        self.evaluate_progress(effective_pose, previous)
+    }
+
+    fn observe_pose(&mut self, current_pose: Option<(f32, f32, f32)>) -> Option<(f32, f32, f32)> {
+        let Some((rx, ry, ryaw)) =
+            current_pose.filter(|(x, y, yaw)| x.is_finite() && y.is_finite() && yaw.is_finite())
+        else {
+            return self.last_confirmed_pose;
+        };
+
+        let Some((lx, ly, _)) = self.last_confirmed_pose else {
+            self.last_confirmed_pose = Some((rx, ry, ryaw));
+            self.pending_jump_pose = None;
+            return self.last_confirmed_pose;
+        };
+
+        if (rx - lx).hypot(ry - ly) <= self.max_step_dist {
+            self.last_confirmed_pose = Some((rx, ry, ryaw));
+            self.pending_jump_pose = None;
+            return self.last_confirmed_pose;
+        }
+
+        if let Some((px, py, _)) = self.pending_jump_pose {
+            if (rx - px).hypot(ry - py) <= self.max_step_dist {
+                self.last_confirmed_pose = Some((rx, ry, ryaw));
+                self.pending_jump_pose = None;
+                return self.last_confirmed_pose;
+            }
+        }
+
+        self.pending_jump_pose = Some((rx, ry, ryaw));
+        self.last_confirmed_pose
     }
 
     pub fn compute_progress(
-        &self,
+        &mut self,
         current_pose: Option<(f32, f32, f32)>,
         previous: Option<&Progress>,
     ) -> Progress {
+        let effective_pose = self.observe_pose(current_pose);
+        self.evaluate_progress(effective_pose, previous)
+    }
+
+    fn evaluate_progress(
+        &mut self,
+        effective_pose: Option<(f32, f32, f32)>,
+        previous: Option<&Progress>,
+    ) -> Progress {
+        self.pending_plan_recompute = false;
         let Some(plan_id) = self.plan_id.clone() else {
             return Progress::default();
         };
 
         let prev_same_plan = previous.filter(|p| p.plan_id == plan_id);
-        let prev_reached = prev_same_plan.map(|p| p.reached_waypoint).unwrap_or(0);
-        let prev_progress = prev_same_plan.map(|p| p.progress).unwrap_or(0.0);
+        let mut idx = self
+            .reached_waypoint
+            .max(prev_same_plan.map(|p| p.reached_waypoint).unwrap_or(0))
+            .max(self.start_waypoint);
+        let mut est_progress = self
+            .progress
+            .max(prev_same_plan.map(|p| p.progress).unwrap_or(0.0))
+            .max(self.index_progress(idx));
 
-        let start_prog = self
-            .waypoint_progress(self.start_waypoint)
-            .unwrap_or(self.start_progress);
-        let mut reached_waypoint = self.start_waypoint.max(prev_reached);
-        let mut progress = start_prog.max(prev_progress);
-
-        if let Some((rx, ry, ryaw)) = current_pose {
+        if let Some((rx, ry, ryaw)) = effective_pose {
             let dist_to_target = (rx - self.target_xy.0).hypot(ry - self.target_xy.1);
             let pos_reached = dist_to_target <= self.target_tolerance;
             let ori_reached = self.is_orientation_satisfied(ryaw);
 
             if pos_reached && ori_reached {
-                reached_waypoint = reached_waypoint.max(self.target_waypoint);
-                progress = progress.max(self.target_progress);
-            } else if reached_waypoint < self.target_waypoint {
+                idx = idx.max(self.target_waypoint);
+                est_progress = est_progress.max(self.target_progress);
+            } else if idx < self.target_waypoint {
                 let (sx, sy) = self.start_xy;
                 let (tx, ty) = self.target_xy;
                 let dx = tx - sx;
                 let dy = ty - sy;
                 let seg_len_sq = dx * dx + dy * dy;
-                let prog_span = (self.target_progress - start_prog).max(0.0);
-                let wp_span = (self.target_waypoint - self.start_waypoint) as f32;
+                let start_prog = self.index_progress(self.start_waypoint);
                 let pre_final_cap = (self.target_progress - 1e-3).max(start_prog);
+                let max_cross_track = self.target_tolerance.max(Self::MAX_CROSS_TRACK_DIST);
+                let max_cross_track_sq = max_cross_track * max_cross_track;
+                let pass_tol = (self.target_tolerance * 2.0).max(Self::WAYPOINT_PASS_TOLERANCE);
+                let pass_tol_sq = pass_tol * pass_tol;
 
                 if pos_reached && !ori_reached {
-                    let pre_rot_wp = self
-                        .target_waypoint
-                        .saturating_sub(1)
-                        .max(self.start_waypoint);
-                    reached_waypoint = reached_waypoint.max(pre_rot_wp);
-                    let pre_rot_prog = self.waypoint_progress(pre_rot_wp).unwrap_or_else(|| {
-                        if wp_span > 0.0 {
-                            let frac = (pre_rot_wp - self.start_waypoint) as f32 / wp_span;
-                            start_prog + frac * prog_span
-                        } else {
-                            start_prog
-                        }
-                    });
-                    let interp = if seg_len_sq > 1e-6 {
+                    let pre_rot_wp = self.target_waypoint.saturating_sub(1).max(idx);
+                    idx = idx.max(pre_rot_wp);
+                    let approx = if seg_len_sq > 1e-6 {
                         pre_final_cap
                     } else {
-                        pre_rot_prog.min(pre_final_cap)
+                        self.index_progress(idx).min(pre_final_cap)
                     };
-                    progress = progress.max(interp).min(self.target_progress);
-                } else {
+                    est_progress = est_progress.max(approx);
+                } else if !self.plan_waypoints.is_empty() {
                     let target_idx = (self.target_waypoint as usize)
                         .min(self.plan_waypoints.len().saturating_sub(1));
-                    let search_start =
-                        (reached_waypoint as usize).max(self.start_waypoint as usize);
-                    let mut best_seg: Option<(f32, usize, f32, f32)> = None;
+                    let cur = (idx as usize).min(target_idx);
+                    if cur < target_idx {
+                        let local_match = Self::find_segment(
+                            &self.plan_waypoints,
+                            cur..target_idx,
+                            rx,
+                            ry,
+                            max_cross_track_sq,
+                            Some(Self::MAX_SEGMENT_LOOKAHEAD),
+                        );
+                        let matched_seg = match local_match {
+                            Some((_, _, d_sq)) if d_sq <= pass_tol_sq => local_match,
+                            _ => Self::find_segment(
+                                &self.plan_waypoints,
+                                cur..target_idx,
+                                rx,
+                                ry,
+                                pass_tol_sq,
+                                None,
+                            )
+                            .or(local_match),
+                        };
 
-                    if !self.plan_waypoints.is_empty() && search_start < target_idx {
-                        let mut non_zero_scanned = 0usize;
-                        for i in search_start..target_idx {
-                            let (p0, prog0) = self.plan_waypoints[i];
-                            let (p1, prog1) = self.plan_waypoints[i + 1];
-                            let sdx = p1[0] - p0[0];
-                            let sdy = p1[1] - p0[1];
-                            let slen_sq = sdx * sdx + sdy * sdy;
-                            if slen_sq <= 1e-6 {
-                                continue;
-                            }
-                            if non_zero_scanned >= Self::MAX_SEGMENT_LOOKAHEAD {
-                                break;
-                            }
-                            non_zero_scanned += 1;
-                            let t = (((rx - p0[0]) * sdx + (ry - p0[1]) * sdy) / slen_sq)
-                                .clamp(0.0, 1.0);
-                            let proj_x = p0[0] + t * sdx;
-                            let proj_y = p0[1] + t * sdy;
-                            let dist_sq = (rx - proj_x).powi(2) + (ry - proj_y).powi(2);
-                            let seg_prog = prog0 + t * (prog1 - prog0);
-                            match best_seg {
-                                None => best_seg = Some((dist_sq, i, t, seg_prog)),
-                                Some((best_dist_sq, _, _, _)) if dist_sq + 1e-3 < best_dist_sq => {
-                                    best_seg = Some((dist_sq, i, t, seg_prog));
-                                }
-                                _ => {}
-                            }
+                        if let Some((seg_idx, t, dist_sq)) = matched_seg {
+                            let within_pass_tol = dist_sq <= pass_tol_sq;
+                            let candidate_wp = if t >= 1.0 - 1e-4 && within_pass_tol {
+                                (seg_idx + 1) as u64
+                            } else if within_pass_tol || (seg_idx > cur && t > 0.25) {
+                                seg_idx as u64
+                            } else {
+                                idx
+                            };
+                            idx = idx.max(candidate_wp.min(self.target_waypoint.saturating_sub(1)));
+
+                            let prog0 = self.plan_waypoints[seg_idx].1;
+                            let prog1 = self.plan_waypoints[seg_idx + 1].1;
+                            let rough_prog = if !within_pass_tol && t >= 1.0 - 1e-4 {
+                                (prog1 - 1e-3).max(prog0)
+                            } else {
+                                prog0 + t * (prog1 - prog0)
+                            };
+                            est_progress = est_progress.max(rough_prog.min(pre_final_cap));
                         }
                     }
-
-                    if let Some((_, seg_idx, t, seg_prog)) = best_seg {
-                        let interp = seg_prog.clamp(start_prog, pre_final_cap);
-                        progress = progress.max(interp).min(self.target_progress);
-                        if self.target_waypoint > self.start_waypoint + 1 {
-                            let seg_wp = if t >= 1.0 - 1e-4 {
-                                (seg_idx + 1) as u64
-                            } else {
-                                seg_idx as u64
-                            };
-                            let intermediate_wp =
-                                seg_wp.min(self.target_waypoint.saturating_sub(1));
-                            reached_waypoint = reached_waypoint.max(intermediate_wp);
-                        }
-                    } else if !self.plan_waypoints.is_empty() {
-                        let hold_wp = reached_waypoint
-                            .max(self.start_waypoint)
-                            .min(self.target_waypoint.saturating_sub(1));
-                        let hold_prog = self
-                            .waypoint_progress(hold_wp)
-                            .unwrap_or(start_prog)
-                            .clamp(start_prog, pre_final_cap);
-                        progress = progress.max(hold_prog).min(self.target_progress);
-                    } else if seg_len_sq > 1e-6 {
-                        let t = (((rx - sx) * dx + (ry - sy) * dy) / seg_len_sq).clamp(0.0, 1.0);
-                        let interp = (start_prog + t * prog_span).min(pre_final_cap);
-                        progress = progress.max(interp).min(self.target_progress);
-                        if self.target_waypoint > self.start_waypoint + 1 && wp_span > 0.0 {
-                            let intermediate_wp = (self.start_waypoint
-                                + (t * wp_span).floor() as u64)
+                } else if seg_len_sq > 1e-6 {
+                    let t = (((rx - sx) * dx + (ry - sy) * dy) / seg_len_sq).clamp(0.0, 1.0);
+                    let proj_x = sx + t * dx;
+                    let proj_y = sy + t * dy;
+                    let chord_dist_sq = (rx - proj_x).powi(2) + (ry - proj_y).powi(2);
+                    if chord_dist_sq <= max_cross_track_sq {
+                        let wp_span = (self.target_waypoint - self.start_waypoint) as f32;
+                        let prog_span = (self.target_progress - start_prog).max(0.0);
+                        if chord_dist_sq <= pass_tol_sq
+                            && self.target_waypoint > self.start_waypoint + 1
+                            && wp_span > 0.0
+                        {
+                            let step = ((t * wp_span) + 1e-5).floor() as u64;
+                            let candidate_wp = (self.start_waypoint + step)
                                 .min(self.target_waypoint.saturating_sub(1));
-                            reached_waypoint = reached_waypoint.max(intermediate_wp);
+                            idx = idx.max(candidate_wp);
                         }
+                        let rough_prog = (start_prog + t * prog_span).min(pre_final_cap);
+                        est_progress = est_progress.max(rough_prog);
                     }
                 }
             }
         }
 
+        self.reached_waypoint = idx;
+        self.progress = est_progress.max(self.index_progress(idx));
+
         Progress {
-            progress,
-            reached_waypoint,
+            progress: self.progress,
+            reached_waypoint: self.reached_waypoint,
             target_waypoint: self.target_waypoint,
             reached_keys: vec![],
             plan_id,
@@ -423,9 +568,15 @@ impl ProgressTracker {
         let prev_reached = prev_same_plan.map(|p| p.reached_waypoint).unwrap_or(0);
         let prev_progress = prev_same_plan.map(|p| p.progress).unwrap_or(0.0);
 
+        let reached_waypoint = self
+            .reached_waypoint
+            .max(prev_reached)
+            .max(self.target_waypoint);
+        let progress = self.progress.max(prev_progress).max(self.target_progress);
+
         Some(Progress {
-            progress: prev_progress.max(self.target_progress),
-            reached_waypoint: prev_reached.max(self.target_waypoint),
+            progress,
+            reached_waypoint,
             target_waypoint: self.target_waypoint,
             reached_keys: vec![],
             plan_id,
@@ -655,6 +806,8 @@ fn update_local_plans(
         if let Some(plan) = plan_sub.subscriber.data_callback() {
             if local_plans.get(&plan.plan_id).is_none() {
                 local_plans.insert(plan.clone());
+                progress_tracker.set_plan(&plan);
+            } else if progress_tracker.plan_waypoints.is_empty() {
                 progress_tracker.set_plan(&plan);
             }
         }
@@ -1024,7 +1177,8 @@ mod tests {
         let p0 = tracker.on_safe_zone_with_plan(&sz, Some(&plan), Some((0.0, 0.0, 0.0)), None);
         assert_eq!(p0.reached_waypoint, 0);
 
-        let p_at_1_98 = tracker.compute_progress(Some((1.98, 0.0, 0.0)), Some(&p0));
+        let p_at_1_0 = tracker.compute_progress(Some((1.0, 0.0, 0.0)), Some(&p0));
+        let p_at_1_98 = tracker.compute_progress(Some((1.98, 0.0, 0.0)), Some(&p_at_1_0));
         assert_eq!(p_at_1_98.reached_waypoint, 1);
         assert!((p_at_1_98.progress - 1.98).abs() < 1e-4);
 
@@ -1058,11 +1212,13 @@ mod tests {
         let p0 = fallback_tracker.on_safe_zone(&sz, Some((0.0, 0.0, 0.0)), None);
         assert_eq!(p0.reached_waypoint, 0);
 
-        let p_at_2 = fallback_tracker.compute_progress(Some((2.0, 0.0, 0.0)), Some(&p0));
+        let p_at_1 = fallback_tracker.compute_progress(Some((1.0, 0.0, 0.0)), Some(&p0));
+        let p_at_2 = fallback_tracker.compute_progress(Some((2.0, 0.0, 0.0)), Some(&p_at_1));
         assert_eq!(p_at_2.reached_waypoint, 1);
         assert!((p_at_2.progress - 1.0).abs() < 1e-4);
 
-        let p_at_3_9 = fallback_tracker.compute_progress(Some((3.9, 0.0, 0.0)), Some(&p_at_2));
+        let p_at_3 = fallback_tracker.compute_progress(Some((3.0, 0.0, 0.0)), Some(&p_at_2));
+        let p_at_3_9 = fallback_tracker.compute_progress(Some((3.9, 0.0, 0.0)), Some(&p_at_3));
         assert_eq!(p_at_3_9.reached_waypoint, 1);
         assert!((p_at_3_9.progress - 1.95).abs() < 1e-4);
 
@@ -1092,7 +1248,8 @@ mod tests {
 
         let pp0 =
             plan_tracker.on_safe_zone_with_plan(&sz2, Some(&plan), Some((0.0, 0.0, 0.0)), None);
-        let pp_at_2 = plan_tracker.compute_progress(Some((2.0, 0.0, 0.0)), Some(&pp0));
+        let pp_at_1 = plan_tracker.compute_progress(Some((1.0, 0.0, 0.0)), Some(&pp0));
+        let pp_at_2 = plan_tracker.compute_progress(Some((2.0, 0.0, 0.0)), Some(&pp_at_1));
         assert_eq!(pp_at_2.reached_waypoint, 1);
         assert!((pp_at_2.progress - 2.0).abs() < 1e-4);
 
@@ -1118,8 +1275,9 @@ mod tests {
         let p0 = tracker.on_safe_zone(&sz, Some((0.0, 0.0, 0.0)), None);
         assert_eq!(p0.reached_waypoint, 0);
 
-        // Robot arrives at (3.0, 0.0) with yaw = 0.0 (still needs to rotate to PI/2)
-        let p_pos_only = tracker.compute_progress(Some((3.0, 0.0, 0.0)), Some(&p0));
+        // Robot drives to (3.0, 0.0) with yaw = 0.0 (still needs to rotate to PI/2)
+        let p_mid = tracker.compute_progress(Some((1.5, 0.0, 0.0)), Some(&p0));
+        let p_pos_only = tracker.compute_progress(Some((3.0, 0.0, 0.0)), Some(&p_mid));
         assert_eq!(p_pos_only.reached_waypoint, 3);
         assert!(
             p_pos_only.progress < 4.0,
@@ -1269,8 +1427,9 @@ mod tests {
         let p0 = tracker.on_safe_zone(&sz, Some((0.0, 0.0, 0.0)), None);
         assert!(tracker.target_yaw.is_none());
 
-        // Robot is at X = 2.0 (t = 1.0 along segment) but laterally offset by Y = 0.5m (> 0.25m tolerance)
-        let p_offset = tracker.compute_progress(Some((2.0, 0.5, 0.0)), Some(&p0));
+        // Robot drives to X = 2.0 (t = 1.0 along segment) while laterally offset by Y = 0.5m (> 0.25m tolerance)
+        let p_mid = tracker.compute_progress(Some((1.0, 0.25, 0.0)), Some(&p0));
+        let p_offset = tracker.compute_progress(Some((2.0, 0.5, 0.0)), Some(&p_mid));
         assert_eq!(p_offset.reached_waypoint, 1);
         assert!(
             p_offset.progress < 2.0,
@@ -1390,5 +1549,206 @@ mod tests {
         let p_ok = tracker.compute_progress(Some((1.0, 0.0, 2.0)), Some(&p_blocked));
         assert_eq!(p_ok.reached_waypoint, 1);
         assert!((p_ok.progress - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn progress_tracker_gates_cross_track_detours_and_diagonal_chord_fallback() {
+        // 1. Plan-backed cross-track gating during obstacle detours
+        let mut tracker = ProgressTracker::default();
+        let mut sz = safe_zone(1, 0, 1, 4.0, 0.0);
+        sz.last_waypoint = 0;
+        sz.target_waypoint = vec![2].try_into().unwrap();
+        sz.target_progress = 2.0;
+        sz.incremental_target.regions[0].tolerance = 0.25;
+
+        let mut plan = Plan::default();
+        plan.plan_id = sz.id.plan_id.clone();
+        for (i, pos) in [[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]].into_iter().enumerate() {
+            plan.waypoints.push(Waypoint {
+                position: pos,
+                progress: i as f32,
+                ..Default::default()
+            });
+        }
+
+        let p0 = tracker.on_safe_zone_with_plan(&sz, Some(&plan), Some((0.0, 0.0, 0.0)), None);
+        let p_detour_1 = tracker.compute_progress(Some((1.0, 1.2, 0.0)), None);
+        let p_detour_2 = tracker.compute_progress(Some((2.2, 1.2, 0.0)), Some(&p_detour_1));
+        assert_eq!(
+            p_detour_2.reached_waypoint, 0,
+            "Wide detour (>1.0m cross-track) must not advance reached_waypoint"
+        );
+        assert!(
+            (p_detour_2.progress - p0.progress).abs() < 1e-4,
+            "Wide detour (>1.0m cross-track) must not inflate progress, got {}",
+            p_detour_2.progress
+        );
+
+        // Moderate detour (0.75m: inside 1.0m corridor, outside 0.5m waypoint pass tolerance)
+        // interpolates up to < 1.0 on segment 0 without claiming intermediate wp 1 was reached
+        let p_mod = tracker.compute_progress(Some((2.0, 0.75, 0.0)), Some(&p_detour_2));
+        assert_eq!(p_mod.reached_waypoint, 0);
+        assert!(p_mod.progress < 1.0);
+
+        // Rejoining corridor near wp 1 advances reached_waypoint to 1
+        let p_rejoin = tracker.compute_progress(Some((2.1, 0.2, 0.0)), Some(&p_mod));
+        assert_eq!(p_rejoin.reached_waypoint, 1);
+        assert!(p_rejoin.progress >= 1.0);
+
+        // 2. L-turn (0,0)->(0,4)->(4,4) before Plan arrives: diagonal chord (0,0)->(4,4) must
+        // reject off-chord poses on leg 1 where cross-track > 1.0m!
+        let mut chord_tracker = ProgressTracker::default();
+        let mut lturn_sz = safe_zone(2, 0, 1, 4.0, 4.0);
+        lturn_sz.last_waypoint = 0;
+        lturn_sz.target_waypoint = vec![2].try_into().unwrap();
+        lturn_sz.target_progress = 8.0;
+        lturn_sz.incremental_target.regions[0].tolerance = 0.25;
+
+        let c0 = chord_tracker.on_safe_zone(&lturn_sz, Some((0.0, 0.0, 0.0)), None);
+        let c1 = chord_tracker.compute_progress(Some((0.0, 1.2, 0.0)), Some(&c0));
+        let c2 = chord_tracker.compute_progress(Some((0.0, 2.4, 0.0)), Some(&c1));
+        assert!(
+            c2.progress < 1.5,
+            "Off-chord L-turn leg (>1.0m from diagonal chord) must not inflate chord progress, got {}",
+            c2.progress
+        );
+        assert_eq!(c2.reached_waypoint, 0);
+    }
+
+    #[test]
+    fn progress_tracker_only_increments_indices_and_handles_safe_zone_shortcuts() {
+        let mut tracker = ProgressTracker::default();
+        let mut sz = safe_zone(1, 0, 1, 4.0, 0.0);
+        sz.last_waypoint = 0;
+        sz.target_waypoint = vec![4].try_into().unwrap();
+        sz.target_progress = 4.0;
+        sz.incremental_target.regions[0].tolerance = 0.25;
+
+        let mut plan = Plan::default();
+        plan.plan_id = sz.id.plan_id.clone();
+        for (i, x) in [0.0, 1.0, 2.0, 3.0, 4.0].into_iter().enumerate() {
+            plan.waypoints.push(Waypoint {
+                position: [x, 0.0],
+                progress: i as f32,
+                ..Default::default()
+            });
+        }
+
+        // Start at (0.5, 0.0) -> progress = 0.5
+        let p0 = tracker.on_safe_zone_with_plan(&sz, Some(&plan), Some((0.5, 0.0, 0.0)), None);
+        assert!((p0.progress - 0.5).abs() < 1e-4);
+
+        // 1. Single-frame AMCL spike to (3.8, 0.0) (3.3m jump > 1.5m) is suppressed immediately!
+        let p_spike = tracker.compute_progress(Some((3.8, 0.0, 0.0)), Some(&p0));
+        assert_eq!(p_spike.reached_waypoint, 0);
+        assert!(
+            (p_spike.progress - 0.5).abs() < 1e-4,
+            "Single-sample AMCL jump must not ratchet progress, got {}",
+            p_spike.progress
+        );
+
+        // Next pose snaps back to (0.6, 0.0) -> advances smoothly to 0.6
+        let p_normal = tracker.compute_progress(Some((0.6, 0.0, 0.0)), Some(&p_spike));
+        assert!((p_normal.progress - 0.6).abs() < 1e-4);
+
+        // 2. Once robot advances to (3.1, 0.0) -> wp 3, prog 3.1, neither backward poses
+        // nor off-corridor detours may ever drop reached_waypoint or progress!
+        let p_step1 = tracker.compute_progress(Some((2.0, 0.0, 0.0)), Some(&p_normal));
+        let p_high = tracker.compute_progress(Some((3.1, 0.0, 0.0)), Some(&p_step1));
+        assert_eq!(p_high.reached_waypoint, 3);
+        assert!((p_high.progress - 3.1).abs() < 1e-4);
+
+        for pose in [
+            (0.8, 0.0, 0.0),
+            (0.82, 0.0, 0.0),
+            (0.84, 0.0, 0.0),
+            (0.86, 0.0, 0.0),
+            (2.0, 2.5, 0.0),
+        ] {
+            let held = tracker.compute_progress(Some(pose), Some(&p_high));
+            assert_eq!(
+                held.reached_waypoint, 3,
+                "ProgressTracker must never decrement reached_waypoint within the same PlanId"
+            );
+            assert!(
+                (held.progress - 3.1).abs() < 1e-4,
+                "ProgressTracker must never drop progress within the same PlanId, got {}",
+                held.progress
+            );
+        }
+
+        // 3. Corridor swap pocket shortcut inside an open SafeZone:
+        // wp0 [5,0] -> wp1 [4,0] -> wp2 [3,0] -> wp3 [2,0] -> wp4 [3,0]
+        // -> wp5 [3,1] -> wp6 [2,1] -> wp7 [1,1] -> wp8 [0,1] -> wp9 [-1,1] -> wp10 [-2,1] -> wp11 [-2,0]
+        let mut shortcut_tracker = ProgressTracker::default();
+        let mut swap_sz = safe_zone(2, 0, 1, -2.0, 0.0);
+        swap_sz.last_waypoint = 0;
+        swap_sz.target_waypoint = vec![11].try_into().unwrap();
+        swap_sz.target_progress = 11.0;
+        swap_sz.incremental_target.regions[0].tolerance = 0.25;
+
+        let mut swap_plan = Plan::default();
+        swap_plan.plan_id = swap_sz.id.plan_id.clone();
+        for (i, pos) in [
+            [5.0, 0.0],
+            [4.0, 0.0],
+            [3.0, 0.0],
+            [2.0, 0.0],
+            [3.0, 0.0],
+            [3.0, 1.0],
+            [2.0, 1.0],
+            [1.0, 1.0],
+            [0.0, 1.0],
+            [-1.0, 1.0],
+            [-2.0, 1.0],
+            [-2.0, 0.0],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            swap_plan.waypoints.push(Waypoint {
+                position: pos,
+                progress: i as f32,
+                ..Default::default()
+            });
+        }
+
+        let mut prev_prog = shortcut_tracker.on_safe_zone_with_plan(
+            &swap_sz,
+            Some(&swap_plan),
+            Some((5.0, 0.0, std::f32::consts::PI)),
+            None,
+        );
+        // Nav2 shortcuts diagonally from (3.9, 0.14) onto the north passing lane y=1.0,
+        // bypassing the pocket jog at wp3 [2,0] and wp4 [3,0].
+        for pose in [
+            (3.9, 0.14, 2.8),
+            (3.0, 0.85, 2.2),
+            (2.2, 0.98, std::f32::consts::PI),
+            (1.0, 1.0, std::f32::consts::PI),
+            (-0.2, 1.0, std::f32::consts::PI),
+            (-1.4, 1.0, std::f32::consts::PI),
+        ] {
+            let next_prog = shortcut_tracker.compute_progress(Some(pose), Some(&prev_prog));
+            assert!(
+                next_prog.reached_waypoint >= prev_prog.reached_waypoint,
+                "Shortcut must never decrement reached_waypoint ({} -> {})",
+                prev_prog.reached_waypoint,
+                next_prog.reached_waypoint
+            );
+            assert!(
+                next_prog.progress >= prev_prog.progress,
+                "Shortcut must never drop progress ({} -> {})",
+                prev_prog.progress,
+                next_prog.progress
+            );
+            prev_prog = next_prog;
+        }
+        assert!(
+            prev_prog.reached_waypoint >= 9 && prev_prog.progress >= 9.0,
+            "Shortcut along granted SafeZone must advance indices onto north lane, got wp={} prog={}",
+            prev_prog.reached_waypoint,
+            prev_prog.progress
+        );
     }
 }

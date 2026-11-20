@@ -140,7 +140,7 @@ fn update_amcl_pose(
         &OdomPublisher,
         Option<&ProgressPublisher>,
         Option<&mut LatestProgress>,
-        Option<&ProgressTracker>,
+        Option<&mut ProgressTracker>,
         Option<&CurrentSafeZone>,
         Option<&CurrentNavigationRequest>,
     )>,
@@ -152,14 +152,14 @@ fn update_amcl_pose(
         odom_pub,
         progress_pub,
         mut latest_progress,
-        progress_tracker,
+        mut progress_tracker,
         current_safe_zone,
         current_nav_req,
     ) in agents.iter_mut()
     {
         let mut has_new_pose = false;
-        if let Some(amcl_pose_msg) = amcl_pose_sub.subscriber.data_callback() {
-            amcl_pose.0 = amcl_pose_msg.clone();
+        if let Some(amcl_pose_msg) = amcl_pose_sub.subscriber.take_data() {
+            amcl_pose.0 = amcl_pose_msg;
             agent.localized = true;
             has_new_pose = true;
         }
@@ -176,8 +176,11 @@ fn update_amcl_pose(
 
         let prev_published = latest_progress.as_ref().and_then(|lp| lp.0.clone());
         let current_pose = Some(amcl_pose.xy_yaw());
-        let computed_prog = match (progress_tracker, prev_published.as_ref()) {
-            (Some(tracker), prev) if tracker.plan_id.is_some() => {
+        let computed_prog = match (progress_tracker.as_deref_mut(), prev_published.as_ref()) {
+            (Some(tracker), prev)
+                if tracker.plan_id.is_some()
+                    && (has_new_pose || tracker.has_pending_plan_recompute()) =>
+            {
                 Some(tracker.compute_progress(current_pose, prev))
             }
             (_, prev) => prev.cloned(),

@@ -320,6 +320,12 @@ impl PlanExecutor {
         self.active_robots.remove(robot_id).is_some()
     }
 
+    pub fn cached_progress(&self, robot_id: &str) -> Option<Progress> {
+        self.active_robots
+            .get(robot_id)
+            .and_then(|s| s.latest_progress.clone())
+    }
+
     pub fn handle_plan(&mut self, robot_id: &str, msg: Plan) -> bool {
         let Some(state) = self.active_robots.get_mut(robot_id) else {
             return false;
